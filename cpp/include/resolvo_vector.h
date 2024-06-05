@@ -8,11 +8,15 @@
 
 namespace resolvo {
 
+/// A simple vector implementation that uses reference counting to share data
+// between multiple instances. The vector is implemented as a contiguous array
+/// of elements. The vector is copy-on-write, meaning that when a vector is
+/// copied, the data is not copied.
 template<typename T>
 struct Vector {
     /// Constucts a new empty vector.
     Vector()
-        : inner(const_cast<Header *>(reinterpret_cast<const Vector*>(
+        : inner(const_cast<Header *>(reinterpret_cast<const Header*>(
                 cbindgen_private::resolvo_vector_empty())))
     {
     }
@@ -86,14 +90,135 @@ struct Vector {
         }
         return *this;
     }
-    /// Move-assign's \a other to this vector and returns a reference to this vector.
+    /// Move-assign's `other` to this vector and returns a reference to this vector.
     Vector &operator=(Vector &&other)
     {
         std::swap(inner, other.inner);
         return *this;
     }
 
+    /// Returns a const pointer to the first element of this vector.
+    const T *cbegin() const { return reinterpret_cast<const T *>(inner + 1); }
+
+    /// Returns a const pointer that points past the last element of this vector. The
+    /// pointer cannot be dereferenced, it can only be used for comparison.
+    const T *cend() const { return cbegin() + inner->size; }
+
+    /// Returns a const pointer to the first element of this vector.
+    const T *begin() const { return cbegin(); }
+    /// Returns a const pointer that points past the last element of this vector. The
+    /// pointer cannot be dereferenced, it can only be used for comparison.
+    const T *end() const { return cend(); }
+
+    /// Returns a pointer to the first element of this vector.
+    T *begin()
+    {
+        detach(inner->size);
+        return reinterpret_cast<T *>(inner + 1);
+    }
+
+    /// Returns a pointer that points past the last element of this vector. The
+    /// pointer cannot be dereferenced, it can only be used for comparison.
+    T *end()
+    {
+        detach(inner->size);
+        return begin() + inner->size;
+    }
+
+    /// Returns the number of elements in this vector.
+    std::size_t size() const { return inner->size; }
+
+    /// Returns true if there are no elements on this vector; false otherwise.
+    bool empty() const { return inner->size == 0; }
+
+    /// This indexing operator returns a reference to the `index`th element of this vector.
+    T &operator[](std::size_t index) { return begin()[index]; }
+
+    /// This indexing operator returns a const reference to the `index`th element of this vector.
+    const T &operator[](std::size_t index) const { return begin()[index]; }
+
+    /// Returns a reference to the `index`th element of this vector.
+    const T &at(std::size_t index) const { return begin()[index]; }
+
+    /// Appends the `value` as a new element to the end of this vector.
+    void push_back(const T &value)
+    {
+        detach(inner->size + 1);
+        new (end()) T(value);
+        inner->size++;
+    }
+
+    /// Moves the `value` as a new element to the end of this vector.
+    void push_back(T &&value)
+    {
+        detach(inner->size + 1);
+        new (end()) T(std::move(value));
+        inner->size++;
+    }
+
+    /// Clears the vector and removes all elements. The capacity remains unaffected.
+    void clear()
+    {
+        if (inner->refcount != 1) {
+            *this = Vector();
+        } else {
+            auto b = cbegin(), e = cend();
+            inner->size = 0;
+            for (auto it = b; it < e; ++it) {
+                it->~T();
+            }
+        }
+    }
+
+    /// Returns true if the vector `a` has the same number of elements as `b`
+    /// and all the elements also compare equal; false otherwise.
+    friend bool operator==(const Vector &a, const Vector &b)
+    {
+        if (a.size() != b.size())
+            return false;
+        return std::equal(a.cbegin(), a.cend(), b.cbegin());
+    }
+
+    /// Returns the current allocated capacity of this vector.
+    std::size_t capacity() const { return inner->capacity; }
+
 private:
+    void detach(std::size_t expected_capacity)
+    {
+        if (inner->refcount == 1 && expected_capacity <= inner->capacity) {
+            return;
+        }
+        auto new_array = Vector::with_capacity(expected_capacity);
+        auto old_data = reinterpret_cast<const T *>(inner + 1);
+        auto new_data = reinterpret_cast<T *>(new_array.inner + 1);
+        for (std::size_t i = 0; i < inner->size; ++i) {
+            new (new_data + i) T(old_data[i]);
+            new_array.inner->size++;
+        }
+        *this = std::move(new_array);
+    }
+
+    void drop()
+    {
+        if (inner->refcount > 0 && (--inner->refcount) == 0) {
+            auto b = cbegin(), e = cend();
+            for (auto it = b; it < e; ++it) {
+                it->~T();
+            }
+            cbindgen_private::resolvo_vector_free(reinterpret_cast<uint8_t *>(inner),
+                                                       sizeof(Header)
+                                                               + inner->capacity * sizeof(T),
+                                                       alignof(Header));
+        }
+    }
+
+    static Vector with_capacity(std::size_t capacity)
+    {
+        auto mem = cbindgen_private::resolvo_vector_allocate(
+                sizeof(Header) + capacity * sizeof(T), alignof(Header));
+        return Vector(new (mem) Header { { 1 }, 0, capacity });
+    }
+
     struct Header
     {
         std::atomic<std::intptr_t> refcount;
@@ -104,6 +229,6 @@ private:
                   "Not yet supported because we would need to add padding");
     Header *inner;
     explicit Vector(Header *inner) : inner(inner) { }
-}
+};
 
 }

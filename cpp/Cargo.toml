@@ -12,8 +12,8 @@ edition.workspace = true
 readme.workspace = true
 publish = false
 
-# prefix used to convey path to generated includes to the C++ test driver
-links = "resolvo_cpp"
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 resolvo = { path = "../" }
@@ -21,3 +21,4 @@ resolvo = { path = "../" }
 [build-dependencies]
 anyhow = "1"
 cbindgen = "0.26.0"
+
