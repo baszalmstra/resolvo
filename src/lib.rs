@@ -12,6 +12,7 @@
 
 mod conditional_requirement;
 pub mod conflict;
+pub mod extra;
 pub(crate) mod internal;
 mod requirement;
 pub mod runtime;
@@ -25,8 +26,9 @@ use std::{
 };
 
 pub use conditional_requirement::{Condition, ConditionalRequirement, LogicalOperator};
+pub use extra::Extra;
 pub use internal::{
-    id::{ConditionId, NameId, SolvableId, StringId, VersionSetId, VersionSetUnionId},
+    id::{ConditionId, ExtraId, NameId, SolvableId, StringId, VersionSetId, VersionSetUnionId},
     mapping::Mapping,
 };
 use itertools::Itertools;
@@ -108,6 +110,16 @@ pub trait Interner {
     /// allows implementers to have a custom representation for conditions that
     /// differ from the representation of the solver.
     fn resolve_condition(&self, condition: ConditionId) -> Condition;
+
+    /// Returns an object that can be used to display the given extra in a
+    /// user-friendly way.
+    fn display_extra(&self, extra: ExtraId) -> impl Display + '_;
+
+    /// Returns the base solvable for the given extra.
+    fn extra_base_solvable(&self, extra: ExtraId) -> SolvableId;
+
+    /// Resolves an ExtraId to its Extra data.
+    fn resolve_extra(&self, extra: ExtraId) -> &Extra;
 }
 
 /// Defines implementation specific behavior for the solver and a way for the
@@ -146,6 +158,20 @@ pub trait DependencyProvider: Sized + Interner {
     /// [UnsolvableOrCancelled::Cancelled].
     fn should_cancel_with_value(&self) -> Option<Box<dyn Any>> {
         None
+    }
+
+    /// Check if a solvable has a specific extra.
+    ///
+    /// This method is used by the solver to validate that a solvable actually
+    /// supports the requested extra before including it in the solution.
+    ///
+    /// Default implementation returns `true` for backward compatibility.
+    fn has_extra(&self, solvable: SolvableId, extra_name: &str) -> bool {
+        // Default implementation assumes all solvables have all extras
+        // This maintains backward compatibility but should be overridden
+        // by providers that support extras
+        let _ = (solvable, extra_name);
+        true
     }
 }
 

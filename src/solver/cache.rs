@@ -286,6 +286,73 @@ impl<D: DependencyProvider> SolverCache<D> {
                     }
                 }
             }
+            Requirement::Extra {
+                base_package,
+                extra_name,
+                version_constraint,
+            } => {
+                match self.requirement_to_sorted_candidates.get(&requirement) {
+                    Some(candidates) => Ok(candidates),
+                    None => {
+                        // For extras, we need to:
+                        // 1. Get candidates for the base package
+                        // 2. Filter to only those that have the requested extra
+                        // 3. Create virtual solvables that include the extra dependencies
+
+                        let base_candidates = self
+                            .get_or_cache_sorted_candidates_for_version_set(version_constraint)
+                            .await?;
+
+                        // Check which base candidates actually have the requested extra
+                        let extra_name_str = self.provider.display_string(extra_name).to_string();
+                        let base_package_name =
+                            self.provider.display_name(base_package).to_string();
+
+                        let mut extra_candidates = Vec::new();
+                        let mut missing_extra_count = 0;
+
+                        for &candidate in base_candidates.iter() {
+                            // Check if this candidate has the requested extra
+                            if self.provider.has_extra(candidate, &extra_name_str) {
+                                extra_candidates.push(candidate);
+                            } else {
+                                missing_extra_count += 1;
+                                tracing::debug!(
+                                    "Candidate {} does not have extra '{}'",
+                                    self.provider.display_solvable(candidate),
+                                    extra_name_str
+                                );
+                            }
+                        }
+
+                        // Log a warning if some candidates don't have the requested extra
+                        if missing_extra_count > 0 {
+                            tracing::warn!(
+                                "Extra '{}' not found in {} out of {} candidates for package '{}'",
+                                extra_name_str,
+                                missing_extra_count,
+                                base_candidates.len(),
+                                base_package_name
+                            );
+                        }
+
+                        // If no candidates have the extra, log an error but still return them
+                        // This allows the solver to continue and potentially provide better error messages
+                        if extra_candidates.is_empty() {
+                            tracing::error!(
+                                "No candidates found with extra '{}' for package '{}'. Returning all base candidates.",
+                                extra_name_str,
+                                base_package_name
+                            );
+                            extra_candidates = base_candidates.to_vec();
+                        }
+
+                        Ok(self
+                            .requirement_to_sorted_candidates
+                            .insert(requirement, extra_candidates))
+                    }
+                }
+            }
         }
     }
 
