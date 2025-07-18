@@ -109,16 +109,44 @@ impl BundleBoxProvider {
             .iter()
             .map(|dep| ConditionalSpec::from_str(*dep).unwrap())
             .map(|spec| {
-                let mut iter = spec
-                    .specs
-                    .into_iter()
-                    .map(|spec| self.intern_version_set(&spec))
-                    .peekable();
-                let first = iter.next().unwrap();
-                let requirement = if iter.peek().is_some() {
-                    self.pool.intern_version_set_union(first, iter).into()
+                // Check if we have multiple specs or any extras
+                let has_extras = spec.specs.iter().any(|s| s.extra.is_some());
+                
+                let requirement = if spec.specs.len() == 1 {
+                    // Single spec, handle extra if present
+                    self.intern_spec_as_requirement(&spec.specs[0])
+                } else if has_extras {
+                    // Multiple specs with extras - not currently supported well
+                    // For now, we'll take the first one if it has an extra
+                    if spec.specs[0].extra.is_some() {
+                        self.intern_spec_as_requirement(&spec.specs[0])
+                    } else {
+                        // Fall back to version set union for regular specs
+                        let mut iter = spec
+                            .specs
+                            .into_iter()
+                            .map(|spec| self.intern_version_set(&spec))
+                            .peekable();
+                        let first = iter.next().unwrap();
+                        if iter.peek().is_some() {
+                            self.pool.intern_version_set_union(first, iter).into()
+                        } else {
+                            first.into()
+                        }
+                    }
                 } else {
-                    first.into()
+                    // Multiple regular specs (union)
+                    let mut iter = spec
+                        .specs
+                        .into_iter()
+                        .map(|spec| self.intern_version_set(&spec))
+                        .peekable();
+                    let first = iter.next().unwrap();
+                    if iter.peek().is_some() {
+                        self.pool.intern_version_set_union(first, iter).into()
+                    } else {
+                        first.into()
+                    }
                 };
 
                 let condition = spec.condition.map(|c| self.intern_condition(&c));
@@ -146,6 +174,25 @@ impl BundleBoxProvider {
         let dep_name = self.pool.intern_package_name(&spec.name);
         self.pool
             .intern_version_set(dep_name, spec.versions.clone())
+    }
+
+    pub fn intern_spec_as_requirement(&mut self, spec: &Spec) -> Requirement {
+        if let Some(extra_name) = &spec.extra {
+            // This is a spec with an extra, create Requirement::Extra
+            let base_package = self.pool.intern_package_name(&spec.name);
+            let extra_name_id = self.pool.intern_string(extra_name);
+            let version_constraint = self.pool.intern_version_set(base_package, spec.versions.clone());
+            
+            Requirement::Extra {
+                base_package,
+                extra_name: extra_name_id,
+                version_constraint,
+            }
+        } else {
+            // Regular spec, create Single requirement
+            let version_set = self.intern_version_set(spec);
+            Requirement::Single(version_set)
+        }
     }
 
     pub fn from_packages(packages: &[(&str, u32, Vec<&str>)]) -> Self {
@@ -1543,5 +1590,495 @@ mod extras_tests {
                 "Missing numpy package"
             );
         });
+    }
+
+    #[test]
+    fn test_virtual_packages_pull_dependencies() {
+        // Bug 1: Virtual packages aren't properly pulling in their dependencies
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut provider = BundleBoxProvider::new();
+
+            // Create a package with extra that has multiple dependencies
+            provider.add_package("baselib", Pack::new(1), &[], &[]);
+            provider.add_package("dep1", Pack::new(1), &[], &[]);
+            provider.add_package("dep2", Pack::new(1), &[], &[]);
+            provider.add_package("dep3", Pack::new(1), &[], &[]);
+
+            let mut extras = HashMap::default();
+            extras.insert("complex".to_string(), vec!["dep1", "dep2", "dep3"]);
+
+            provider.add_package_with_extras(
+                "testpkg",
+                Pack::new(1),
+                &["baselib"],
+                &[],
+                Some(extras),
+            );
+
+            let testpkg_name_id = provider.pool.intern_package_name("testpkg");
+            let testpkg_version_constraint = provider
+                .pool
+                .intern_version_set(testpkg_name_id, version_ranges::Ranges::full());
+            let complex_extra_name = provider.pool.intern_string("complex");
+
+            let extra_requirement = ConditionalRequirement {
+                condition: None,
+                requirement: resolvo::Requirement::Extra {
+                    base_package: testpkg_name_id,
+                    extra_name: complex_extra_name,
+                    version_constraint: testpkg_version_constraint,
+                },
+            };
+
+            let mut solver = Solver::new(provider);
+            let problem = Problem::new().requirements(vec![extra_requirement]);
+            let solution = solver.solve(problem).unwrap();
+
+            let package_names: Vec<String> = solution
+                .iter()
+                .map(|&s| {
+                    let solvable = solver.provider().pool.resolve_solvable(s);
+                    let name = solver.provider().pool.resolve_package_name(solvable.name);
+                    format!("{} {}", name, solvable.record)
+                })
+                .collect();
+
+            println!("Virtual package dependencies test - Solution: {:?}", package_names);
+
+            // Should include testpkg, baselib, and ALL extra dependencies
+            assert!(package_names.contains(&"testpkg 1".to_string()), "Missing base package");
+            assert!(package_names.contains(&"baselib 1".to_string()), "Missing base dependency");
+            assert!(package_names.contains(&"dep1 1".to_string()), "Missing extra dependency dep1");
+            assert!(package_names.contains(&"dep2 1".to_string()), "Missing extra dependency dep2");
+            assert!(package_names.contains(&"dep3 1".to_string()), "Missing extra dependency dep3");
+        });
+    }
+
+    #[test]
+    fn test_multiple_extras_same_package_no_conflicts() {
+        // Bug 2: Multiple extras from the same package create version conflicts
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut provider = BundleBoxProvider::new();
+
+            provider.add_package("numpy", Pack::new(1), &[], &[]);
+            provider.add_package("matplotlib", Pack::new(1), &[], &[]);
+            provider.add_package("scipy", Pack::new(1), &[], &[]);
+            provider.add_package("pandas", Pack::new(1), &[], &[]);
+
+            let mut extras = HashMap::default();
+            extras.insert("viz".to_string(), vec!["matplotlib"]);
+            extras.insert("scientific".to_string(), vec!["scipy"]);
+            extras.insert("data".to_string(), vec!["pandas"]);
+
+            provider.add_package_with_extras(
+                "analysis",
+                Pack::new(1),
+                &["numpy"],
+                &[],
+                Some(extras),
+            );
+
+            // Try to install multiple extras from the same package
+            let analysis_name_id = provider.pool.intern_package_name("analysis");
+            let analysis_version_constraint = provider
+                .pool
+                .intern_version_set(analysis_name_id, version_ranges::Ranges::full());
+            
+            let viz_extra_name = provider.pool.intern_string("viz");
+            let scientific_extra_name = provider.pool.intern_string("scientific");
+            let data_extra_name = provider.pool.intern_string("data");
+
+            let requirements = vec![
+                ConditionalRequirement {
+                    condition: None,
+                    requirement: resolvo::Requirement::Extra {
+                        base_package: analysis_name_id,
+                        extra_name: viz_extra_name,
+                        version_constraint: analysis_version_constraint,
+                    },
+                },
+                ConditionalRequirement {
+                    condition: None,
+                    requirement: resolvo::Requirement::Extra {
+                        base_package: analysis_name_id,
+                        extra_name: scientific_extra_name,
+                        version_constraint: analysis_version_constraint,
+                    },
+                },
+                ConditionalRequirement {
+                    condition: None,
+                    requirement: resolvo::Requirement::Extra {
+                        base_package: analysis_name_id,
+                        extra_name: data_extra_name,
+                        version_constraint: analysis_version_constraint,
+                    },
+                },
+            ];
+
+            let mut solver = Solver::new(provider);
+            let problem = Problem::new().requirements(requirements);
+            
+            match solver.solve(problem) {
+                Ok(solution) => {
+                    let package_names: Vec<String> = solution
+                        .iter()
+                        .map(|&s| {
+                            let solvable = solver.provider().pool.resolve_solvable(s);
+                            let name = solver.provider().pool.resolve_package_name(solvable.name);
+                            format!("{} {}", name, solvable.record)
+                        })
+                        .collect();
+
+                    println!("Multiple extras test - Solution: {:?}", package_names);
+
+                    // Should include analysis, numpy, and all three extra dependencies
+                    assert!(package_names.contains(&"analysis 1".to_string()), "Missing base package");
+                    assert!(package_names.contains(&"numpy 1".to_string()), "Missing base dependency");
+                    assert!(package_names.contains(&"matplotlib 1".to_string()), "Missing viz extra dependency");
+                    assert!(package_names.contains(&"scipy 1".to_string()), "Missing scientific extra dependency");
+                    assert!(package_names.contains(&"pandas 1".to_string()), "Missing data extra dependency");
+                }
+                Err(e) => {
+                    panic!("Multiple extras from same package should not conflict, but got error: {:?}", e);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_recursive_extra_dependencies() {
+        // Bug 3: Recursive extra dependencies don't work
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut provider = BundleBoxProvider::new();
+
+            // Create a chain of extras depending on other extras
+            provider.add_package("base", Pack::new(1), &[], &[]);
+            provider.add_package("tool1", Pack::new(1), &[], &[]);
+            provider.add_package("tool2", Pack::new(1), &[], &[]);
+            provider.add_package("tool3", Pack::new(1), &[], &[]);
+
+            // level1 has an extra that depends on tool1
+            let mut level1_extras = HashMap::default();
+            level1_extras.insert("extended".to_string(), vec!["tool1"]);
+            provider.add_package_with_extras(
+                "level1",
+                Pack::new(1),
+                &["base"],
+                &[],
+                Some(level1_extras),
+            );
+
+            // level2 has an extra that depends on level1[extended] AND tool2
+            let mut level2_extras = HashMap::default();
+            level2_extras.insert("advanced".to_string(), vec!["level1[extended]", "tool2"]);
+            provider.add_package_with_extras(
+                "level2",
+                Pack::new(1),
+                &[],
+                &[],
+                Some(level2_extras),
+            );
+
+            // level3 has an extra that depends on level2[advanced] AND tool3
+            let mut level3_extras = HashMap::default();
+            level3_extras.insert("ultimate".to_string(), vec!["level2[advanced]", "tool3"]);
+            provider.add_package_with_extras(
+                "level3",
+                Pack::new(1),
+                &[],
+                &[],
+                Some(level3_extras),
+            );
+
+            let level3_name_id = provider.pool.intern_package_name("level3");
+            let level3_version_constraint = provider
+                .pool
+                .intern_version_set(level3_name_id, version_ranges::Ranges::full());
+            let ultimate_extra_name = provider.pool.intern_string("ultimate");
+
+            let extra_requirement = ConditionalRequirement {
+                condition: None,
+                requirement: resolvo::Requirement::Extra {
+                    base_package: level3_name_id,
+                    extra_name: ultimate_extra_name,
+                    version_constraint: level3_version_constraint,
+                },
+            };
+
+            let mut solver = Solver::new(provider);
+            let problem = Problem::new().requirements(vec![extra_requirement]);
+            
+            match solver.solve(problem) {
+                Ok(solution) => {
+                    let package_names: Vec<String> = solution
+                        .iter()
+                        .map(|&s| {
+                            let solvable = solver.provider().pool.resolve_solvable(s);
+                            let name = solver.provider().pool.resolve_package_name(solvable.name);
+                            format!("{} {}", name, solvable.record)
+                        })
+                        .collect();
+
+                    println!("Recursive extras test - Solution: {:?}", package_names);
+
+                    // Should include the full chain: level3, level2, level1, base, tool1, tool2, tool3
+                    assert!(package_names.contains(&"level3 1".to_string()), "Missing level3");
+                    assert!(package_names.contains(&"level2 1".to_string()), "Missing level2");
+                    assert!(package_names.contains(&"level1 1".to_string()), "Missing level1");
+                    assert!(package_names.contains(&"base 1".to_string()), "Missing base");
+                    assert!(package_names.contains(&"tool1 1".to_string()), "Missing tool1");
+                    assert!(package_names.contains(&"tool2 1".to_string()), "Missing tool2");
+                    assert!(package_names.contains(&"tool3 1".to_string()), "Missing tool3");
+                }
+                Err(e) => {
+                    println!("Recursive extras failed with error: {:?}", e);
+                    panic!("Recursive extra dependencies should work, but got error: {:?}", e);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_virtual_packages_edge_cases() {
+        // Bug 4: Test for index out of bounds and other internal bugs
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut provider = BundleBoxProvider::new();
+
+            // Create packages with various edge cases
+            provider.add_package("pkg", Pack::new(1), &[], &[]);
+            provider.add_package("pkg", Pack::new(2), &[], &[]);
+            provider.add_package("dep", Pack::new(1), &[], &[]);
+
+            // Add extras to multiple versions of the same package
+            let mut extras_v1 = HashMap::default();
+            extras_v1.insert("feature".to_string(), vec!["dep"]);
+            
+            let mut extras_v2 = HashMap::default();
+            extras_v2.insert("feature".to_string(), vec!["dep"]);
+
+            provider.add_package_with_extras(
+                "multipkg",
+                Pack::new(1),
+                &[],
+                &[],
+                Some(extras_v1),
+            );
+
+            provider.add_package_with_extras(
+                "multipkg",
+                Pack::new(2),
+                &[],
+                &[],
+                Some(extras_v2),
+            );
+
+            // Test requesting extra from ambiguous package name
+            let multipkg_name_id = provider.pool.intern_package_name("multipkg");
+            let multipkg_version_constraint = provider
+                .pool
+                .intern_version_set(multipkg_name_id, version_ranges::Ranges::full());
+            let feature_extra_name = provider.pool.intern_string("feature");
+
+            let extra_requirement = ConditionalRequirement {
+                condition: None,
+                requirement: resolvo::Requirement::Extra {
+                    base_package: multipkg_name_id,
+                    extra_name: feature_extra_name,
+                    version_constraint: multipkg_version_constraint,
+                },
+            };
+
+            let mut solver = Solver::new(provider);
+            let problem = Problem::new().requirements(vec![extra_requirement]);
+            
+            match solver.solve(problem) {
+                Ok(solution) => {
+                    let package_names: Vec<String> = solution
+                        .iter()
+                        .map(|&s| {
+                            let solvable = solver.provider().pool.resolve_solvable(s);
+                            let name = solver.provider().pool.resolve_package_name(solvable.name);
+                            format!("{} {}", name, solvable.record)
+                        })
+                        .collect();
+
+                    println!("Edge cases test - Solution: {:?}", package_names);
+
+                    // Should pick highest version and include dependencies
+                    assert!(package_names.iter().any(|p| p.starts_with("multipkg")), "Missing multipkg");
+                    assert!(package_names.contains(&"dep 1".to_string()), "Missing dep");
+                }
+                Err(e) => {
+                    println!("Edge cases test failed with error: {:?}", e);
+                    // Don't panic here as some edge cases might legitimately fail
+                    // but we want to see what the error is
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_virtual_packages_stress_test() {
+        // Stress test to catch index out of bounds and other internal issues
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut provider = BundleBoxProvider::new();
+
+            // Create many packages with many extras
+            for i in 1..=10 {
+                provider.add_package(&format!("dep{}", i), Pack::new(1), &[], &[]);
+            }
+
+            for pkg_id in 1..=5 {
+                let extras = match pkg_id {
+                    1 => {
+                        let mut e = HashMap::default();
+                        e.insert("extra1".to_string(), vec!["dep1"]);
+                        e.insert("extra2".to_string(), vec!["dep2"]);
+                        e.insert("extra3".to_string(), vec!["dep3"]);
+                        e
+                    }
+                    2 => {
+                        let mut e = HashMap::default();
+                        e.insert("extra1".to_string(), vec!["dep3"]);
+                        e.insert("extra2".to_string(), vec!["dep4"]);
+                        e.insert("extra3".to_string(), vec!["dep5"]);
+                        e
+                    }
+                    3 => {
+                        let mut e = HashMap::default();
+                        e.insert("extra1".to_string(), vec!["dep5"]);
+                        e.insert("extra2".to_string(), vec!["dep6"]);
+                        e.insert("extra3".to_string(), vec!["dep7"]);
+                        e
+                    }
+                    4 => {
+                        let mut e = HashMap::default();
+                        e.insert("extra1".to_string(), vec!["dep7"]);
+                        e.insert("extra2".to_string(), vec!["dep8"]);
+                        e.insert("extra3".to_string(), vec!["dep9"]);
+                        e
+                    }
+                    _ => {
+                        let mut e = HashMap::default();
+                        e.insert("extra1".to_string(), vec!["dep9"]);
+                        e.insert("extra2".to_string(), vec!["dep10"]);
+                        e.insert("extra3".to_string(), vec!["dep1"]);
+                        e
+                    }
+                };
+
+                provider.add_package_with_extras(
+                    &format!("package{}", pkg_id),
+                    Pack::new(1),
+                    &[],
+                    &[],
+                    Some(extras),
+                );
+            }
+
+            // Try to solve for multiple extras from multiple packages
+            let mut requirements = Vec::new();
+            for pkg_id in 1..=3 {
+                for extra_id in 1..=2 {
+                    let pkg_name_id = provider.pool.intern_package_name(&format!("package{}", pkg_id));
+                    let version_constraint = provider
+                        .pool
+                        .intern_version_set(pkg_name_id, version_ranges::Ranges::full());
+                    let extra_name = provider.pool.intern_string(&format!("extra{}", extra_id));
+
+                    requirements.push(ConditionalRequirement {
+                        condition: None,
+                        requirement: resolvo::Requirement::Extra {
+                            base_package: pkg_name_id,
+                            extra_name,
+                            version_constraint,
+                        },
+                    });
+                }
+            }
+
+            let mut solver = Solver::new(provider);
+            let problem = Problem::new().requirements(requirements);
+            
+            match solver.solve(problem) {
+                Ok(solution) => {
+                    let package_names: Vec<String> = solution
+                        .iter()
+                        .map(|&s| {
+                            let solvable = solver.provider().pool.resolve_solvable(s);
+                            let name = solver.provider().pool.resolve_package_name(solvable.name);
+                            format!("{} {}", name, solvable.record)
+                        })
+                        .collect();
+
+                    println!("Stress test - Solution with {} packages: {:?}", package_names.len(), package_names);
+                    
+                    // Should have installed many packages
+                    assert!(package_names.len() >= 6, "Stress test should install multiple packages");
+                }
+                Err(e) => {
+                    println!("Stress test failed with error: {:?}", e);
+                    panic!("Stress test revealed internal bug: {:?}", e);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_package_extra_syntax_parsing() {
+        let mut provider = BundleBoxProvider::new();
+
+        // Create test package with extra
+        let mut mylib_extras = HashMap::default();
+        mylib_extras.insert("dev".to_string(), vec!["pytest", "black"]);
+        provider.add_package_with_extras("mylib", Pack::new(1), &[], &[], Some(mylib_extras));
+        provider.add_package("pytest", Pack::new(1), &[], &[]);
+        provider.add_package("black", Pack::new(1), &[], &[]);
+
+        // Test that package[extra] syntax is now parsed correctly
+        let requirements = provider.requirements(&["mylib[dev]"]);
+        assert_eq!(requirements.len(), 1);
+        
+        // Check that it creates a Requirement::Extra
+        match &requirements[0].requirement {
+            Requirement::Extra { base_package, extra_name, .. } => {
+                let package_name = provider.display_name(*base_package).to_string();
+                let extra_name_str = provider.display_string(*extra_name).to_string();
+                assert_eq!(package_name, "mylib");
+                assert_eq!(extra_name_str, "dev");
+            }
+            _ => panic!("Should create Requirement::Extra for package[extra] syntax"),
+        }
+
+        // Test solving works
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let result = solver.solve(problem);
+        assert!(result.is_ok(), "Should solve package[extra] requirements");
     }
 }

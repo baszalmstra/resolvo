@@ -8,11 +8,16 @@ use version_ranges::Ranges;
 pub struct Spec {
     pub name: String,
     pub versions: Ranges<Pack>,
+    pub extra: Option<String>,
 }
 
 impl Spec {
     pub fn new(name: String, versions: Ranges<Pack>) -> Self {
-        Self { name, versions }
+        Self { name, versions, extra: None }
+    }
+
+    pub fn new_with_extra(name: String, extra: String, versions: Ranges<Pack>) -> Self {
+        Self { name, versions, extra: Some(extra) }
     }
 }
 

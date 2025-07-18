@@ -74,13 +74,26 @@ fn ranges<'src>()
         })
 }
 
-/// Parses a single [`Spec`]. E.g. `foo 1..2` or `bar 3` or `baz`.
+/// Parses a single [`Spec`]. E.g. `foo 1..2` or `bar 3` or `baz` or `foo[extra]`.
 pub(crate) fn spec<'src>()
 -> impl Parser<'src, &'src str, Spec, extra::Err<error::Simple<'src, char>>> {
     name()
         .padded()
+        .then(
+            just("[")
+                .ignore_then(name().map(|s: &str| s.to_string()))
+                .then_ignore(just("]"))
+                .or_not()
+        )
         .then(ranges().or_not())
-        .map(|(name, range)| Spec::new(name.to_string(), range.unwrap_or(Ranges::full())))
+        .map(|((name, extra), range)| {
+            if let Some(extra_name) = extra {
+                // Create a special spec that represents an extra requirement
+                Spec::new_with_extra(name.to_string(), extra_name, range.unwrap_or(Ranges::full()))
+            } else {
+                Spec::new(name.to_string(), range.unwrap_or(Ranges::full()))
+            }
+        })
 }
 
 fn condition<'src>()
