@@ -7,7 +7,7 @@ use event_listener::Event;
 
 use crate::{
     Candidates, Dependencies, DependencyProvider, HintDependenciesAvailable, NameId, Requirement,
-    SolvableId, VersionSetId,
+    SolvableId, StringId, VersionSetId,
     internal::{
         arena::{Arena, ArenaId},
         frozen_copy_map::FrozenCopyMap,
@@ -286,6 +286,29 @@ impl<D: DependencyProvider> SolverCache<D> {
                     }
                 }
             }
+            Requirement::Extra {
+                base_package,
+                extra_name,
+                version_constraint,
+            } => {
+                match self.requirement_to_sorted_candidates.get(&requirement) {
+                    Some(candidates) => Ok(candidates),
+                    None => {
+                        // For extras, we create virtual solvables that represent "base package + extra"
+                        let virtual_candidates = self
+                            .create_virtual_extra_solvables(
+                                base_package,
+                                extra_name,
+                                version_constraint,
+                            )
+                            .await?;
+
+                        Ok(self
+                            .requirement_to_sorted_candidates
+                            .insert(requirement, virtual_candidates))
+                    }
+                }
+            }
         }
     }
 
@@ -352,6 +375,7 @@ impl<D: DependencyProvider> SolverCache<D> {
                 }
 
                 let dependencies = self.provider.get_dependencies(solvable_id).await;
+
                 let dependencies_id = self.solvable_dependencies.alloc(dependencies);
                 self.solvable_to_dependencies
                     .insert_copy(solvable_id, dependencies_id);
@@ -378,5 +402,97 @@ impl<D: DependencyProvider> SolverCache<D> {
                 .copied();
             value.unwrap_or(false)
         }
+    }
+
+    /// Creates virtual solvables for extra requirements.
+    /// Virtual solvables represent "base package + extra" combinations.
+    async fn create_virtual_extra_solvables(
+        &self,
+        base_package: NameId,
+        extra_name: StringId,
+        version_constraint: VersionSetId,
+    ) -> Result<Vec<SolvableId>, Box<dyn std::any::Any>> {
+        // Create virtual solvables for extra requirements
+
+        // Get candidates for the base package that have this extra
+        let base_candidates = self
+            .get_or_cache_sorted_candidates_for_version_set(version_constraint)
+            .await?;
+
+        tracing::debug!("Got {} base candidates", base_candidates.len());
+
+        let extra_name_str = self.provider.display_string(extra_name).to_string();
+        let base_package_name = self.provider.display_name(base_package).to_string();
+
+        let mut virtual_candidates = Vec::new();
+        let mut missing_extra_count = 0;
+
+        for &candidate in base_candidates.iter() {
+            tracing::debug!(
+                "Checking candidate: {}",
+                self.provider.display_solvable(candidate)
+            );
+            if self.provider.has_extra(candidate, &extra_name_str) {
+                tracing::debug!(
+                    "Candidate has extra '{}', creating virtual solvable",
+                    extra_name_str
+                );
+                // Create a virtual solvable for this base candidate + extra
+                let virtual_solvable = self
+                    .create_virtual_solvable_for_extra(candidate, &extra_name_str)
+                    .await?;
+                tracing::debug!(
+                    "Created virtual solvable: {}",
+                    self.provider.display_solvable(virtual_solvable)
+                );
+                virtual_candidates.push(virtual_solvable);
+            } else {
+                missing_extra_count += 1;
+                tracing::debug!(
+                    "Candidate {} does not have extra '{}'",
+                    self.provider.display_solvable(candidate),
+                    extra_name_str
+                );
+            }
+        }
+
+        // Log warnings for missing extras
+        if missing_extra_count > 0 {
+            tracing::warn!(
+                "Extra '{}' not found in {} out of {} candidates for package '{}'",
+                extra_name_str,
+                missing_extra_count,
+                base_candidates.len(),
+                base_package_name
+            );
+        }
+
+        if virtual_candidates.is_empty() {
+            tracing::error!(
+                "No candidates found with extra '{}' for package '{}'",
+                extra_name_str,
+                base_package_name
+            );
+        }
+
+        tracing::debug!("Returning {} virtual candidates", virtual_candidates.len());
+        Ok(virtual_candidates)
+    }
+
+    /// Creates a virtual solvable that represents a base solvable + extra.
+    /// The virtual solvable will have dependencies that include both the base solvable
+    /// and all the extra dependencies.
+    async fn create_virtual_solvable_for_extra(
+        &self,
+        base_solvable: SolvableId,
+        extra_name: &str,
+    ) -> Result<SolvableId, Box<dyn std::any::Any>> {
+        // Create a virtual solvable through the provider
+        // The provider is responsible for creating and managing virtual solvables
+        let virtual_solvable = self
+            .provider
+            .create_virtual_extra_solvable(base_solvable, extra_name)
+            .await?;
+        Ok(virtual_solvable)
     }
 }

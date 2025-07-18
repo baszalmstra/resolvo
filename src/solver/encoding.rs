@@ -544,14 +544,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     ) {
         let cache = self.cache;
         let query_requirements_candidates = async move {
-            let candidates = futures::future::try_join_all(
-                requirement
-                    .requirement
-                    .version_sets(cache.provider())
-                    .map(|version_set| {
-                        cache.get_or_cache_sorted_candidates_for_version_set(version_set)
-                    }),
-            );
+            let candidates = cache.get_or_cache_sorted_candidates(requirement.requirement).await?;
+            let candidates = vec![candidates];
+            let candidates = ready(Ok(candidates));
 
             let condition_candidates = match requirement.condition {
                 Some(condition) => futures::future::try_join_all(

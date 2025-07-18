@@ -3,10 +3,11 @@ use std::{
     hash::Hash,
 };
 
+use crate::extra::Extra;
 use crate::internal::{
     arena::Arena,
     frozen_copy_map::FrozenCopyMap,
-    id::{NameId, SolvableId, StringId, VersionSetId, VersionSetUnionId},
+    id::{ExtraId, NameId, SolvableId, StringId, VersionSetId, VersionSetUnionId},
     small_vec::SmallVec,
 };
 
@@ -50,6 +51,9 @@ pub struct Pool<VS: VersionSet, N: PackageName = String> {
     version_set_to_id: FrozenCopyMap<(NameId, VS), VersionSetId, ahash::RandomState>,
 
     version_set_unions: Arena<VersionSetUnionId, SmallVec<VersionSetId>>,
+
+    /// Interned extras (optional dependency groups)
+    pub(crate) extras: Arena<ExtraId, Extra>,
 }
 
 impl<VS: VersionSet, N: PackageName> Default for Pool<VS, N> {
@@ -65,6 +69,7 @@ impl<VS: VersionSet, N: PackageName> Default for Pool<VS, N> {
             version_set_to_id: Default::default(),
             version_sets: Arena::new(),
             version_set_unions: Arena::new(),
+            extras: Arena::new(),
         }
     }
 }
@@ -212,6 +217,71 @@ impl<VS: VersionSet, N: PackageName> Pool<VS, N> {
         id: VersionSetUnionId,
     ) -> impl Iterator<Item = VersionSetId> + '_ {
         self.version_set_unions[id].iter().copied()
+    }
+
+    /// Interns an extra into the pool and returns its [`ExtraId`].
+    pub fn intern_extra(&self, extra: Extra) -> ExtraId {
+        self.extras.alloc(extra)
+    }
+
+    /// Returns the extra associated with the provided [`ExtraId`].
+    ///
+    /// Panics if the extra is not found in the pool.
+    pub fn resolve_extra(&self, extra_id: ExtraId) -> &Extra {
+        &self.extras[extra_id]
+    }
+
+    /// Convenience method to create and intern an extra for a specific solvable.
+    pub fn intern_extra_for_solvable(
+        &self,
+        name: String,
+        base_solvable: SolvableId,
+        dependencies: Vec<crate::ConditionalRequirement>,
+    ) -> ExtraId {
+        let extra = Extra::new(name, base_solvable, dependencies);
+        self.intern_extra(extra)
+    }
+
+    /// Find an extra by name for a given solvable.
+    pub fn find_extra_for_solvable(
+        &self,
+        base_solvable: SolvableId,
+        name: &str,
+    ) -> Option<ExtraId> {
+        // Linear search through extras - could be optimized with a map if needed
+        for (extra_id, extra) in self.extras.iter() {
+            if extra.base_solvable == base_solvable && extra.name == name {
+                return Some(extra_id);
+            }
+        }
+        None
+    }
+
+    /// Get all extras for a given solvable.
+    pub fn get_extras_for_solvable(&self, base_solvable: SolvableId) -> Vec<ExtraId> {
+        let mut result = Vec::new();
+        for (extra_id, extra) in self.extras.iter() {
+            if extra.base_solvable == base_solvable {
+                result.push(extra_id);
+            }
+        }
+        result
+    }
+
+    /// Find all extras with a given name across all solvables of a package.
+    pub fn find_extras_by_name_and_package(
+        &self,
+        package_name: NameId,
+        extra_name: &str,
+    ) -> Vec<ExtraId> {
+        let mut result = Vec::new();
+        for (extra_id, extra) in self.extras.iter() {
+            let solvable = self.resolve_solvable(extra.base_solvable);
+            if solvable.name == package_name && extra.name == extra_name {
+                result.push(extra_id);
+            }
+        }
+        result
     }
 }
 

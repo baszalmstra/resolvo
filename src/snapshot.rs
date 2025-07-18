@@ -15,9 +15,9 @@ use ahash::HashSet;
 use futures::FutureExt;
 
 use crate::{
-    Candidates, Condition, Dependencies, DependencyProvider, HintDependenciesAvailable, Interner,
-    Mapping, NameId, Requirement, SolvableId, SolverCache, StringId, VersionSetId,
-    VersionSetUnionId,
+    Candidates, Condition, Dependencies, DependencyProvider, Extra, ExtraId,
+    HintDependenciesAvailable, Interner, Mapping, NameId, Requirement, SolvableId, SolverCache,
+    StringId, VersionSetId, VersionSetUnionId,
     internal::{arena::ArenaId, id::ConditionId},
 };
 
@@ -266,6 +266,15 @@ impl DependencySnapshot {
                                             .version_set_unions
                                             .insert(version_set_union_id, version_sets);
                                     }
+                                    Requirement::Extra {
+                                        version_constraint, ..
+                                    } => {
+                                        // For extras, we process their version constraint
+                                        if seen.insert(Element::VersionSet(version_constraint)) {
+                                            queue
+                                                .push_back(Element::VersionSet(version_constraint));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -497,6 +506,24 @@ impl Interner for SnapshotProvider<'_> {
             .expect("missing condition")
             .clone()
     }
+
+    fn display_extra(&self, _extra: ExtraId) -> impl Display + '_ {
+        // For snapshot provider, we don't have extras information
+        // In a full implementation, you'd store and resolve extras
+        "unknown_extra"
+    }
+
+    fn extra_base_solvable(&self, _extra: ExtraId) -> SolvableId {
+        // For snapshot provider, we don't have extras information
+        // Return a dummy solvable ID
+        SolvableId(0)
+    }
+
+    fn resolve_extra(&self, _extra: ExtraId) -> &Extra {
+        // For snapshot provider, we don't have extras information
+        // This should panic or return an error in a real implementation
+        panic!("Extras not supported in snapshot provider")
+    }
 }
 
 impl DependencyProvider for SnapshotProvider<'_> {
@@ -547,5 +574,12 @@ impl DependencyProvider for SnapshotProvider<'_> {
             }
         }
         None
+    }
+
+    fn has_extra(&self, solvable: SolvableId, extra_name: &str) -> bool {
+        // DependencySnapshot doesn't have knowledge of extras, so we delegate to the default implementation
+        // This returns `true` for backward compatibility
+        let _ = (solvable, extra_name);
+        true
     }
 }

@@ -12,6 +12,7 @@
 
 mod conditional_requirement;
 pub mod conflict;
+pub mod extra;
 pub(crate) mod internal;
 mod requirement;
 pub mod runtime;
@@ -25,8 +26,9 @@ use std::{
 };
 
 pub use conditional_requirement::{Condition, ConditionalRequirement, LogicalOperator};
+pub use extra::Extra;
 pub use internal::{
-    id::{ConditionId, NameId, SolvableId, StringId, VersionSetId, VersionSetUnionId},
+    id::{ConditionId, ExtraId, NameId, SolvableId, StringId, VersionSetId, VersionSetUnionId},
     mapping::Mapping,
 };
 use itertools::Itertools;
@@ -108,6 +110,16 @@ pub trait Interner {
     /// allows implementers to have a custom representation for conditions that
     /// differ from the representation of the solver.
     fn resolve_condition(&self, condition: ConditionId) -> Condition;
+
+    /// Returns an object that can be used to display the given extra in a
+    /// user-friendly way.
+    fn display_extra(&self, extra: ExtraId) -> impl Display + '_;
+
+    /// Returns the base solvable for the given extra.
+    fn extra_base_solvable(&self, extra: ExtraId) -> SolvableId;
+
+    /// Resolves an ExtraId to its Extra data.
+    fn resolve_extra(&self, extra: ExtraId) -> &Extra;
 }
 
 /// Defines implementation specific behavior for the solver and a way for the
@@ -146,6 +158,62 @@ pub trait DependencyProvider: Sized + Interner {
     /// [UnsolvableOrCancelled::Cancelled].
     fn should_cancel_with_value(&self) -> Option<Box<dyn Any>> {
         None
+    }
+
+    /// Check if a solvable has a specific extra.
+    ///
+    /// This method is used by the solver to validate that a solvable actually
+    /// supports the requested extra before including it in the solution.
+    ///
+    /// Default implementation returns `true` for backward compatibility.
+    fn has_extra(&self, solvable: SolvableId, extra_name: &str) -> bool {
+        // Default implementation assumes all solvables have all extras
+        // This maintains backward compatibility but should be overridden
+        // by providers that support extras
+        let _ = (solvable, extra_name);
+        true
+    }
+
+    /// Get the dependencies for a specific extra of a solvable.
+    ///
+    /// This method is used by the solver to get the additional dependencies
+    /// that should be included when a solvable is chosen to satisfy a
+    /// Requirement::Extra.
+    ///
+    /// Default implementation returns empty dependencies.
+    fn get_extra_dependencies(
+        &self,
+        solvable: SolvableId,
+        extra_name: &str,
+    ) -> Vec<ConditionalRequirement> {
+        // Default implementation returns no extra dependencies
+        // This maintains backward compatibility but should be overridden
+        // by providers that support extras
+        let _ = (solvable, extra_name);
+        Vec::new()
+    }
+
+    /// Create a virtual solvable that represents a base solvable with a specific extra.
+    ///
+    /// Virtual solvables are used to implement the extras feature. When the solver
+    /// encounters a Requirement::Extra, it creates virtual solvables that represent
+    /// the combination of a base package and an extra.
+    ///
+    /// The virtual solvable should have dependencies that include both:
+    /// 1. A strong dependency on the base solvable
+    /// 2. All dependencies from the requested extra
+    ///
+    /// Default implementation just returns the base solvable.
+    async fn create_virtual_extra_solvable(
+        &self,
+        base_solvable: SolvableId,
+        extra_name: &str,
+    ) -> Result<SolvableId, Box<dyn std::any::Any>> {
+        // Default implementation just returns the base solvable
+        // This maintains backward compatibility but providers that support extras
+        // should override this to create proper virtual solvables
+        let _ = extra_name;
+        Ok(base_solvable)
     }
 }
 
