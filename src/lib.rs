@@ -173,6 +173,48 @@ pub trait DependencyProvider: Sized + Interner {
         let _ = (solvable, extra_name);
         true
     }
+
+    /// Get the dependencies for a specific extra of a solvable.
+    ///
+    /// This method is used by the solver to get the additional dependencies
+    /// that should be included when a solvable is chosen to satisfy a
+    /// Requirement::Extra.
+    ///
+    /// Default implementation returns empty dependencies.
+    fn get_extra_dependencies(
+        &self,
+        solvable: SolvableId,
+        extra_name: &str,
+    ) -> Vec<ConditionalRequirement> {
+        // Default implementation returns no extra dependencies
+        // This maintains backward compatibility but should be overridden
+        // by providers that support extras
+        let _ = (solvable, extra_name);
+        Vec::new()
+    }
+
+    /// Create a virtual solvable that represents a base solvable with a specific extra.
+    ///
+    /// Virtual solvables are used to implement the extras feature. When the solver
+    /// encounters a Requirement::Extra, it creates virtual solvables that represent
+    /// the combination of a base package and an extra.
+    ///
+    /// The virtual solvable should have dependencies that include both:
+    /// 1. A strong dependency on the base solvable
+    /// 2. All dependencies from the requested extra
+    ///
+    /// Default implementation just returns the base solvable.
+    async fn create_virtual_extra_solvable(
+        &self,
+        base_solvable: SolvableId,
+        extra_name: &str,
+    ) -> Result<SolvableId, Box<dyn std::any::Any>> {
+        // Default implementation just returns the base solvable
+        // This maintains backward compatibility but providers that support extras
+        // should override this to create proper virtual solvables
+        let _ = extra_name;
+        Ok(base_solvable)
+    }
 }
 
 /// A list of candidate solvables for a specific package. This is returned from

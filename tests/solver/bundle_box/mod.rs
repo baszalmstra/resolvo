@@ -40,8 +40,8 @@ use itertools::Itertools;
 pub use pack::Pack;
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    Extra, ExtraId, Interner, KnownDependencies, NameId, SolvableId, SolverCache, StringId,
-    VersionSetId, VersionSetUnionId, snapshot::DependencySnapshot, utils::Pool,
+    Extra, ExtraId, Interner, KnownDependencies, NameId, Requirement, SolvableId, SolverCache,
+    StringId, VersionSetId, VersionSetUnionId, snapshot::DependencySnapshot, utils::Pool,
 };
 pub use spec::Spec;
 use version_ranges::Ranges;
@@ -67,6 +67,8 @@ pub struct BundleBoxProvider {
     requested_candidates: RefCell<HashSet<NameId>>,
     requested_dependencies: RefCell<HashSet<SolvableId>>,
     interned_solvables: RefCell<HashMap<(NameId, Pack), SolvableId>>,
+    /// Virtual solvables for extra combinations: (base_solvable, extra_name) -> virtual_solvable
+    virtual_extra_solvables: RefCell<HashMap<(SolvableId, String), SolvableId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -502,6 +504,13 @@ impl DependencyProvider for BundleBoxProvider {
         let package_name = self.pool.resolve_package_name(candidate.name);
         let pack = candidate.record;
 
+        // Check if this is a virtual solvable for an extra
+        if let Some((base_solvable, extra_name)) = self.find_base_solvable_for_virtual(solvable) {
+            return self
+                .get_virtual_solvable_dependencies(base_solvable, &extra_name)
+                .await;
+        }
+
         if pack.cancel_during_get_dependencies {
             self.cancel_solving.set(true);
             let reason = self.pool.intern_string("cancelled");
@@ -547,6 +556,132 @@ impl DependencyProvider for BundleBoxProvider {
         self.pool
             .find_extra_for_solvable(solvable, extra_name)
             .is_some()
+    }
+
+    fn get_extra_dependencies(
+        &self,
+        solvable: SolvableId,
+        extra_name: &str,
+    ) -> Vec<ConditionalRequirement> {
+        // Find the extra for this solvable and return its dependencies
+        if let Some(extra_id) = self.pool.find_extra_for_solvable(solvable, extra_name) {
+            let extra_data = self.pool.resolve_extra(extra_id);
+            extra_data.dependencies.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn create_virtual_extra_solvable(
+        &self,
+        base_solvable: SolvableId,
+        extra_name: &str,
+    ) -> Result<SolvableId, Box<dyn std::any::Any>> {
+        // Check if we already created this virtual solvable
+        let key = (base_solvable, extra_name.to_string());
+        if let Some(&virtual_solvable) = self.virtual_extra_solvables.borrow().get(&key) {
+            return Ok(virtual_solvable);
+        }
+
+        // Get base solvable info
+        let base_solvable_data = self.pool.resolve_solvable(base_solvable);
+        let base_name = self.pool.resolve_package_name(base_solvable_data.name);
+        let base_version = &base_solvable_data.record;
+
+        // Create a virtual package name like "myapp[viz]"
+        let virtual_package_name = format!("{}[{}]", base_name, extra_name);
+        let virtual_name_id = self.pool.intern_package_name(virtual_package_name);
+
+        // Create the virtual solvable with the same version as the base
+        let virtual_solvable = self
+            .pool
+            .intern_solvable(virtual_name_id, base_version.clone());
+
+        // Store the mapping for future lookups
+        self.virtual_extra_solvables
+            .borrow_mut()
+            .insert(key, virtual_solvable);
+
+        Ok(virtual_solvable)
+    }
+}
+
+impl BundleBoxProvider {
+    /// Check if a solvable is a virtual extra solvable and return the base solvable and extra name
+    fn find_base_solvable_for_virtual(
+        &self,
+        virtual_solvable: SolvableId,
+    ) -> Option<(SolvableId, String)> {
+        // First try the mapping (fastest)
+        for ((base_solvable, extra_name), &stored_virtual) in
+            self.virtual_extra_solvables.borrow().iter()
+        {
+            if stored_virtual == virtual_solvable {
+                return Some((*base_solvable, extra_name.clone()));
+            }
+        }
+
+        // If not found in mapping, try to detect by name pattern "package[extra]"
+        let virtual_solvable_data = self.pool.resolve_solvable(virtual_solvable);
+        let virtual_name = self.pool.resolve_package_name(virtual_solvable_data.name);
+
+        if let Some(bracket_start) = virtual_name.find('[') {
+            if let Some(bracket_end) = virtual_name.find(']') {
+                if bracket_end > bracket_start + 1 {
+                    let base_name = &virtual_name[..bracket_start];
+                    let extra_name = &virtual_name[bracket_start + 1..bracket_end];
+
+                    // Find the base solvable with matching name and version
+                    if let Some(base_name_id) =
+                        self.pool.lookup_package_name(&base_name.to_string())
+                    {
+                        // Look for existing solvable with same name and version
+                        let key = (base_name_id, virtual_solvable_data.record.clone());
+                        if let Some(&base_solvable) = self.interned_solvables.borrow().get(&key) {
+                            return Some((base_solvable, extra_name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get dependencies for a virtual extra solvable
+    async fn get_virtual_solvable_dependencies(
+        &self,
+        base_solvable: SolvableId,
+        extra_name: &str,
+    ) -> Dependencies {
+        let mut requirements = Vec::new();
+
+        // Add a strong dependency on the base solvable
+        let base_solvable_data = self.pool.resolve_solvable(base_solvable);
+        let base_name_id = base_solvable_data.name;
+        let base_version = &base_solvable_data.record;
+
+        // Create a version set that exactly matches the base solvable's version
+        let exact_version_range = Ranges::singleton(base_version.version.clone());
+        let base_version_set = self
+            .pool
+            .intern_version_set(base_name_id, exact_version_range);
+
+        requirements.push(ConditionalRequirement {
+            condition: None,
+            requirement: Requirement::Single(base_version_set),
+        });
+
+        // Add all extra dependencies
+        let extra_deps = self.get_extra_dependencies(base_solvable, extra_name);
+        requirements.extend(extra_deps);
+
+        let result = KnownDependencies {
+            requirements,
+            constrains: vec![],
+        };
+
+        self.maybe_delay(Dependencies::Known(result)).await
     }
 }
 
@@ -1349,6 +1484,64 @@ mod extras_tests {
                     );
                 }
             }
+        });
+    }
+
+    #[test]
+    fn test_extras_solving_with_requirement_extra() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // Test: Install myapp[viz] using Requirement::Extra - should get matplotlib and numpy
+            let provider = create_test_provider();
+
+            // Create a Requirement::Extra for myapp[viz]
+            let myapp_name_id = provider.pool.intern_package_name("myapp");
+            let myapp_version_constraint = provider
+                .pool
+                .intern_version_set(myapp_name_id, version_ranges::Ranges::full());
+            let viz_extra_name = provider.pool.intern_string("viz");
+
+            let extra_requirement = ConditionalRequirement {
+                condition: None,
+                requirement: resolvo::Requirement::Extra {
+                    base_package: myapp_name_id,
+                    extra_name: viz_extra_name,
+                    version_constraint: myapp_version_constraint,
+                },
+            };
+
+            let mut solver = Solver::new(provider);
+            let problem = Problem::new().requirements(vec![extra_requirement]);
+            let solution = solver.solve(problem).unwrap();
+
+            let package_names: Vec<String> = solution
+                .iter()
+                .map(|&s| {
+                    let solvable = solver.provider().pool.resolve_solvable(s);
+                    let name = solver.provider().pool.resolve_package_name(solvable.name);
+                    format!("{} {}", name, solvable.record)
+                })
+                .collect();
+
+            println!("Solution packages: {:?}", package_names);
+
+            // Should get myapp, matplotlib, and numpy
+            assert!(
+                package_names.contains(&"myapp 1".to_string()),
+                "Missing myapp package"
+            );
+            assert!(
+                package_names.contains(&"matplotlib 1".to_string()),
+                "Missing matplotlib package (extra dependency)"
+            );
+            assert!(
+                package_names.iter().any(|p| p.starts_with("numpy")),
+                "Missing numpy package"
+            );
         });
     }
 }
