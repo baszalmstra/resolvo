@@ -18,7 +18,7 @@ use crate::{
         id::{ClauseId, SolvableId, SolvableOrRootId, StringId, VersionSetId},
     },
     runtime::AsyncRuntime,
-    solver::{Solver, clause::Clause, variable_map::VariableOrigin},
+    solver::{Solver, clause::Clause},
 };
 
 /// Represents the cause of the solver being unable to find a solution
@@ -126,47 +126,29 @@ impl Conflict {
                 &Clause::ForbidMultipleInstances(instance1_id, instance2_id, name_id) => {
                     let solvable1 = instance1_id
                         .as_solvable_or_root(&state.variable_map)
-                        .expect("only solvables can be excluded");
+                        .expect("only solvables can be in ForbidMultipleInstances");
+                    let solvable2 = instance2_id
+                        .variable()
+                        .as_solvable_or_root(&state.variable_map)
+                        .expect("only solvables can be in ForbidMultipleInstances");
+
                     let node1_id = Self::add_node(&mut graph, &mut nodes, solvable1);
+                    let node2_id = Self::add_node(&mut graph, &mut nodes, solvable2);
 
-                    // Check if instance2_id is a helper variable (binary encoding) or a solvable (direct forbid)
-                    match state.variable_map.origin(instance2_id.variable()) {
-                        VariableOrigin::ForbidMultiple(name) => {
-                            // Binary encoding case: track by helper variable name
-                            let previous_node = last_node_by_name.insert(name, node1_id);
-                            if let Some(previous_node) = previous_node {
-                                graph.add_edge(
-                                    previous_node,
-                                    node1_id,
-                                    ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
-                                );
-                            }
-                        }
-                        VariableOrigin::Solvable(_) => {
-                            // Direct forbid case: instance2_id is another solvable
-                            // Create a direct edge between the two conflicting solvables
-                            let solvable2 = instance2_id
-                                .variable()
-                                .as_solvable_or_root(&state.variable_map)
-                                .expect("expected solvable");
-                            let node2_id = Self::add_node(&mut graph, &mut nodes, solvable2);
-                            graph.add_edge(
-                                node1_id,
-                                node2_id,
-                                ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
-                            );
+                    graph.add_edge(
+                        node1_id,
+                        node2_id,
+                        ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                    );
 
-                            // Also track by name for consistency with binary encoding
-                            let previous_node = last_node_by_name.insert(name_id, node1_id);
-                            if let Some(previous_node) = previous_node {
-                                graph.add_edge(
-                                    previous_node,
-                                    node1_id,
-                                    ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
-                                );
-                            }
-                        }
-                        _ => unreachable!("expected forbid or solvable variable"),
+                    // Track by name for proper conflict graph construction
+                    let previous_node = last_node_by_name.insert(name_id, node1_id);
+                    if let Some(previous_node) = previous_node {
+                        graph.add_edge(
+                            previous_node,
+                            node1_id,
+                            ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                        );
                     }
                 }
                 &Clause::Constrains(package_id, dep_id, version_set_id) => {

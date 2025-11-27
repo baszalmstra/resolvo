@@ -636,21 +636,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             // solvables that have been visited already for the same
             // version set name.
             let other_solvables = self.state.at_most_one_trackers.entry(name_id).or_default();
-            let variable_is_new = other_solvables.add(
-                candidate_var,
-                |_a, _b, _positive| {
-                    // Note: We no longer create binary encoding clauses here.
-                    // The at-most-one constraint is handled by direct propagation
-                    // in the propagation loop, which is more efficient.
-                    // Direct forbid clauses are created on-demand as reasons
-                    // for conflict analysis.
-                },
-                || {
-                    self.state
-                        .variable_map
-                        .alloc_forbid_multiple_variable(name_id)
-                },
-            );
+            let variable_is_new = other_solvables.add(candidate_var);
 
             if variable_is_new {
                 if let Some(&at_least_one_variable) = self.state.at_least_one_tracker.get(&name_id)

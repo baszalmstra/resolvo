@@ -36,9 +36,6 @@ pub enum VariableOrigin {
     /// The variable represents a specific solvable.
     Solvable(SolvableId),
 
-    /// A variable that helps encode an at most one constraint.
-    ForbidMultiple(NameId),
-
     /// A variable that indicates that any solvable of a particular package is
     /// part of the solution.
     AtLeastOne(NameId),
@@ -91,16 +88,6 @@ impl VariableMap {
             Some(solvable_id) => self.intern_solvable(solvable_id),
             None => VariableId::root(),
         }
-    }
-
-    /// Allocate a variable that helps encode an at most one constraint.
-    pub fn alloc_forbid_multiple_variable(&mut self, name: NameId) -> VariableId {
-        let id = self.next_id;
-        self.next_id += 1;
-        let variable_id = VariableId::from_usize(id);
-        self.origins
-            .insert(variable_id, VariableOrigin::ForbidMultiple(name));
-        variable_id
     }
 
     /// Allocate a variable helps encode whether at least one solvable for a
@@ -158,9 +145,6 @@ impl<I: Interner> Display for VariableDisplay<'_, I> {
             VariableOrigin::Root => write!(f, "root"),
             VariableOrigin::Solvable(solvable_id) => {
                 write!(f, "{}", self.interner.display_solvable(solvable_id))
-            }
-            VariableOrigin::ForbidMultiple(name) => {
-                write!(f, "forbid-multiple({})", self.interner.display_name(name))
             }
             VariableOrigin::AtLeastOne(name) => {
                 write!(f, "any-of({})", self.interner.display_name(name))
