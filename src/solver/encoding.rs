@@ -638,45 +638,12 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             let other_solvables = self.state.at_most_one_trackers.entry(name_id).or_default();
             let variable_is_new = other_solvables.add(
                 candidate_var,
-                |a, b, positive| {
-                    let literal_b = if positive { b.positive() } else { b.negative() };
-                    let literal_a = a.negative();
-                    let (watched_literals, kind) =
-                        WatchedLiterals::forbid_multiple(a, literal_b, name_id);
-                    let clause_id = self.state.clauses.alloc(watched_literals, kind);
-                    let watched_literals = self.state.clauses.watched_literals
-                        [clause_id.to_usize()]
-                    .as_mut()
-                    .expect("forbid clause must have watched literals");
-                    self.state
-                        .watches
-                        .start_watching(watched_literals, clause_id);
-
-                    // Add a decision if a decision has already been made for one of the literals.
-                    let set_literal = match (
-                        literal_a.eval(self.state.decision_tracker.map()),
-                        literal_b.eval(self.state.decision_tracker.map()),
-                    ) {
-                        (Some(false), None) => Some(literal_b),
-                        (None, Some(false)) => Some(literal_a),
-                        (Some(false), Some(false)) => unreachable!(
-                            "both literals cannot be false as that would be a conflict"
-                        ),
-                        _ => None,
-                    };
-                    if let Some(literal) = set_literal {
-                        self.state
-                            .decision_tracker
-                            .try_add_decision(
-                                Decision::new(
-                                    literal.variable(),
-                                    literal.satisfying_value(),
-                                    clause_id,
-                                ),
-                                self.level,
-                            )
-                            .expect("we checked that there is no value yet");
-                    }
+                |_a, _b, _positive| {
+                    // Note: We no longer create binary encoding clauses here.
+                    // The at-most-one constraint is handled by direct propagation
+                    // in the propagation loop, which is more efficient.
+                    // Direct forbid clauses are created on-demand as reasons
+                    // for conflict analysis.
                 },
                 || {
                     self.state

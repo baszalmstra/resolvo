@@ -192,6 +192,11 @@ pub(crate) struct SolverState {
     /// solvable for a package.
     at_least_one_tracker: HashMap<NameId, VariableId>,
 
+    /// Cache for direct forbid clauses used in at-most-one propagation.
+    /// Maps (true_variable, false_variable) -> ClauseId for clauses of the form
+    /// (¬true_variable ∨ ¬false_variable).
+    direct_forbid_clauses: HashMap<(VariableId, VariableId), ClauseId>,
+
     pub(crate) decision_tracker: DecisionTracker,
 
     /// Activity score per package.
@@ -1070,7 +1075,6 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // an error is returned.
 
         let interner = self.cache.provider();
-        let clause_kinds = &self.state.clauses.kinds;
 
         while let Some(decision) = self.state.decision_tracker.next_unpropagated() {
             let watched_literal = Literal::new(decision.variable, decision.value);
@@ -1080,6 +1084,55 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 "we are only watching literals that are turning false"
             );
 
+            // OPTIMIZATION: Direct at-most-one propagation
+            //
+            // When a solvable is set to TRUE, all other solvables of the same package
+            // must be set to FALSE. Instead of waiting for this to propagate through
+            // the binary encoding clauses (which involves helper variables), we
+            // directly propagate these constraints here.
+            //
+            // This is a significant optimization because:
+            // 1. It avoids multiple propagation steps through helper variables
+            // 2. It's O(k) where k = number of versions of the package
+            // 3. It reduces the number of watched clause traversals
+            if decision.value {
+                // Check if this is a solvable being set to TRUE
+                // (decision.value=true means the variable is assigned TRUE)
+                if let Some(solvable_id) = decision.variable.as_solvable(&self.state.variable_map) {
+                    let name_id = interner.solvable_name(solvable_id);
+
+                    // Get all other solvables of the same package and propagate them to FALSE.
+                    if let Some(tracker) = self.state.at_most_one_trackers.get(&name_id) {
+                        for &other_var in &tracker.variables {
+                            if other_var == decision.variable {
+                                continue;
+                            }
+
+                            // Create or get the reason clause for this propagation
+                            let reason_clause = SolverState::get_or_create_direct_forbid_clause(
+                                &mut self.state.direct_forbid_clauses,
+                                &mut self.state.clauses,
+                                decision.variable,
+                                other_var,
+                                name_id,
+                            );
+
+                            // Propagate: other_var must be FALSE.
+                            // try_add_decision handles the case where it's already decided.
+                            self.state
+                                .decision_tracker
+                                .try_add_decision(
+                                    Decision::new(other_var, false, reason_clause),
+                                    level,
+                                )
+                                .map_err(|_| {
+                                    PropagationError::Conflict(other_var, false, reason_clause)
+                                })?;
+                        }
+                    }
+                }
+            }
+
             // Propagate, iterating through the linked list of clauses that watch this
             // solvable
             let mut next_cursor = self
@@ -1088,7 +1141,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .cursor(&mut self.state.clauses.watched_literals, watched_literal);
             while let Some(cursor) = next_cursor.take() {
                 let clause_id = cursor.clause_id();
-                let clause = &clause_kinds[clause_id.to_usize()];
+                let clause = &self.state.clauses.kinds[clause_id.to_usize()];
                 let watch_index = cursor.watch_index();
 
                 // If the other literal the current clause is watching is already true, we can
@@ -1480,5 +1533,39 @@ impl SolverState {
                 None
             }
         })
+    }
+
+    /// Gets or creates a direct forbid clause for the at-most-one constraint.
+    ///
+    /// This creates a clause of the form (¬true_var ∨ ¬false_var), which represents
+    /// that if `true_var` is true, then `false_var` must be false (because they
+    /// are both solvables of the same package and at most one can be installed).
+    ///
+    /// These clauses are used as reasons during direct at-most-one propagation,
+    /// allowing conflict analysis to work correctly.
+    ///
+    /// This is an associated function to allow holding a reference to
+    /// `at_most_one_trackers` while creating clauses.
+    fn get_or_create_direct_forbid_clause(
+        direct_forbid_clauses: &mut HashMap<(VariableId, VariableId), ClauseId>,
+        clauses: &mut Clauses,
+        true_var: VariableId,
+        false_var: VariableId,
+        name_id: NameId,
+    ) -> ClauseId {
+        if let Some(&clause_id) = direct_forbid_clauses.get(&(true_var, false_var)) {
+            return clause_id;
+        }
+
+        // Create a new ForbidMultipleInstances clause: (¬true_var ∨ ¬false_var)
+        let (watched_literals, kind) =
+            WatchedLiterals::forbid_multiple(true_var, false_var.negative(), name_id);
+        let clause_id = clauses.alloc(watched_literals, kind);
+
+        // Note: We don't start watching this clause because we handle at-most-one
+        // propagation directly. The clause is only used as a reason for conflict analysis.
+
+        direct_forbid_clauses.insert((true_var, false_var), clause_id);
+        clause_id
     }
 }
