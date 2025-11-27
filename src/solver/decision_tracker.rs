@@ -1,5 +1,5 @@
-use crate::internal::id::{ClauseId, VariableId};
-use crate::solver::{decision::Decision, decision_map::DecisionMap};
+use crate::internal::id::VariableId;
+use crate::solver::{decision::Decision, decision::PropagationReason, decision_map::DecisionMap};
 
 /// Tracks the assignments to solvables, keeping a log that can be used to backtrack, and a map that
 /// can be used to query the current value assigned
@@ -37,9 +37,9 @@ impl DecisionTracker {
         self.map.level(variable_id)
     }
 
-    // Find the clause that caused the assignment of the specified solvable. If no assignment has
+    // Find the reason that caused the assignment of the specified solvable. If no assignment has
     // been made to the solvable than `None` is returned.
-    pub(crate) fn find_clause_for_assignment(&self, variable_id: VariableId) -> Option<ClauseId> {
+    pub(crate) fn find_reason_for_assignment(&self, variable_id: VariableId) -> Option<PropagationReason> {
         self.stack
             .iter()
             .find(|d| d.variable == variable_id)

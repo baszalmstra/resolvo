@@ -70,6 +70,10 @@ pub(crate) enum Clause {
     /// itself forbids two solvables from being installed at the same time.
     ///
     /// In SAT terms: (¬A ∨ ¬B)
+    ///
+    /// Note: This clause type is currently unused in favor of direct at-most-one
+    /// propagation, but kept for pattern matching compatibility and potential future use.
+    #[allow(dead_code)]
     ForbidMultipleInstances(VariableId, Literal, NameId),
     /// Forbids packages that do not satisfy a solvable's constrains
     ///
@@ -204,6 +208,9 @@ impl Clause {
 
     /// Returns the ids of the solvables that will be watched as well as the
     /// clause itself.
+    ///
+    /// Note: Currently unused in favor of direct at-most-one propagation.
+    #[allow(dead_code)]
     fn forbid_multiple(
         candidate: VariableId,
         constrained_candidate: Literal,
@@ -437,6 +444,8 @@ impl WatchedLiterals {
         (Self::from_kind_and_initial_watches(watched_literals), kind)
     }
 
+    /// Note: Currently unused in favor of direct at-most-one propagation.
+    #[allow(dead_code)]
     pub fn forbid_multiple(
         candidate: VariableId,
         other_candidate: Literal,

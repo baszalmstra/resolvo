@@ -4,7 +4,7 @@ use ahash::{HashMap, HashSet};
 pub use cache::SolverCache;
 use clause::{Clause, Literal, WatchedLiterals};
 use conditions::{Disjunction, DisjunctionId};
-use decision::Decision;
+use decision::{Decision, PropagationReason};
 use decision_tracker::DecisionTracker;
 use elsa::FrozenMap;
 use encoding::Encoder;
@@ -192,11 +192,6 @@ pub(crate) struct SolverState {
     /// solvable for a package.
     at_least_one_tracker: HashMap<NameId, VariableId>,
 
-    /// Cache for direct forbid clauses used in at-most-one propagation.
-    /// Maps (true_variable, false_variable) -> ClauseId for clauses of the form
-    /// (¬true_variable ∨ ¬false_variable).
-    direct_forbid_clauses: HashMap<(VariableId, VariableId), ClauseId>,
-
     pub(crate) decision_tracker: DecisionTracker,
 
     /// Activity score per package.
@@ -241,18 +236,18 @@ impl From<Box<dyn Any>> for UnsolvableOrCancelled {
 /// An error during the propagation step
 #[derive(Debug)]
 pub(crate) enum PropagationError {
-    Conflict(VariableId, bool, ClauseId),
+    Conflict(VariableId, bool, PropagationReason),
     Cancelled(Box<dyn Any>),
 }
 
 impl Display for PropagationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PropagationError::Conflict(solvable, value, clause) => {
+            PropagationError::Conflict(solvable, value, reason) => {
                 write!(
                     f,
-                    "conflict while propagating solvable {:?}, value {} caused by clause {:?}",
-                    solvable, value, clause
+                    "conflict while propagating solvable {:?}, value {} caused by {:?}",
+                    solvable, value, reason
                 )
             }
             PropagationError::Cancelled(_) => {
@@ -473,21 +468,46 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // Handle propagation errors
             match propagate_result {
                 Ok(()) => {}
-                Err(PropagationError::Conflict(_, _, clause_id)) => {
+                Err(PropagationError::Conflict(conflicting_var, _, reason)) => {
                     if level == starting_level + 1 {
-                        return self.run_sat_process_unsolvable(
-                            root_solvable,
-                            starting_level,
-                            clause_id,
-                        );
+                        match reason {
+                            PropagationReason::Clause(clause_id) => {
+                                return self.run_sat_process_unsolvable(
+                                    root_solvable,
+                                    starting_level,
+                                    clause_id,
+                                );
+                            }
+                            PropagationReason::DirectForbid(true_var) => {
+                                // A DirectForbid conflict at root level means two versions
+                                // of the same package were both required. We need to find
+                                // the clauses that required each version.
+                                return self.run_sat_process_direct_forbid_unsolvable(
+                                    root_solvable,
+                                    starting_level,
+                                    conflicting_var,
+                                    true_var,
+                                );
+                            }
+                        }
                     } else {
                         // The conflict was caused because new clauses have been added dynamically.
                         // We need to start over.
-                        tracing::debug!(
-                            "├─ added clause {clause} introduces a conflict which invalidates the partial solution",
-                            clause = self.state.clauses.kinds[clause_id.to_usize()]
-                                .display(&self.state.variable_map, self.provider())
-                        );
+                        match reason {
+                            PropagationReason::Clause(clause_id) => {
+                                tracing::debug!(
+                                    "├─ added clause {clause} introduces a conflict which invalidates the partial solution",
+                                    clause = self.state.clauses.kinds[clause_id.to_usize()]
+                                        .display(&self.state.variable_map, self.provider())
+                                );
+                            }
+                            PropagationReason::DirectForbid(true_var) => {
+                                tracing::debug!(
+                                    "├─ at-most-one constraint on {} introduces a conflict which invalidates the partial solution",
+                                    true_var.display(&self.state.variable_map, self.provider())
+                                );
+                            }
+                        }
                         level = starting_level;
                         self.state.decision_tracker.undo_until(starting_level);
                         continue;
@@ -547,12 +567,28 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 new_solvables
                     .iter()
                     .copied()
-                    .format_with("\n- ", |(id, derived_from), f| f(&format_args!(
-                        "{} (derived from {})",
-                        id.display(&self.state.variable_map, self.provider()),
-                        self.state.clauses.kinds[derived_from.to_usize()]
-                            .display(&self.state.variable_map, self.provider()),
-                    )))
+                    .format_with("\n- ", |(id, derived_from), f| {
+                        let reason_str = match derived_from {
+                            PropagationReason::Clause(clause_id) => {
+                                format!(
+                                    "{}",
+                                    self.state.clauses.kinds[clause_id.to_usize()]
+                                        .display(&self.state.variable_map, self.provider())
+                                )
+                            }
+                            PropagationReason::DirectForbid(true_var) => {
+                                format!(
+                                    "at-most-one({})",
+                                    true_var.display(&self.state.variable_map, self.provider())
+                                )
+                            }
+                        };
+                        f(&format_args!(
+                            "{} (derived from {})",
+                            id.display(&self.state.variable_map, self.provider()),
+                            reason_str,
+                        ))
+                    })
                     .to_string()
             );
             tracing::debug!("====");
@@ -610,6 +646,84 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             Err(UnsolvableOrCancelled::Unsolvable(
                 self.analyze_unsolvable(clause_id),
             ))
+        } else {
+            self.state.decision_tracker.undo_until(starting_level);
+            self.state
+                .decision_tracker
+                .try_add_decision(
+                    Decision::new(
+                        self.state
+                            .variable_map
+                            .intern_solvable_or_root(solvable_or_root),
+                        false,
+                        ClauseId::install_root(),
+                    ),
+                    starting_level + 1,
+                )
+                .expect("bug: already decided - decision should have been undone");
+            Ok(false)
+        }
+    }
+
+    /// Handles an unsolvable DirectForbid conflict at root level.
+    ///
+    /// This happens when two different versions of the same package are both
+    /// required by root requirements, which is impossible to satisfy.
+    fn run_sat_process_direct_forbid_unsolvable(
+        &mut self,
+        solvable_or_root: SolvableOrRootId,
+        starting_level: u32,
+        conflicting_var: VariableId,
+        true_var: VariableId,
+    ) -> Result<bool, UnsolvableOrCancelled> {
+        if starting_level == 0 {
+            tracing::trace!(
+                "Unsolvable: at-most-one conflict between {} and {}",
+                conflicting_var.display(&self.state.variable_map, self.provider()),
+                true_var.display(&self.state.variable_map, self.provider()),
+            );
+
+            // Build a conflict from the reasons for both variables.
+            // Find the clauses that required `conflicting_var` and `true_var` to be true.
+            // Both were assigned true by their respective requires clauses, but they
+            // are different versions of the same package so at most one can be installed.
+            let conflicting_var_reason = self
+                .state
+                .decision_tracker
+                .find_reason_for_assignment(conflicting_var);
+            let true_var_reason = self
+                .state
+                .decision_tracker
+                .find_reason_for_assignment(true_var);
+
+            debug_assert!(
+                conflicting_var_reason.is_some(),
+                "conflicting_var should have a reason for being assigned"
+            );
+            debug_assert!(
+                true_var_reason.is_some(),
+                "true_var should have a reason for being assigned"
+            );
+
+            // Use analyze_unsolvable starting from the true_var's reason clause.
+            // This will trace the decision history to build a complete conflict.
+            // Then add the conflicting_var's reason clause if not already included.
+            let conflict = if let Some(PropagationReason::Clause(clause_id)) = true_var_reason {
+                let mut conflict = self.analyze_unsolvable(clause_id);
+                // Add the clause for conflicting_var as well
+                if let Some(PropagationReason::Clause(other_clause_id)) = conflicting_var_reason {
+                    conflict.add_clause(other_clause_id);
+                }
+                conflict
+            } else if let Some(PropagationReason::Clause(clause_id)) = conflicting_var_reason {
+                self.analyze_unsolvable(clause_id)
+            } else {
+                // Both are DirectForbid? This shouldn't happen at root level.
+                debug_assert!(false, "Both DirectForbid reasons at root level");
+                Conflict::default()
+            };
+
+            Err(UnsolvableOrCancelled::Unsolvable(conflict))
         } else {
             self.state.decision_tracker.undo_until(starting_level);
             self.state
@@ -965,38 +1079,64 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         mut level: u32,
         conflicting_solvable: VariableId,
         attempted_value: bool,
-        conflicting_clause: ClauseId,
+        conflicting_reason: PropagationReason,
     ) -> Result<u32, Conflict> {
         {
             tracing::debug!(
                 "├┬ Propagation conflicted: could not set {solvable} to {attempted_value}",
                 solvable = conflicting_solvable.display(&self.state.variable_map, self.provider()),
             );
-            tracing::debug!(
-                "││ During unit propagation for clause: {}",
-                self.state.clauses.kinds[conflicting_clause.to_usize()]
-                    .display(&self.state.variable_map, self.provider())
-            );
+            match conflicting_reason {
+                PropagationReason::Clause(clause_id) => {
+                    tracing::debug!(
+                        "││ During unit propagation for clause: {}",
+                        self.state.clauses.kinds[clause_id.to_usize()]
+                            .display(&self.state.variable_map, self.provider())
+                    );
+                }
+                PropagationReason::DirectForbid(true_var) => {
+                    tracing::debug!(
+                        "││ During at-most-one propagation: {} is true",
+                        true_var.display(&self.state.variable_map, self.provider())
+                    );
+                }
+            }
 
-            tracing::debug!(
-                "││ Previously decided value: {}. Derived from: {}",
-                !attempted_value,
-                self.state.clauses.kinds[self
-                    .state
-                    .decision_tracker
-                    .find_clause_for_assignment(conflicting_solvable)
-                    .unwrap()
-                    .to_usize()]
-                .display(&self.state.variable_map, self.provider()),
-            );
+            let reason = self
+                .state
+                .decision_tracker
+                .find_reason_for_assignment(conflicting_solvable)
+                .unwrap();
+            match reason {
+                PropagationReason::Clause(clause_id) => {
+                    tracing::debug!(
+                        "││ Previously decided value: {}. Derived from: {}",
+                        !attempted_value,
+                        self.state.clauses.kinds[clause_id.to_usize()]
+                            .display(&self.state.variable_map, self.provider()),
+                    );
+                }
+                PropagationReason::DirectForbid(true_var) => {
+                    tracing::debug!(
+                        "││ Previously decided value: {}. Derived from: at-most-one with {}",
+                        !attempted_value,
+                        true_var.display(&self.state.variable_map, self.provider()),
+                    );
+                }
+            }
         }
 
         if level == 1 {
             for decision in self.state.decision_tracker.stack() {
-                let clause_id = decision.derived_from;
-                let clause = self.state.clauses.kinds[clause_id.to_usize()];
                 let level = self.state.decision_tracker.level(decision.variable);
                 let action = if decision.value { "install" } else { "forbid" };
+
+                // Skip DirectForbid reasons in logging to reduce noise
+                let PropagationReason::Clause(clause_id) = decision.derived_from else {
+                    continue;
+                };
+
+                let clause = self.state.clauses.kinds[clause_id.to_usize()];
 
                 if let Clause::ForbidMultipleInstances(..) = clause {
                     // Skip forbids clauses, to reduce noise
@@ -1008,16 +1148,21 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     decision
                         .variable
                         .display(&self.state.variable_map, self.provider()),
-                    self.state.clauses.kinds[decision.derived_from.to_usize()]
-                        .display(&self.state.variable_map, self.provider()),
+                    clause.display(&self.state.variable_map, self.provider()),
                 );
             }
 
-            return Err(self.analyze_unsolvable(conflicting_clause));
+            // DirectForbid at level 1 shouldn't happen in normal operation
+            let PropagationReason::Clause(clause_id) = conflicting_reason else {
+                debug_assert!(false, "DirectForbid conflict at level 1");
+                // If this somehow happens, create a minimal conflict
+                return Err(Conflict::default());
+            };
+            return Err(self.analyze_unsolvable(clause_id));
         }
 
         let (new_level, learned_clause_id, literal) =
-            self.analyze(level, conflicting_solvable, conflicting_clause);
+            self.analyze(level, conflicting_solvable, conflicting_reason);
         let old_level = level;
         level = new_level;
 
@@ -1108,25 +1253,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                                 continue;
                             }
 
-                            // Create or get the reason clause for this propagation
-                            let reason_clause = SolverState::get_or_create_direct_forbid_clause(
-                                &mut self.state.direct_forbid_clauses,
-                                &mut self.state.clauses,
-                                decision.variable,
-                                other_var,
-                                name_id,
-                            );
+                            // Use DirectForbid as the reason - no clause allocation needed.
+                            // The decision.variable being TRUE directly implies other_var must be FALSE.
+                            let reason = PropagationReason::DirectForbid(decision.variable);
 
                             // Propagate: other_var must be FALSE.
                             // try_add_decision handles the case where it's already decided.
                             self.state
                                 .decision_tracker
                                 .try_add_decision(
-                                    Decision::new(other_var, false, reason_clause),
+                                    Decision::new(other_var, false, reason),
                                     level,
                                 )
                                 .map_err(|_| {
-                                    PropagationError::Conflict(other_var, false, reason_clause)
+                                    PropagationError::Conflict(other_var, false, reason)
                                 })?;
                         }
                     }
@@ -1180,7 +1320,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             PropagationError::Conflict(
                                 other_watched_literal.variable(),
                                 true,
-                                clause_id,
+                                PropagationReason::Clause(clause_id),
                             )
                         })?;
 
@@ -1220,7 +1360,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .state
                 .decision_tracker
                 .try_add_decision(Decision::new(solvable_id, value, clause_id), level)
-                .map_err(|_| PropagationError::Conflict(solvable_id, value, clause_id))?;
+                .map_err(|_| PropagationError::Conflict(solvable_id, value, PropagationReason::Clause(clause_id)))?;
 
             if decided {
                 tracing::trace!(
@@ -1260,7 +1400,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     Decision::new(literal.variable(), decision, clause_id),
                     level,
                 )
-                .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
+                .map_err(|_| PropagationError::Conflict(literal.variable(), decision, PropagationReason::Clause(clause_id)))?;
 
             if decided {
                 tracing::trace!(
@@ -1305,6 +1445,27 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
     }
 
+    /// Adds the reason for propagation to the current [`Conflict`]
+    ///
+    /// This handles both regular clauses and DirectForbid reasons.
+    fn analyze_unsolvable_reason(
+        clauses: &Vec<Clause>,
+        learnt_why: &Mapping<LearntClauseId, Vec<ClauseId>>,
+        reason: PropagationReason,
+        conflict: &mut Conflict,
+        seen: &mut HashSet<ClauseId>,
+    ) {
+        match reason {
+            PropagationReason::Clause(clause_id) => {
+                Self::analyze_unsolvable_clause(clauses, learnt_why, clause_id, conflict, seen);
+            }
+            PropagationReason::DirectForbid(_) => {
+                // DirectForbid doesn't contribute to conflict clauses
+                // The at-most-one constraint is implicit
+            }
+        }
+    }
+
     /// Create a [`Conflict`] based on the id of the clause that triggered an
     /// unrecoverable conflict
     fn analyze_unsolvable(&mut self, clause_id: ClauseId) -> Conflict {
@@ -1346,9 +1507,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 continue;
             }
 
-            assert_ne!(why, ClauseId::install_root());
+            if let PropagationReason::Clause(clause_id) = why {
+                assert_ne!(clause_id, ClauseId::install_root());
+            }
 
-            Self::analyze_unsolvable_clause(
+            Self::analyze_unsolvable_reason(
                 &self.state.clauses.kinds,
                 &self.state.learnt_why,
                 why,
@@ -1356,18 +1519,29 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 &mut seen,
             );
 
-            self.state.clauses.kinds[why.to_usize()].visit_literals(
-                &self.state.learnt_clauses,
-                &self.state.requirement_to_sorted_candidates,
-                &self.state.disjunctions,
-                |literal| {
-                    if literal.eval(self.state.decision_tracker.map()) == Some(true) {
-                        assert_eq!(literal.variable(), decision.variable);
-                    } else {
-                        involved.insert(literal.variable());
-                    }
-                },
-            );
+            // Visit literals of the reason to find involved variables
+            match why {
+                PropagationReason::Clause(clause_id) => {
+                    self.state.clauses.kinds[clause_id.to_usize()].visit_literals(
+                        &self.state.learnt_clauses,
+                        &self.state.requirement_to_sorted_candidates,
+                        &self.state.disjunctions,
+                        |literal| {
+                            if literal.eval(self.state.decision_tracker.map()) == Some(true) {
+                                assert_eq!(literal.variable(), decision.variable);
+                            } else {
+                                involved.insert(literal.variable());
+                            }
+                        },
+                    );
+                }
+                PropagationReason::DirectForbid(true_var) => {
+                    // For DirectForbid, the clause is logically (¬true_var ∨ ¬false_var)
+                    // where false_var is decision.variable
+                    // The true_var (set to true) caused decision.variable to be set to false
+                    involved.insert(true_var);
+                }
+            }
         }
 
         conflict
@@ -1390,7 +1564,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         mut current_level: u32,
         mut conflicting_solvable: VariableId,
-        mut clause_id: ClauseId,
+        mut reason: PropagationReason,
     ) -> (u32, ClauseId, Literal) {
         let mut seen = HashSet::default();
         let mut causes_at_current_level = 0u32;
@@ -1400,44 +1574,86 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut s_value;
         let mut learnt_why = Vec::new();
         let mut first_iteration = true;
-        let clause_kinds = &self.state.clauses.kinds;
+
+        // Helper closure to process a literal during conflict analysis
+        let process_literal = |literal: Literal,
+                                   seen: &mut HashSet<VariableId>,
+                                   causes_at_current_level: &mut u32,
+                                   learnt: &mut Vec<Literal>,
+                                   back_track_to: &mut u32,
+                                   first_iteration: bool,
+                                   conflicting_solvable: VariableId,
+                                   current_level: u32,
+                                   decision_tracker: &DecisionTracker| {
+            if !first_iteration && literal.variable() == conflicting_solvable {
+                // We are only interested in the causes of the conflict, so we ignore the
+                // solvable whose value was propagated
+                return;
+            }
+
+            if !seen.insert(literal.variable()) {
+                // Skip literals we have already seen
+                return;
+            }
+
+            let decision_level = decision_tracker.level(literal.variable());
+            if decision_level == current_level {
+                *causes_at_current_level += 1;
+            } else if current_level > 1 {
+                let learnt_literal = Literal::new(
+                    literal.variable(),
+                    decision_tracker.assigned_value(literal.variable()).unwrap(),
+                );
+                learnt.push(learnt_literal);
+                *back_track_to = (*back_track_to).max(decision_level);
+            } else {
+                unreachable!();
+            }
+        };
+
         loop {
-            learnt_why.push(clause_id);
+            // Visit literals based on the reason type
+            match reason {
+                PropagationReason::Clause(clause_id) => {
+                    learnt_why.push(clause_id);
 
-            clause_kinds[clause_id.to_usize()].visit_literals(
-                &self.state.learnt_clauses,
-                &self.state.requirement_to_sorted_candidates,
-                &self.state.disjunctions,
-                |literal| {
-                    if !first_iteration && literal.variable() == conflicting_solvable {
-                        // We are only interested in the causes of the conflict, so we ignore the
-                        // solvable whose value was propagated
-                        return;
-                    }
-
-                    if !seen.insert(literal.variable()) {
-                        // Skip literals we have already seen
-                        return;
-                    }
-
-                    let decision_level = self.state.decision_tracker.level(literal.variable());
-                    if decision_level == current_level {
-                        causes_at_current_level += 1;
-                    } else if current_level > 1 {
-                        let learnt_literal = Literal::new(
-                            literal.variable(),
-                            self.state
-                                .decision_tracker
-                                .assigned_value(literal.variable())
-                                .unwrap(),
+                    self.state.clauses.kinds[clause_id.to_usize()].visit_literals(
+                        &self.state.learnt_clauses,
+                        &self.state.requirement_to_sorted_candidates,
+                        &self.state.disjunctions,
+                        |literal| {
+                            process_literal(
+                                literal,
+                                &mut seen,
+                                &mut causes_at_current_level,
+                                &mut learnt,
+                                &mut back_track_to,
+                                first_iteration,
+                                conflicting_solvable,
+                                current_level,
+                                &self.state.decision_tracker,
+                            );
+                        },
+                    );
+                }
+                PropagationReason::DirectForbid(true_var) => {
+                    // For DirectForbid, the clause is logically (¬true_var ∨ ¬false_var)
+                    // where false_var is the conflicting_solvable
+                    for literal in [true_var.negative(), conflicting_solvable.negative()] {
+                        process_literal(
+                            literal,
+                            &mut seen,
+                            &mut causes_at_current_level,
+                            &mut learnt,
+                            &mut back_track_to,
+                            first_iteration,
+                            conflicting_solvable,
+                            current_level,
+                            &self.state.decision_tracker,
                         );
-                        learnt.push(learnt_literal);
-                        back_track_to = back_track_to.max(decision_level);
-                    } else {
-                        unreachable!();
                     }
-                },
-            );
+                }
+            }
 
             first_iteration = false;
 
@@ -1447,7 +1663,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
                 conflicting_solvable = last_decision.variable;
                 s_value = last_decision.value;
-                clause_id = last_decision.derived_from;
+                reason = last_decision.derived_from;
 
                 current_level = last_decision_level;
 
@@ -1535,37 +1751,4 @@ impl SolverState {
         })
     }
 
-    /// Gets or creates a direct forbid clause for the at-most-one constraint.
-    ///
-    /// This creates a clause of the form (¬true_var ∨ ¬false_var), which represents
-    /// that if `true_var` is true, then `false_var` must be false (because they
-    /// are both solvables of the same package and at most one can be installed).
-    ///
-    /// These clauses are used as reasons during direct at-most-one propagation,
-    /// allowing conflict analysis to work correctly.
-    ///
-    /// This is an associated function to allow holding a reference to
-    /// `at_most_one_trackers` while creating clauses.
-    fn get_or_create_direct_forbid_clause(
-        direct_forbid_clauses: &mut HashMap<(VariableId, VariableId), ClauseId>,
-        clauses: &mut Clauses,
-        true_var: VariableId,
-        false_var: VariableId,
-        name_id: NameId,
-    ) -> ClauseId {
-        if let Some(&clause_id) = direct_forbid_clauses.get(&(true_var, false_var)) {
-            return clause_id;
-        }
-
-        // Create a new ForbidMultipleInstances clause: (¬true_var ∨ ¬false_var)
-        let (watched_literals, kind) =
-            WatchedLiterals::forbid_multiple(true_var, false_var.negative(), name_id);
-        let clause_id = clauses.alloc(watched_literals, kind);
-
-        // Note: We don't start watching this clause because we handle at-most-one
-        // propagation directly. The clause is only used as a reason for conflict analysis.
-
-        direct_forbid_clauses.insert((true_var, false_var), clause_id);
-        clause_id
-    }
 }
