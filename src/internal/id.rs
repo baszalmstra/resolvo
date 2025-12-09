@@ -278,6 +278,16 @@ impl From<SolvableId> for SolvableOrRootId {
     }
 }
 
+impl ArenaId for SolvableOrRootId {
+    fn from_usize(x: usize) -> Self {
+        Self(x as u32)
+    }
+
+    fn to_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
 pub(crate) struct DisplaySolvableOrRootId<'i, I: Interner> {
     interner: &'i I,
     solvable_id: SolvableOrRootId,

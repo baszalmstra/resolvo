@@ -154,6 +154,31 @@ impl<TId: ArenaId, TValue> Mapping<TId, TValue> {
         .unwrap()
     }
 
+    /// Gets a mutable reference to the value for the given id, inserting a default
+    /// value if not present.
+    pub fn get_or_insert_default(&mut self, id: TId) -> &mut TValue
+    where
+        TValue: Default,
+    {
+        let idx = id.to_usize();
+        let (chunk, offset) = Self::chunk_and_offset(idx);
+
+        // Resize to fit if needed
+        if chunk >= self.chunks.len() {
+            self.chunks
+                .resize_with(chunk + 1, || std::array::from_fn(|_| None));
+        }
+
+        let slot = &mut self.chunks[chunk][offset];
+        if slot.is_none() {
+            *slot = Some(TValue::default());
+            self.len += 1;
+            self.max = self.max.max(idx);
+        }
+
+        slot.as_mut().unwrap()
+    }
+
     /// Returns the number of mapped items
     pub fn len(&self) -> usize {
         self.len
@@ -180,6 +205,32 @@ impl<TId: ArenaId, TValue> Mapping<TId, TValue> {
         MappingIter {
             mapping: self,
             offset: 0,
+            remaining: self.len,
+        }
+    }
+
+    /// Clears the mapping, removing all values.
+    pub fn clear(&mut self) {
+        for chunk in &mut self.chunks {
+            for slot in chunk.iter_mut() {
+                *slot = None;
+            }
+        }
+        self.len = 0;
+        self.max = 0;
+    }
+
+    /// Drains the mapping, returning an iterator over all key-value pairs
+    /// and clearing the mapping.
+    pub fn drain(&mut self) -> MappingDrain<'_, TId, TValue> {
+        let max = self.max;
+        let len = self.len;
+        self.len = 0;
+        self.max = 0;
+        MappingDrain {
+            mapping: self,
+            offset: 0,
+            end: if len > 0 { max + 1 } else { 0 },
         }
     }
 }
@@ -187,36 +238,66 @@ impl<TId: ArenaId, TValue> Mapping<TId, TValue> {
 pub struct MappingIter<'a, TId, TValue> {
     mapping: &'a Mapping<TId, TValue>,
     offset: usize,
+    remaining: usize,
 }
 
 impl<'a, TId: ArenaId, TValue> Iterator for MappingIter<'a, TId, TValue> {
     type Item = (TId, &'a TValue);
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.offset >= self.mapping.len {
+        while self.remaining > 0 {
+            let current_offset = self.offset;
+            self.offset += 1;
+
+            let (chunk, offset) = Mapping::<TId, TValue>::chunk_and_offset(current_offset);
+            if chunk >= self.mapping.chunks.len() {
                 return None;
             }
 
-            let (chunk, offset) = Mapping::<TId, TValue>::chunk_and_offset(self.offset);
-            let id = TId::from_usize(self.offset);
-            self.offset += 1;
-
-            unsafe {
-                if let Some(value) = &self
-                    .mapping
-                    .chunks
-                    .get_unchecked(chunk)
-                    .get_unchecked(offset)
-                {
-                    break Some((id, value));
-                }
+            if let Some(value) = &self.mapping.chunks[chunk][offset] {
+                self.remaining -= 1;
+                return Some((TId::from_usize(current_offset), value));
             }
         }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
     }
 }
 
 impl<TId: ArenaId, TValue> FusedIterator for MappingIter<'_, TId, TValue> {}
+impl<TId: ArenaId, TValue> ExactSizeIterator for MappingIter<'_, TId, TValue> {}
+
+pub struct MappingDrain<'a, TId, TValue> {
+    mapping: &'a mut Mapping<TId, TValue>,
+    offset: usize,
+    end: usize,
+}
+
+impl<TId: ArenaId, TValue> Iterator for MappingDrain<'_, TId, TValue> {
+    type Item = (TId, TValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.offset < self.end {
+            let current_offset = self.offset;
+            self.offset += 1;
+
+            let (chunk, offset) = Mapping::<TId, TValue>::chunk_and_offset(current_offset);
+            if chunk >= self.mapping.chunks.len() {
+                return None;
+            }
+
+            if let Some(value) = self.mapping.chunks[chunk][offset].take() {
+                return Some((TId::from_usize(current_offset), value));
+            }
+        }
+        None
+    }
+}
+
+impl<TId: ArenaId, TValue> FusedIterator for MappingDrain<'_, TId, TValue> {}
 
 #[cfg(feature = "serde")]
 impl<K: ArenaId, V: serde::Serialize> serde::Serialize for Mapping<K, V> {

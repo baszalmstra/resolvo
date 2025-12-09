@@ -1,12 +1,11 @@
-use std::{collections::hash_map::Entry, fmt::Display};
-
-use ahash::HashMap;
+use std::fmt::Display;
 
 use crate::{
     Interner, NameId, SolvableId,
     internal::{
         arena::ArenaId,
         id::{SolvableOrRootId, VariableId},
+        mapping::Mapping,
     },
 };
 
@@ -21,10 +20,11 @@ pub struct VariableMap {
     next_id: usize,
 
     /// A map from solvable id to variable id.
-    solvable_to_variable: HashMap<SolvableId, VariableId>,
+    solvable_to_variable: Mapping<SolvableId, VariableId>,
 
-    /// Records the origins of all variables.
-    origins: HashMap<VariableId, VariableOrigin>,
+    /// Records the origins of all variables. Indexed by VariableId since
+    /// VariableIds are allocated contiguously.
+    origins: Vec<VariableOrigin>,
 }
 
 /// Describes the origin of a variable.
@@ -46,13 +46,11 @@ pub enum VariableOrigin {
 
 impl Default for VariableMap {
     fn default() -> Self {
-        let mut origins = HashMap::default();
-        origins.insert(VariableId::root(), VariableOrigin::Root);
-
         Self {
             next_id: 1, // The first variable id is 1 because 0 is reserved for the root.
-            solvable_to_variable: HashMap::default(),
-            origins,
+            solvable_to_variable: Mapping::new(),
+            // Index 0 is reserved for the root variable.
+            origins: vec![VariableOrigin::Root],
         }
     }
 }
@@ -60,18 +58,17 @@ impl Default for VariableMap {
 impl VariableMap {
     /// Allocate a variable for a new variable or reuse an existing one.
     pub fn intern_solvable(&mut self, solvable_id: SolvableId) -> VariableId {
-        match self.solvable_to_variable.entry(solvable_id) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let id = self.next_id;
-                self.next_id += 1;
-                let variable_id = VariableId::from_usize(id);
-                entry.insert(variable_id);
-                self.origins
-                    .insert(variable_id, VariableOrigin::Solvable(solvable_id));
-                variable_id
-            }
+        if let Some(&variable_id) = self.solvable_to_variable.get(solvable_id) {
+            return variable_id;
         }
+
+        let id = self.next_id;
+        self.next_id += 1;
+        let variable_id = VariableId::from_usize(id);
+        self.solvable_to_variable.insert(solvable_id, variable_id);
+        self.origins.push(VariableOrigin::Solvable(solvable_id));
+        debug_assert_eq!(self.origins.len(), self.next_id);
+        variable_id
     }
 
     #[cfg(feature = "diagnostics")]
@@ -81,8 +78,8 @@ impl VariableMap {
 
     #[cfg(feature = "diagnostics")]
     pub fn size_in_bytes(&self) -> usize {
-        self.origins.capacity() * std::mem::size_of::<(VariableId, VariableOrigin)>()
-            + self.solvable_to_variable.capacity() * std::mem::size_of::<(SolvableId, VariableId)>()
+        self.origins.capacity() * std::mem::size_of::<VariableOrigin>()
+            + self.solvable_to_variable.size_in_bytes()
     }
 
     /// Allocate a variable for a solvable or the root.
@@ -98,8 +95,8 @@ impl VariableMap {
         let id = self.next_id;
         self.next_id += 1;
         let variable_id = VariableId::from_usize(id);
-        self.origins
-            .insert(variable_id, VariableOrigin::ForbidMultiple(name));
+        self.origins.push(VariableOrigin::ForbidMultiple(name));
+        debug_assert_eq!(self.origins.len(), self.next_id);
         variable_id
     }
 
@@ -109,15 +106,15 @@ impl VariableMap {
         let id = self.next_id;
         self.next_id += 1;
         let variable_id = VariableId::from_usize(id);
-        self.origins
-            .insert(variable_id, VariableOrigin::AtLeastOne(name));
+        self.origins.push(VariableOrigin::AtLeastOne(name));
+        debug_assert_eq!(self.origins.len(), self.next_id);
         variable_id
     }
 
     /// Returns the origin of a variable. The origin describes the semantics of
     /// a variable.
     pub fn origin(&self, variable_id: VariableId) -> VariableOrigin {
-        self.origins[&variable_id].clone()
+        self.origins[variable_id.to_usize()].clone()
     }
 }
 

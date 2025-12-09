@@ -3,7 +3,6 @@ use std::{any::Any, future::ready};
 use futures::{
     FutureExt, StreamExt, TryFutureExt, future::LocalBoxFuture, stream::FuturesUnordered,
 };
-use indexmap::IndexMap;
 
 use super::{SolverState, clause::WatchedLiterals, conditions};
 use crate::{
@@ -12,6 +11,7 @@ use crate::{
     internal::{
         arena::ArenaId,
         id::{ClauseId, SolvableOrRootId, VariableId},
+        mapping::Mapping,
     },
     solver::{conditions::Disjunction, decision::Decision},
 };
@@ -44,10 +44,10 @@ pub(crate) struct Encoder<'a, 'cache, D: DependencyProvider> {
     conflicting_clauses: Vec<ClauseId>,
 
     /// Stores for which packages and solvables we want to add forbid clauses.
-    pending_forbid_clauses: IndexMap<NameId, Vec<VariableId>, ahash::RandomState>,
+    pending_forbid_clauses: Mapping<NameId, Vec<VariableId>>,
 
     /// A set of packages that should have an at-least-once tracker.
-    new_at_least_one_packages: IndexMap<NameId, VariableId, ahash::RandomState>,
+    new_at_least_one_packages: Mapping<NameId, VariableId>,
 }
 
 /// The result of a future that was queued for processing.
@@ -104,9 +104,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             root_dependencies,
             pending_futures: FuturesUnordered::new(),
             conflicting_clauses: Vec::new(),
-            pending_forbid_clauses: IndexMap::default(),
+            pending_forbid_clauses: Mapping::new(),
             level,
-            new_at_least_one_packages: IndexMap::default(),
+            new_at_least_one_packages: Mapping::new(),
         }
     }
 
@@ -273,8 +273,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         {
             let name_id = self.cache.provider().solvable_name(solvable);
             self.pending_forbid_clauses
-                .entry(name_id)
-                .or_default()
+                .get_or_insert_default(name_id)
                 .push(variable_id);
         }
 
@@ -298,7 +297,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         DisjunctionComplement::Solvables(version_set, solvables) => {
                             let name_id = self.cache.provider().version_set_name(version_set);
                             let pending_forbid_clauses =
-                                self.pending_forbid_clauses.entry(name_id).or_default();
+                                self.pending_forbid_clauses.get_or_insert_default(name_id);
                             disjunction_literals.reserve(solvables.len());
                             pending_forbid_clauses.reserve(solvables.len());
                             for &solvable in solvables {
@@ -312,9 +311,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                             let at_least_one_of_var = match self
                                 .state
                                 .at_least_one_tracker
-                                .get(&name_id)
+                                .get(name_id)
                                 .copied()
-                                .or_else(|| self.new_at_least_one_packages.get(&name_id).copied())
+                                .or_else(|| self.new_at_least_one_packages.get(name_id).copied())
                             {
                                 Some(variable) => variable,
                                 None => {
@@ -366,8 +365,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
 
             self.state
                 .requires_clauses
-                .entry(variable)
-                .or_default()
+                .get_or_insert_default(variable)
                 .push((requirement.requirement, condition, clause_id));
 
             if conflict {
@@ -492,7 +490,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// processed by the [`Self::on_dependencies_available`] function.
     fn queue_solvable(&mut self, solvable_id: SolvableOrRootId) {
         // Early out if the solvable has already been processed
-        if !self.state.clauses_added_for_solvable.insert(solvable_id) {
+        let idx = solvable_id.to_usize();
+        if self.state.clauses_added_for_solvable.len() <= idx {
+            self.state
+                .clauses_added_for_solvable
+                .resize(idx + 1, false);
+        }
+        if self.state.clauses_added_for_solvable.replace(idx, true) {
             return;
         }
 
@@ -517,7 +521,11 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// Enqueues retrieving all candidates for a particular package name.
     fn queue_package(&mut self, name_id: NameId) {
         // Early out if the package has already been processed
-        if !self.state.clauses_added_for_package.insert(name_id) {
+        let idx = name_id.to_usize();
+        if self.state.clauses_added_for_package.len() <= idx {
+            self.state.clauses_added_for_package.resize(idx + 1, false);
+        }
+        if self.state.clauses_added_for_package.replace(idx, true) {
             return;
         }
 
@@ -625,7 +633,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     fn add_pending_forbid_clauses(&mut self) {
         for (name_id, candidate_var) in
             self.pending_forbid_clauses
-                .drain(..)
+                .drain()
                 .flat_map(|(name_id, candidate_vars)| {
                     candidate_vars
                         .into_iter()
@@ -635,7 +643,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             // Add forbid constraints for this solvable on all other
             // solvables that have been visited already for the same
             // version set name.
-            let other_solvables = self.state.at_most_one_trackers.entry(name_id).or_default();
+            let other_solvables = self.state.at_most_one_trackers.get_or_insert_default(name_id);
             let variable_is_new = other_solvables.add(
                 candidate_var,
                 |a, b, positive| {
@@ -686,7 +694,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             );
 
             if variable_is_new {
-                if let Some(&at_least_one_variable) = self.state.at_least_one_tracker.get(&name_id)
+                if let Some(&at_least_one_variable) = self.state.at_least_one_tracker.get(name_id)
                 {
                     let (watched_literals, kind) =
                         WatchedLiterals::any_of(at_least_one_variable, candidate_var);
@@ -719,13 +727,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     ///
     /// See [`super::conditions`] for more information about conditions.
     fn add_pending_at_least_one_clauses(&mut self) {
-        for (name_id, at_least_one_variable) in self.new_at_least_one_packages.drain(..) {
+        for (name_id, at_least_one_variable) in self.new_at_least_one_packages.drain() {
             // Find the at-most-one tracker for the package. We want to reuse the same
             // variables.
             let variables = self
                 .state
                 .at_most_one_trackers
-                .get(&name_id)
+                .get(name_id)
                 .map(|tracker| &tracker.variables);
 
             // Add clauses for the existing variables.

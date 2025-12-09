@@ -1,6 +1,7 @@
 use std::{any::Any, fmt::Display, ops::ControlFlow};
 
-use ahash::{HashMap, HashSet};
+use ahash::HashSet;
+use bitvec::vec::BitVec;
 pub use cache::SolverCache;
 use clause::{Clause, Literal, WatchedLiterals};
 use conditions::{Disjunction, DisjunctionId};
@@ -8,7 +9,6 @@ use decision::Decision;
 use decision_tracker::DecisionTracker;
 use elsa::FrozenMap;
 use encoding::Encoder;
-use indexmap::IndexMap;
 use itertools::Itertools;
 use variable_map::VariableMap;
 use watch_map::WatchMap;
@@ -166,7 +166,7 @@ type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
 #[derive(Default)]
 pub(crate) struct SolverState {
     pub(crate) clauses: Clauses,
-    requires_clauses: IndexMap<VariableId, Vec<RequiresClause>, ahash::RandomState>,
+    requires_clauses: Mapping<VariableId, Vec<RequiresClause>>,
     watches: WatchMap,
 
     /// A mapping from requirements to the variables that represent the
@@ -184,13 +184,13 @@ pub(crate) struct SolverState {
 
     disjunctions: Arena<DisjunctionId, Disjunction>,
 
-    clauses_added_for_package: HashSet<NameId>,
-    clauses_added_for_solvable: HashSet<SolvableOrRootId>,
-    at_most_one_trackers: HashMap<NameId, AtMostOnceTracker<VariableId>>,
+    clauses_added_for_package: BitVec,
+    clauses_added_for_solvable: BitVec,
+    at_most_one_trackers: Mapping<NameId, AtMostOnceTracker<VariableId>>,
 
     /// Keeps track of auxiliary variables that are used to encode at-least-one
     /// solvable for a package.
-    at_least_one_tracker: HashMap<NameId, VariableId>,
+    at_least_one_tracker: Mapping<NameId, VariableId>,
 
     pub(crate) decision_tracker: DecisionTracker,
 
@@ -519,10 +519,14 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     else {
                         return false;
                     };
+                    let idx = solvable_or_root.to_usize();
                     !self
                         .state
                         .clauses_added_for_solvable
-                        .contains(&solvable_or_root)
+                        .get(idx)
+                        .as_deref()
+                        .copied()
+                        .unwrap_or(false)
                 })
                 .map(|d| (d.variable, d.derived_from))
                 .collect();
@@ -710,7 +714,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
 
         let mut best_decision: Option<PossibleDecision> = None;
-        for (&solvable_id, requirements) in self.state.requires_clauses.iter() {
+        for (solvable_id, requirements) in self.state.requires_clauses.iter() {
             let is_explicit_requirement = solvable_id == VariableId::root();
             if let Some(best_decision) = &best_decision {
                 // If we already have an explicit requirement, there is no need to evaluate

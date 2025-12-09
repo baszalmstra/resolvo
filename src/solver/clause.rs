@@ -1,6 +1,5 @@
 use std::{
     fmt::{Debug, Display, Formatter},
-    iter,
     num::NonZeroU32,
     ops::ControlFlow,
 };
@@ -276,38 +275,46 @@ impl Clause {
         match *self {
             Clause::InstallRoot => unreachable!(),
             Clause::Excluded(solvable, _) => visit(init, solvable.negative()),
-            Clause::Learnt(learnt_id) => learnt_clauses[learnt_id]
-                .iter()
-                .copied()
-                .try_fold(init, visit),
+            Clause::Learnt(learnt_id) => {
+                let mut acc = init;
+                for &lit in &learnt_clauses[learnt_id] {
+                    acc = visit(acc, lit)?;
+                }
+                ControlFlow::Continue(acc)
+            }
             Clause::Requires(solvable_id, disjunction, match_spec_id) => {
-                iter::once(solvable_id.negative())
-                    .chain(
-                        disjunction
-                            .into_iter()
-                            .flat_map(|d| disjunction_to_candidates[d].literals.iter())
-                            .copied(),
-                    )
-                    .chain(
-                        requirements_to_sorted_candidates[&match_spec_id]
-                            .iter()
-                            .flatten()
-                            .map(|&s| s.positive()),
-                    )
-                    .try_fold(init, visit)
+                let mut acc = visit(init, solvable_id.negative())?;
+
+                if let Some(d) = disjunction {
+                    for &lit in &disjunction_to_candidates[d].literals {
+                        acc = visit(acc, lit)?;
+                    }
+                }
+
+                for candidates in &requirements_to_sorted_candidates[&match_spec_id] {
+                    for &s in candidates {
+                        acc = visit(acc, s.positive())?;
+                    }
+                }
+
+                ControlFlow::Continue(acc)
             }
-            Clause::Constrains(s1, s2, _) => [s1.negative(), s2.negative()]
-                .into_iter()
-                .try_fold(init, visit),
+            Clause::Constrains(s1, s2, _) => {
+                let acc = visit(init, s1.negative())?;
+                visit(acc, s2.negative())
+            }
             Clause::ForbidMultipleInstances(s1, s2, _) => {
-                [s1.negative(), s2].into_iter().try_fold(init, visit)
+                let acc = visit(init, s1.negative())?;
+                visit(acc, s2)
             }
-            Clause::Lock(_, s) => [s.negative(), VariableId::root().negative()]
-                .into_iter()
-                .try_fold(init, visit),
-            Clause::AnyOf(selected, variable) => [selected.positive(), variable.negative()]
-                .into_iter()
-                .try_fold(init, visit),
+            Clause::Lock(_, s) => {
+                let acc = visit(init, s.negative())?;
+                visit(acc, VariableId::root().negative())
+            }
+            Clause::AnyOf(selected, variable) => {
+                let acc = visit(init, selected.positive())?;
+                visit(acc, variable.negative())
+            }
         }
     }
 

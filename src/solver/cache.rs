@@ -10,7 +10,7 @@ use crate::{
     SolvableId, VersionSetId,
     internal::{
         arena::{Arena, ArenaId},
-        frozen_copy_map::FrozenCopyMap,
+        frozen_mapping::FrozenMapping,
         id::{CandidatesId, DependenciesId},
     },
 };
@@ -22,7 +22,7 @@ pub struct SolverCache<D: DependencyProvider> {
 
     /// A mapping from package name to a list of candidates.
     candidates: Arena<CandidatesId, Candidates>,
-    package_name_to_candidates: FrozenCopyMap<NameId, CandidatesId>,
+    package_name_to_candidates: FrozenMapping<NameId, CandidatesId>,
     package_name_to_candidates_in_flight: RefCell<HashMap<NameId, Rc<Event>>>,
 
     /// A mapping of `VersionSetId` to the candidates that match that set.
@@ -39,7 +39,7 @@ pub struct SolverCache<D: DependencyProvider> {
 
     /// A mapping from a solvable to a list of dependencies
     solvable_dependencies: Arena<DependenciesId, Dependencies>,
-    solvable_to_dependencies: FrozenCopyMap<SolvableId, DependenciesId>,
+    solvable_to_dependencies: FrozenMapping<SolvableId, DependenciesId>,
 
     /// A mapping that indicates that the dependencies for a particular solvable
     /// can cheaply be retrieved from the dependency provider. This
@@ -82,7 +82,7 @@ impl<D: DependencyProvider> SolverCache<D> {
     ) -> Result<&Candidates, Box<dyn Any>> {
         // If we already have the candidates for this package cached we can simply
         // return
-        let candidates_id = match self.package_name_to_candidates.get_copy(&package_name) {
+        let candidates_id = match self.package_name_to_candidates.get_copy(package_name) {
             Some(id) => id,
             None => {
                 // Since getting the candidates from the provider is a potentially blocking
@@ -104,7 +104,7 @@ impl<D: DependencyProvider> SolverCache<D> {
                         // the computed result.
                         in_flight.listen().await;
                         self.package_name_to_candidates
-                            .get_copy(&package_name)
+                            .get_copy(package_name)
                             .expect("after waiting for a request the result should be available")
                     }
                     None => {
@@ -341,7 +341,7 @@ impl<D: DependencyProvider> SolverCache<D> {
         &self,
         solvable_id: SolvableId,
     ) -> Result<&Dependencies, Box<dyn Any>> {
-        let dependencies_id = match self.solvable_to_dependencies.get_copy(&solvable_id) {
+        let dependencies_id = match self.solvable_to_dependencies.get_copy(solvable_id) {
             Some(id) => id,
             None => {
                 // Since getting the dependencies from the provider is a potentially blocking
@@ -367,7 +367,7 @@ impl<D: DependencyProvider> SolverCache<D> {
     /// the dependencies for a solvable are available or the dependencies
     /// have already been requested.
     pub fn are_dependencies_available_for(&self, solvable: SolvableId) -> bool {
-        if self.solvable_to_dependencies.get_copy(&solvable).is_some() {
+        if self.solvable_to_dependencies.get_copy(solvable).is_some() {
             true
         } else {
             let solvable_idx = solvable.to_usize();
