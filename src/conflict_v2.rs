@@ -933,23 +933,38 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
             let _ = builder.build_from_root_requirement(req, &targets, &name);
         }
 
-        // Locked at root — terminal facts after the chain.
+        // Locked at root — try to build a chain-based explanation that
+        // narrates the transitive dependency path leading into the locked
+        // package, falling back to a terminal `LockedFact` when no chain
+        // can be found.
         let mut locked_subjects: Vec<String> = Vec::new();
         for e in g.edges(graph.root_node) {
             if let ConflictEdge::Conflict(ConflictCause::Locked(s)) = e.weight() {
+                let s = *s;
                 let name = interner
-                    .display_name(interner.solvable_name(*s))
+                    .display_name(interner.solvable_name(s))
                     .to_string();
-                let version_str = interner.display_merged_solvables(&[*s]).to_string();
-                let id = builder.next_id();
-                builder.facts.push(NarrativeFact {
-                    id,
-                    body: NarrativeFactBody::LockedFact {
-                        subject: name.clone(),
-                        locked: version_str.clone(),
-                    },
-                });
-                locked_subjects.push(format!("{name} is locked at {version_str}"));
+                let version_str = interner.display_merged_solvables(&[s]).to_string();
+                if let Some(root_req) = builder.try_build_locked_chain(s) {
+                    // The chain fact already mentions the lock; surface the
+                    // chain's root requirement in the concluding line so it
+                    // reads "root cannot be installed because it depends on
+                    // <X>" rather than repeating the lock info.
+                    let req_text = root_req.display(interner).to_string();
+                    if !root_failing_subjects.contains(&req_text) {
+                        root_failing_subjects.push(req_text);
+                    }
+                } else {
+                    let id = builder.next_id();
+                    builder.facts.push(NarrativeFact {
+                        id,
+                        body: NarrativeFactBody::LockedFact {
+                            subject: name.clone(),
+                            locked: version_str.clone(),
+                        },
+                    });
+                    locked_subjects.push(format!("{name} is locked at {version_str}"));
+                }
             }
         }
 
@@ -1510,6 +1525,114 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
         }
         let _ = name; // currently unused; reserved for richer group framing
         last
+    }
+
+    /// Walk Requires edges from `start` looking for a requirement whose
+    /// version-set name equals `target_name`. Returns the path of nodes
+    /// traversed (excluding the final candidate node) and the matching
+    /// requirement at the endpoint. This lets us narrate transitive chains
+    /// to a package that's external to the chain (e.g. a locked package
+    /// reached only through installable intermediate nodes).
+    fn find_chain_to_name(
+        &self,
+        start: NodeIndex,
+        target_name: NameId,
+    ) -> Option<(Vec<NodeIndex>, Requirement)> {
+        let g = &self.graph.graph;
+        let mut visited: HashSet<NodeIndex> = HashSet::new();
+        let mut stack: Vec<(NodeIndex, Vec<NodeIndex>)> = vec![(start, vec![start])];
+        while let Some((nx, path)) = stack.pop() {
+            if !visited.insert(nx) {
+                continue;
+            }
+            for e in g.edges_directed(nx, Direction::Outgoing) {
+                if let ConflictEdge::Requires(r) = e.weight() {
+                    let req_name = requirement_name_id(r, self.interner);
+                    if req_name == target_name {
+                        return Some((path.clone(), *r));
+                    }
+                    let target = e.target();
+                    let mut new_path = path.clone();
+                    new_path.push(target);
+                    stack.push((target, new_path));
+                }
+            }
+        }
+        None
+    }
+
+    /// For a locked solvable at root, attempt to find a transitive
+    /// requirement chain that explains *why* a different version of the
+    /// locked package would be needed. If found, emit a single fact
+    /// narrating the chain plus the lock and return the root-level
+    /// `Requirement` that initiated the chain (so the caller can mark
+    /// it as a failing top-level requirement for the conclusion).
+    /// Otherwise the caller falls back to a terminal `LockedFact`.
+    fn try_build_locked_chain(&mut self, locked: SolvableId) -> Option<Requirement> {
+        let g = &self.graph.graph;
+        let locked_name = self.interner.solvable_name(locked);
+
+        // Find the first root requirement whose installable target has a
+        // transitive requires-chain ending in the locked name.
+        let mut chain_info: Option<(Vec<NodeIndex>, Requirement, Requirement)> = None;
+        for e in g.edges(self.graph.root_node) {
+            let ConflictEdge::Requires(root_req) = e.weight() else {
+                continue;
+            };
+            let target = e.target();
+            if !self.installable.contains(&target) {
+                continue;
+            }
+            if let Some((path, endpoint)) = self.find_chain_to_name(target, locked_name) {
+                chain_info = Some((path, endpoint, *root_req));
+                break;
+            }
+        }
+
+        let (chain, endpoint_req, root_req) = chain_info?;
+        let subject = self.render_node(chain[0]);
+        let mut causes: Vec<NarrativeCause> = Vec::new();
+
+        // One cause per intermediate "X depends on Y" hop.
+        for window in chain.windows(2) {
+            let from = self.render_node(window[0]);
+            let req = g
+                .edges_directed(window[0], Direction::Outgoing)
+                .find_map(|e| match e.weight() {
+                    ConflictEdge::Requires(r) if e.target() == window[1] => Some(*r),
+                    _ => None,
+                })?;
+            causes.push(NarrativeCause::Depends {
+                text: format!("{} depends on {}", from, req.display(self.interner)),
+                ruled_out_by: None,
+            });
+        }
+        // Final leg: the endpoint requirement off the last node in the chain
+        // (which is the one whose name matches `locked_name`).
+        let last_node = self.render_node(*chain.last()?);
+        causes.push(NarrativeCause::Depends {
+            text: format!(
+                "{} depends on {}",
+                last_node,
+                endpoint_req.display(self.interner)
+            ),
+            ruled_out_by: None,
+        });
+        // The lock cause.
+        let locked_str = self.interner.display_merged_solvables(&[locked]).to_string();
+        causes.push(NarrativeCause::Raw(format!(
+            "{} is locked at {}",
+            self.interner.display_name(locked_name),
+            locked_str,
+        )));
+
+        let id = self.next_id();
+        self.facts.push(NarrativeFact {
+            id,
+            body: NarrativeFactBody::Simple { subject, causes },
+        });
+        let _ = id;
+        Some(root_req)
     }
 }
 
