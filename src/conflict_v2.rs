@@ -968,8 +968,11 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
         }
 
         // Constraints-at-root — root has a Conflict(Constrains(_)) edge that
-        // isn't expressible as a normal "requires" chain. Emit a single
-        // terminal fact for each unique constraint.
+        // isn't expressible as a normal "requires" chain. Emit one terminal
+        // fact per unique constraint. We deliberately don't push these
+        // into `root_failing_subjects`: the fact already reads as a
+        // complete sentence ("The constraint X cannot be fulfilled.") and
+        // adding it to the ∴ line would just duplicate it.
         let mut constrains_seen: HashSet<VersionSetId> = HashSet::new();
         for e in g.edges(graph.root_node) {
             if let ConflictEdge::Conflict(ConflictCause::Constrains(vs)) = e.weight() {
@@ -987,11 +990,10 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
                     body: NarrativeFactBody::Simple {
                         subject: format!("the constraint {name} {vset}"),
                         causes: vec![NarrativeCause::Raw(format!(
-                            "the constraint {name} {vset} cannot be fulfilled"
+                            "The constraint {name} {vset} cannot be fulfilled"
                         ))],
                     },
                 });
-                root_failing_subjects.push(format!("the constraint {name} {vset}"));
             }
         }
 
@@ -1560,7 +1562,7 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
                 body: NarrativeFactBody::Simple {
                     subject: req.display(self.interner).to_string(),
                     causes: vec![NarrativeCause::Raw(format!(
-                        "no candidates were found for {}",
+                        "No candidates were found for {}",
                         req.display(self.interner)
                     ))],
                 },
@@ -1583,20 +1585,31 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
         });
 
         if non_inst.len() > 1 && same_name {
+            // If every member is a pure-forbid-multi node, the group fact
+            // would just list "X 2.0 cannot be selected", "X 2.1 cannot
+            // be selected", … which is uninformative — the actual cause
+            // is already captured by some sibling fact (e.g. another
+            // root requirement that pulls in the conflicting version).
+            // Suppress the group; the concluding ∴ line still lists this
+            // requirement.
+            let all_pure_forbid = non_inst
+                .iter()
+                .all(|&t| self.is_inlinable_forbid(t).is_some());
+            if all_pure_forbid {
+                return None;
+            }
             let id = self.build_group(self.graph.root_node, *req, &non_inst);
             return Some(id);
         }
 
         // Single non-installable target (or all different names) → recurse.
-        // Wrap in a single-name group iff there's exactly one member, for
-        // readability.
         if non_inst.len() == 1 {
-            let single_id = self.build_for_node(non_inst[0]);
-            // If the single member is a solvable that is in fact the *only*
-            // version of its name, wrap it in a one-member group anyway so
-            // the conclusion line reads naturally ("…cannot be installed
-            // because it depends on <name>").
-            return single_id;
+            // Same suppression for single-target pure-forbid-multi cases:
+            // the cause is covered elsewhere by inlined "and X is required".
+            if self.is_inlinable_forbid(non_inst[0]).is_some() {
+                return None;
+            }
+            return self.build_for_node(non_inst[0]);
         }
 
         // Mixed names — recurse into each individually.
@@ -1644,19 +1657,55 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
         None
     }
 
-    /// For a locked solvable at root, attempt to find a transitive
-    /// requirement chain that explains *why* a different version of the
-    /// locked package would be needed. If found, emit a single fact
-    /// narrating the chain plus the lock and return the root-level
-    /// `Requirement` that initiated the chain (so the caller can mark
-    /// it as a failing top-level requirement for the conclusion).
-    /// Otherwise the caller falls back to a terminal `LockedFact`.
+    /// For a locked solvable at root, attempt to build an explanation
+    /// covering one of two shapes:
+    ///
+    /// 1. **Direct conflict** — root has a Requires(R) where R's name equals
+    ///    the locked package's name (e.g. root requires `bors >=2` and bors
+    ///    is locked at 1.0). The fact reads "R is required, but X is locked
+    ///    at version V".
+    /// 2. **Transitive chain** — root requires some other package whose
+    ///    dependency chain leads through Requires edges to the locked name
+    ///    (e.g. root requires `asdf`, asdf depends on `c >=2`, c is locked
+    ///    at 1). The fact reads "Because A depends on B, ... and c is locked
+    ///    at V, A cannot be installed."
+    ///
+    /// Returns the root-level `Requirement` that initiated the chain so the
+    /// caller can list it in the failing-subjects conclusion. Falls back to
+    /// `None` (caller emits a terminal `LockedFact`) only when neither shape
+    /// applies.
     fn try_build_locked_chain(&mut self, locked: SolvableId) -> Option<Requirement> {
         let g = &self.graph.graph;
         let locked_name = self.interner.solvable_name(locked);
+        let locked_name_str = self.interner.display_name(locked_name).to_string();
+        let locked_full = self.interner.display_merged_solvables(&[locked]).to_string();
+        let version_only = strip_name_prefix(&locked_full, &locked_name_str);
 
-        // Find the first root requirement whose installable target has a
-        // transitive requires-chain ending in the locked name.
+        // Case A: direct conflict — root requires the same package name.
+        for e in g.edges(self.graph.root_node) {
+            if let ConflictEdge::Requires(root_req) = e.weight() {
+                let req_name = requirement_name_id(root_req, self.interner);
+                if req_name == locked_name {
+                    let req_text = root_req.display(self.interner).to_string();
+                    let id = self.next_id();
+                    // Phrasing: avoid starting the sentence with the
+                    // (lowercase) package name. The "But " inversion
+                    // reads naturally after the ❶ marker.
+                    self.facts.push(NarrativeFact {
+                        id,
+                        body: NarrativeFactBody::Simple {
+                            subject: req_text.clone(),
+                            causes: vec![NarrativeCause::Raw(format!(
+                                "{locked_name_str} is locked at version {version_only}, but {req_text} is required"
+                            ))],
+                        },
+                    });
+                    return Some(*root_req);
+                }
+            }
+        }
+
+        // Case B: transitive chain.
         let mut chain_info: Option<(Vec<NodeIndex>, Requirement, Requirement)> = None;
         for e in g.edges(self.graph.root_node) {
             let ConflictEdge::Requires(root_req) = e.weight() else {
@@ -1676,7 +1725,6 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
         let subject = self.render_node(chain[0]);
         let mut causes: Vec<NarrativeCause> = Vec::new();
 
-        // One cause per intermediate "X depends on Y" hop.
         for window in chain.windows(2) {
             let from = self.render_node(window[0]);
             let req = g
@@ -1690,8 +1738,6 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
                 ruled_out_by: None,
             });
         }
-        // Final leg: the endpoint requirement off the last node in the chain
-        // (which is the one whose name matches `locked_name`).
         let last_node = self.render_node(*chain.last()?);
         causes.push(NarrativeCause::Depends {
             text: format!(
@@ -1701,12 +1747,8 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
             ),
             ruled_out_by: None,
         });
-        // The lock cause.
-        let locked_str = self.interner.display_merged_solvables(&[locked]).to_string();
         causes.push(NarrativeCause::Raw(format!(
-            "{} is locked at {}",
-            self.interner.display_name(locked_name),
-            locked_str,
+            "{locked_name_str} is locked at version {version_only}",
         )));
 
         let id = self.next_id();
@@ -1731,7 +1773,10 @@ fn render_narrative_fact(f: &mut Formatter<'_>, fact: &NarrativeFact) -> fmt::Re
                 // (NarrativeCause::Raw), just print it directly. The
                 // "Because X, Y cannot be installed." wrapper reads
                 // awkwardly when X already includes both the subject and
-                // the verb (e.g. "issue_717 2.1 is excluded (...)").
+                // the verb (e.g. "issue_717 2.1 is excluded (...)"). The
+                // cause text is responsible for its own case — we don't
+                // auto-capitalize because that would mangle lowercase
+                // package names.
                 if matches!(&causes[0], NarrativeCause::Raw(_)) {
                     writeln!(f, "  {l} {}.", render_cause(&causes[0]))?;
                 } else {
