@@ -802,19 +802,19 @@ impl<I: Interner> Display for DisplayUnsatProse<'_, '_, I> {
         if !failing_reqs.is_empty() && locked.is_empty() {
             writeln!(
                 f,
-                "  ∴ root requires {}; this cannot be satisfied.",
+                "  ∴ {} cannot be satisfied.",
                 failing_reqs.join(" and "),
             )?;
         } else if failing_reqs.is_empty() && !locked.is_empty() {
             writeln!(
                 f,
-                "  ∴ {} is locked at a version that is incompatible with what the solve requires.",
+                "  ∴ {} is locked at an incompatible version.",
                 locked.join(" and "),
             )?;
         } else if !failing_reqs.is_empty() && !locked.is_empty() {
             writeln!(
                 f,
-                "  ∴ root requires {} and {} is locked; these cannot both be satisfied.",
+                "  ∴ {} cannot be satisfied while {} remains locked.",
                 failing_reqs.join(" and "),
                 locked.join(" and "),
             )?;
@@ -969,9 +969,8 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
         }
 
         // ── Header ─────────────────────────────────────────────────────────
-        writeln!(f, "× No solution.")?;
-
-        // List root's direct requirements.
+        // List the top-level requirements. We deliberately don't say "root";
+        // it's a solver-internal concept that leaks if exposed.
         let mut root_reqs: Vec<String> = Vec::new();
         for e in g.edges(graph.root_node) {
             if let ConflictEdge::Requires(req) = e.weight() {
@@ -981,12 +980,10 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
                 }
             }
         }
-        if !root_reqs.is_empty() {
-            writeln!(
-                f,
-                "  Root depends on {}, but these cannot all be satisfied.",
-                root_reqs.join(", ")
-            )?;
+        if root_reqs.is_empty() {
+            writeln!(f, "× No solution.")?;
+        } else {
+            writeln!(f, "× No solution found for: {}.", root_reqs.join(", "))?;
         }
 
         // Names involved.
@@ -1015,15 +1012,15 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
 
         // ── Conclusion ─────────────────────────────────────────────────────
         if !root_failing_subjects.is_empty() {
-            let nice = root_failing_subjects.join(" and ");
             writeln!(
                 f,
-                "  ∴ root cannot be installed because it depends on {nice}."
+                "  ∴ {} cannot be satisfied.",
+                root_failing_subjects.join(" and ")
             )?;
         } else if !locked_subjects.is_empty() {
             writeln!(
                 f,
-                "  ∴ {}; this is incompatible with what the solve requires.",
+                "  ∴ {} (incompatible with the other requirements).",
                 locked_subjects.join(" and ")
             )?;
         }
@@ -1696,7 +1693,7 @@ fn render_cause(c: &NarrativeCause) -> String {
             Some(id) => format!("{text}, ruled out by {}", label(*id)),
             None => text.clone(),
         },
-        NarrativeCause::RootRequires(s) => format!("{s} is required by root"),
+        NarrativeCause::RootRequires(s) => format!("{s} is required"),
         NarrativeCause::Excluded(reason) => format!("which is excluded ({reason})"),
         NarrativeCause::Raw(s) => s.clone(),
     }
