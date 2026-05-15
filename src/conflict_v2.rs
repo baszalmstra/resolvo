@@ -630,9 +630,24 @@ impl<I: Interner> Display for DisplayUnsatProse<'_, '_, I> {
         let g = &graph.graph;
 
         // Pre-assign numbers in post-order DFS so leaves get the smallest
-        // numbers and the prose narrative reads bottom-up.
+        // numbers and the prose narrative reads bottom-up. Skip merge-class
+        // duplicates so a single merged group ("foo 1 | 2 | 3 | 4 | 5")
+        // gets one fact rather than one per merged version.
+        let mut merge_seen: HashSet<SolvableId> = HashSet::default();
         let mut dfs = DfsPostOrder::new(g, graph.root_node);
         while let Some(nx) = dfs.next(g) {
+            if let ConflictNode::Solvable(s) = g[nx] {
+                if let Some(sid) = s.solvable() {
+                    if let Some(mclass) = merged.get(&sid) {
+                        if mclass.ids.iter().any(|id| merge_seen.contains(id)) {
+                            continue;
+                        }
+                        merge_seen.extend(mclass.ids.iter().copied());
+                    } else if !merge_seen.insert(sid) {
+                        continue;
+                    }
+                }
+            }
             facts.get_or_assign(nx);
         }
 
@@ -843,8 +858,6 @@ enum NarrativeCause {
     RootRequires(String),
     /// "Y is excluded because <reason>".
     Excluded(String),
-    /// "Y is locked at version V" — terminal, used in conclusion-style facts.
-    Locked(String),
     /// Raw text — escape hatch.
     Raw(String),
 }
@@ -1021,6 +1034,32 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
         (self.facts.len() as u32) + 1
     }
 
+    /// Deduplicate a list of solvable nodes by merge-class so a group of
+    /// versions like `foo {1, 2, 3, 4, 5}` that share the same predecessors
+    /// and successors renders as a single member instead of five identical
+    /// ones.
+    fn dedup_by_merge_class(&self, members: &[NodeIndex]) -> Vec<NodeIndex> {
+        let g = &self.graph.graph;
+        let mut seen: HashSet<SolvableId> = HashSet::new();
+        let mut out: Vec<NodeIndex> = Vec::new();
+        for &m in members {
+            if let ConflictNode::Solvable(s) = g[m] {
+                if let Some(sid) = s.solvable() {
+                    if let Some(mclass) = self.merged.get(&sid) {
+                        if mclass.ids.iter().any(|id| seen.contains(id)) {
+                            continue;
+                        }
+                        seen.extend(mclass.ids.iter().copied());
+                    } else if !seen.insert(sid) {
+                        continue;
+                    }
+                }
+            }
+            out.push(m);
+        }
+        out
+    }
+
     /// Returns true if `nx` is a "pure forbid-multi" node — its only reason
     /// for being non-installable is that another version of the same package
     /// is required. Such nodes get inlined into their parent's narrative
@@ -1187,7 +1226,19 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
                 continue;
             }
 
-            // Case C: a single non-installable target — recurse and reference.
+            // Case C: no candidates (unresolved sink) — check *before* the
+            // generic recurse so we don't try to build a fact for the sink.
+            if non_installable.len() == 1
+                && self.graph.unresolved_node == Some(non_installable[0])
+            {
+                causes.push(NarrativeCause::Raw(format!(
+                    "{} depends on {}, which has no candidates",
+                    subject, req_text
+                )));
+                continue;
+            }
+
+            // Case D: a single non-installable target — recurse and reference.
             if non_installable.len() == 1 {
                 let target = non_installable[0];
                 let target_id = self.build_for_node(target);
@@ -1205,17 +1256,6 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
                         ruled_out_by: None,
                     });
                 }
-                continue;
-            }
-
-            // Case D: no candidates (unresolved sink).
-            if non_installable.len() == 1
-                && self.graph.unresolved_node == Some(non_installable[0])
-            {
-                causes.push(NarrativeCause::Raw(format!(
-                    "{} depends on {}, which has no candidates",
-                    subject, req_text
-                )));
                 continue;
             }
         }
@@ -1269,6 +1309,11 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
             return id;
         }
 
+        // Apply merge-class dedup so {foo 1, foo 2, foo 3, foo 4, foo 5} that
+        // were collapsed by `ConflictGraph::simplify` render as one bullet.
+        let members_owned: Vec<NodeIndex> = self.dedup_by_merge_class(members);
+        let members = &members_owned;
+
         let g = &self.graph.graph;
 
         // The group's display name — common name of all members.
@@ -1289,6 +1334,19 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
             // Strip the leading name so the bullet reads "10 depends on …"
             // instead of "menu 10 depends on …" inside a group keyed by menu.
             let member_short = strip_name_prefix(&member_full, &name);
+
+            // Check first whether this member is excluded — exclusion is a
+            // terminal reason and trumps requirement-derived reasons.
+            let excluded_reason =
+                g.edges_directed(m, Direction::Outgoing)
+                    .find_map(|e| match e.weight() {
+                        ConflictEdge::Conflict(ConflictCause::Excluded) => match g[e.target()] {
+                            ConflictNode::Excluded(s) => Some(s),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+
             // Find this member's outgoing requirement(s).
             let mut maybe_req: Option<(Requirement, Vec<NodeIndex>)> = None;
             for e in g.edges_directed(m, Direction::Outgoing) {
@@ -1297,14 +1355,27 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
                     entry.1.push(e.target());
                 }
             }
-            let cause = if let Some((mreq, mtargets)) = maybe_req {
+
+            let cause = if let Some(reason) = excluded_reason {
+                NarrativeCause::Raw(format!(
+                    "{} is excluded ({})",
+                    member_full,
+                    self.interner.display_string(reason)
+                ))
+            } else if let Some((mreq, mtargets)) = maybe_req {
                 let req_text = mreq.display(self.interner).to_string();
                 let non_inst: Vec<NodeIndex> = mtargets
                     .iter()
                     .copied()
                     .filter(|t| !self.installable.contains(t))
                     .collect();
-                if non_inst.len() == 1 {
+                // No-candidates target?
+                if non_inst.len() == 1 && self.graph.unresolved_node == Some(non_inst[0]) {
+                    NarrativeCause::Raw(format!(
+                        "{} depends on {}, which has no candidates",
+                        member_full, req_text
+                    ))
+                } else if non_inst.len() == 1 {
                     if let Some(fb) = self.is_inlinable_forbid(non_inst[0]) {
                         match self.root_requirement_pinning(fb) {
                             Some(pin_req) => NarrativeCause::Depends {
@@ -1378,6 +1449,10 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
         if non_inst.is_empty() {
             return None;
         }
+
+        // Apply merge-class dedup so we don't recurse into multiple aliased
+        // versions of the same package.
+        let non_inst = self.dedup_by_merge_class(&non_inst);
 
         // No-candidates case: the only target is the unresolved sink.
         if non_inst.len() == 1 && self.graph.unresolved_node == Some(non_inst[0]) {
@@ -1500,7 +1575,6 @@ fn render_cause(c: &NarrativeCause) -> String {
         },
         NarrativeCause::RootRequires(s) => format!("{s} is required by root"),
         NarrativeCause::Excluded(reason) => format!("which is excluded ({reason})"),
-        NarrativeCause::Locked(s) => format!("{s} is locked"),
         NarrativeCause::Raw(s) => s.clone(),
     }
 }
@@ -1569,11 +1643,17 @@ pub fn compute_hints(
         }
     }
 
-    // 2. No-candidates hints: edges into the unresolved sink.
+    // 2. No-candidates hints: edges into the unresolved sink. Dedup by name
+    //    so a single missing `bar` doesn't surface 5× when 5 versions of
+    //    `foo` each require it.
     if let Some(unresolved) = graph.unresolved_node {
+        let mut seen_names: HashSet<NameId> = HashSet::default();
         for e in g.edges_directed(unresolved, Direction::Incoming) {
             if let ConflictEdge::Requires(req) = e.weight() {
                 let name = requirement_name_id(req, interner);
+                if !seen_names.insert(name) {
+                    continue;
+                }
                 let suggestion = ctx.similar_name(name);
                 hints.push(ConflictHint::NoCandidatesFor {
                     name,

@@ -1298,6 +1298,102 @@ fn dump_v2_prototype_comparison() {
         &["asdf", "fghi"],
     );
 
+    // 5. PubGrub `confusing_with_lots_of_holes` — 5 versions of foo all
+    //    depend on bar (no versions); baz is also required and unrelated.
+    //    Tests "all versions converge on same conclusion" + irrelevant dep.
+    {
+        let mut p = BundleBoxProvider::new();
+        for v in 1u32..=5 {
+            p.add_package("foo", v.into(), &["bar"], &[]);
+        }
+        p.add_package("baz", 1u32.into(), &[], &[]);
+        // bar deliberately has no versions
+        render_all(
+            &mut out,
+            "PubGrub `confusing_with_lots_of_holes`",
+            p,
+            &["foo", "baz"],
+            &["foo", "bar", "baz"],
+        );
+    }
+
+    // 6. Deep transitive lock — root → a, a 1 → b 2, b 2 → c 2; c is locked
+    //    at v1. Three levels of indirection between the lock and the user.
+    {
+        let mut p = BundleBoxProvider::from_packages(&[
+            ("a", 1, vec!["b 2..3"]),
+            ("b", 2, vec!["c 2..3"]),
+            ("c", 2, vec![]),
+            ("c", 1, vec![]),
+        ]);
+        p.set_locked("c", 1);
+        render_all(
+            &mut out,
+            "Deep transitive lock conflict",
+            p,
+            &["a"],
+            &["a", "b", "c"],
+        );
+    }
+
+    // 7. Diamond constrains — root requires a and b; a 1 constrains c <5
+    //    while b 1 requires c >=5. Only c v6 exists. Tests constrains
+    //    rendering with two pull paths.
+    {
+        let mut p = BundleBoxProvider::from_packages(&[
+            ("b", 1, vec!["c 5..10"]),
+            ("c", 6, vec![]),
+        ]);
+        p.add_package("a", 1u32.into(), &[], &["c 0..5"]);
+        render_all(
+            &mut out,
+            "Diamond constrains (a constrains c<5, b requires c>=5)",
+            p,
+            &["a", "b"],
+            &["a", "b", "c"],
+        );
+    }
+
+    // 8. All candidates excluded with different reasons — 3 versions of `a`
+    //    each excluded with a unique reason. Tests AllCandidatesExcluded
+    //    hint and how the narrative renders excludes.
+    {
+        let mut p = BundleBoxProvider::from_packages(&[
+            ("a", 1, vec![]),
+            ("a", 2, vec![]),
+            ("a", 3, vec![]),
+        ]);
+        p.exclude("a", 1, "wrong platform");
+        p.exclude("a", 2, "yanked");
+        p.exclude("a", 3, "no wheel for current python");
+        render_all(
+            &mut out,
+            "All candidates excluded (different reasons)",
+            p,
+            &["a"],
+            &["a"],
+        );
+    }
+
+    // 9. Two failing branches sharing a culprit — root pins c=1, a depends
+    //    on c=2, b depends on c=2. Both a and b fail for the same reason;
+    //    tests that the same conflict isn't duplicated in the narrative.
+    {
+        let p = BundleBoxProvider::from_packages(&[
+            ("a", 1, vec!["c 2..3"]),
+            ("b", 1, vec!["c 2..3"]),
+            ("c", 2, vec![]),
+            ("c", 1, vec![]),
+        ]);
+        render_all(
+            &mut out,
+            "Two branches sharing a culprit",
+            p,
+            &["a", "b", "c 1..2"],
+            &["a", "b", "c"],
+        );
+    }
+
     std::fs::write("/tmp/unsat_compare.txt", &out).unwrap();
     eprintln!("wrote /tmp/unsat_compare.txt ({} bytes)", out.len());
 }
