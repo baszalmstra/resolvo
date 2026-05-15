@@ -970,9 +970,11 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
         // Constraints-at-root — root has a Conflict(Constrains(_)) edge that
         // isn't expressible as a normal "requires" chain. Emit one terminal
         // fact per unique constraint. We deliberately don't push these
-        // into `root_failing_subjects`: the fact already reads as a
-        // complete sentence ("The constraint X cannot be fulfilled.") and
-        // adding it to the ∴ line would just duplicate it.
+        // into `root_failing_subjects` (the fact already reads as a
+        // complete sentence and the ∴ line would duplicate it), but we
+        // collect them into `constraint_subjects` so the concluding line
+        // can mention them when there are no other failure causes.
+        let mut constraint_subjects: Vec<String> = Vec::new();
         let mut constrains_seen: HashSet<VersionSetId> = HashSet::new();
         for e in g.edges(graph.root_node) {
             if let ConflictEdge::Conflict(ConflictCause::Constrains(vs)) = e.weight() {
@@ -994,6 +996,7 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
                         ))],
                     },
                 });
+                constraint_subjects.push(format!("the constraint {name} {vset}"));
             }
         }
 
@@ -1040,11 +1043,26 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
         }
 
         // ── Conclusion ─────────────────────────────────────────────────────
-        if !root_failing_subjects.is_empty() {
+        if !root_failing_subjects.is_empty() && !constraint_subjects.is_empty() {
+            writeln!(
+                f,
+                "  ∴ {} cannot be satisfied alongside {}.",
+                root_failing_subjects.join(" and "),
+                constraint_subjects.join(" and "),
+            )?;
+        } else if !root_failing_subjects.is_empty() {
             writeln!(
                 f,
                 "  ∴ {} cannot be satisfied.",
                 root_failing_subjects.join(" and ")
+            )?;
+        } else if !constraint_subjects.is_empty() {
+            // Header already lists the root requirements; mention only that
+            // the constraints block them.
+            writeln!(
+                f,
+                "  ∴ no solution exists given {}.",
+                constraint_subjects.join(" and "),
             )?;
         } else if !locked_subjects.is_empty() {
             writeln!(
