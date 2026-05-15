@@ -1127,19 +1127,63 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
     }
 
     /// Given a node that is the forbid-multi target (i.e. the version that
-    /// *is* required), find the root-level Requires version-set whose
-    /// installable choice is this node.
-    fn root_requirement_pinning(&self, forbid_target: NodeIndex) -> Option<Requirement> {
+    /// *is* required), find a Requires edge that pinned it. Prefer a root
+    /// edge, then fall back to any other incoming Requires. The returned
+    /// source lets the caller phrase the inlined cause appropriately —
+    /// "is required" for root, "X also depends on Y" for a self-conflict,
+    /// "X depends on Y" for a sibling.
+    fn find_pinning(&self, forbid_target: NodeIndex) -> Option<(NodeIndex, Requirement)> {
         let g = &self.graph.graph;
+        // Prefer root edges.
         for e in g.edges_directed(forbid_target, Direction::Incoming) {
-            if e.source() != self.graph.root_node {
-                continue;
+            if e.source() == self.graph.root_node {
+                if let ConflictEdge::Requires(req) = e.weight() {
+                    return Some((e.source(), *req));
+                }
             }
+        }
+        // Fall back to any other Requires edge.
+        for e in g.edges_directed(forbid_target, Direction::Incoming) {
             if let ConflictEdge::Requires(req) = e.weight() {
-                return Some(*req);
+                return Some((e.source(), *req));
             }
         }
         None
+    }
+
+    /// Render a pinning result as a `NarrativeCause`, with phrasing chosen
+    /// to fit the relationship between `current_node` (the fact's subject)
+    /// and the pinning source:
+    /// - source is root → "is required"
+    /// - source IS current_node → "X also depends on Y" (self-conflict)
+    /// - source is a different solvable → "X depends on Y"
+    fn cause_for_pinning(
+        &self,
+        pin: Option<(NodeIndex, Requirement)>,
+        current_node: NodeIndex,
+        current_subject: &str,
+    ) -> NarrativeCause {
+        match pin {
+            Some((source, pin_req)) if source == self.graph.root_node => {
+                NarrativeCause::RootRequires(pin_req.display(self.interner).to_string())
+            }
+            Some((source, pin_req)) if source == current_node => NarrativeCause::Raw(format!(
+                "{} also depends on {}",
+                current_subject,
+                pin_req.display(self.interner)
+            )),
+            Some((source, pin_req)) => {
+                let source_str = self.render_node(source);
+                NarrativeCause::Raw(format!(
+                    "{} depends on {}",
+                    source_str,
+                    pin_req.display(self.interner)
+                ))
+            }
+            None => NarrativeCause::Raw(
+                "another version of the required package is selected".to_string(),
+            ),
+        }
     }
 
     /// Render a candidate node's display text (with merged-versions handling).
@@ -1218,23 +1262,17 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
                     text: format!("{} depends on {}", subject, req_text),
                     ruled_out_by: None,
                 });
-                // Second cause: try to find the root-level requirement that
-                // pinned the conflicting version. Use the first inlinable.
+                // Second cause: trace back from the forbidden version to
+                // find what required the conflicting version. Pinning may
+                // be root, the current node itself (self-conflict), or
+                // some other ancestor.
                 let pin = inlinable_all
                     .iter()
                     .find_map(|&t| {
                         self.is_inlinable_forbid(t)
-                            .and_then(|fb_target| self.root_requirement_pinning(fb_target))
+                            .and_then(|fb_target| self.find_pinning(fb_target))
                     });
-                if let Some(pin_req) = pin {
-                    let pin_text = pin_req.display(self.interner).to_string();
-                    causes.push(NarrativeCause::RootRequires(pin_text));
-                } else {
-                    // Fallback when we can't trace back to root.
-                    causes.push(NarrativeCause::Raw(format!(
-                        "another version of the required package is selected"
-                    )));
-                }
+                causes.push(self.cause_for_pinning(pin, nx, &subject));
                 continue;
             }
 
@@ -1420,20 +1458,37 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
                     ))
                 } else if non_inst.len() == 1 {
                     if let Some(fb) = self.is_inlinable_forbid(non_inst[0]) {
-                        match self.root_requirement_pinning(fb) {
-                            Some(pin_req) => NarrativeCause::Depends {
-                                text: format!(
-                                    "{} depends on {}, and {} is required by root",
-                                    member_full,
-                                    req_text,
+                        let pin = self.find_pinning(fb);
+                        let pin_phrase = match pin {
+                            Some((source, pin_req))
+                                if source == self.graph.root_node =>
+                            {
+                                format!(
+                                    " and {} is required",
                                     pin_req.display(self.interner)
-                                ),
-                                ruled_out_by: None,
-                            },
-                            None => NarrativeCause::Depends {
-                                text: format!("{} depends on {}", member_full, req_text),
-                                ruled_out_by: None,
-                            },
+                                )
+                            }
+                            Some((source, pin_req)) if source == m => format!(
+                                " and {} also depends on {}",
+                                member_full,
+                                pin_req.display(self.interner)
+                            ),
+                            Some((source, pin_req)) => {
+                                let source_str = self.render_node(source);
+                                format!(
+                                    " and {} depends on {}",
+                                    source_str,
+                                    pin_req.display(self.interner)
+                                )
+                            }
+                            None => String::new(),
+                        };
+                        NarrativeCause::Depends {
+                            text: format!(
+                                "{} depends on {}{}",
+                                member_full, req_text, pin_phrase
+                            ),
+                            ruled_out_by: None,
                         }
                     } else {
                         let child_id = self.build_for_node(non_inst[0]);
