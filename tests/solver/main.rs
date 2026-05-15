@@ -1149,6 +1149,14 @@ fn render_all(
             )
             .unwrap();
 
+            writeln!(out, "--- v2 narrative (hybrid; banner + grouped facts) ---").unwrap();
+            writeln!(
+                out,
+                "{}",
+                resolvo::conflict_v2::DisplayUnsatNarrative::new(&graph, interner)
+            )
+            .unwrap();
+
             writeln!(out, "--- hints (programmatic) ---").unwrap();
             let ctx = StaticHintCtx {
                 names: known_ids.clone(),

@@ -809,6 +809,702 @@ impl<I: Interner> Display for DisplayUnsatProse<'_, '_, I> {
     }
 }
 
+// ─── Narrative renderer ──────────────────────────────────────────────────────
+
+/// Hybrid renderer combining a banner ("the conflict involves …"), numbered
+/// multi-line fact paragraphs that inline forbid-multi as "is required by
+/// root", grouping of sibling versions ("menu has only versions {10, 15}: …"),
+/// and a single concluding `∴` sentence pointing at the failing top-level
+/// dependency.
+pub struct DisplayUnsatNarrative<'g, 'i, I: Interner> {
+    /// The conflict graph being rendered.
+    pub graph: &'g ConflictGraph,
+    /// The interner used to resolve solvable / version-set / name strings.
+    pub interner: &'i I,
+}
+
+impl<'g, 'i, I: Interner> DisplayUnsatNarrative<'g, 'i, I> {
+    /// Construct a narrative renderer for a conflict graph.
+    pub fn new(graph: &'g ConflictGraph, interner: &'i I) -> Self {
+        Self { graph, interner }
+    }
+}
+
+/// One pre-rendered cause line inside a fact.
+#[derive(Clone)]
+enum NarrativeCause {
+    /// "X depends on Y" — optionally points at another fact that explains
+    /// why Y can't be satisfied.
+    Depends {
+        text: String,
+        ruled_out_by: Option<u32>,
+    },
+    /// "Y is required by root" — used to inline a forbid-multi conclusion.
+    RootRequires(String),
+    /// "Y is excluded because <reason>".
+    Excluded(String),
+    /// "Y is locked at version V" — terminal, used in conclusion-style facts.
+    Locked(String),
+    /// Raw text — escape hatch.
+    Raw(String),
+}
+
+/// One body shape a fact paragraph can take.
+enum NarrativeFactBody {
+    /// `Because <cause1>, and <cause2>, <subject> cannot be installed.`
+    Simple {
+        subject: String,
+        causes: Vec<NarrativeCause>,
+    },
+    /// `<name> has only versions {a, b, c}: … so <name> cannot be installed.`
+    Group {
+        name: String,
+        members: Vec<(String, NarrativeCause)>,
+        subject: String,
+    },
+    /// `<subject> is locked at version <v>.` — single-line terminal fact.
+    LockedFact { subject: String, locked: String },
+}
+
+struct NarrativeFact {
+    id: u32,
+    body: NarrativeFactBody,
+}
+
+impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let graph = self.graph;
+        let interner = self.interner;
+        let installable = installable_set(graph);
+        let merged = graph.simplify(interner);
+        let g = &graph.graph;
+
+        // ── Build phase ────────────────────────────────────────────────────
+        let mut builder = NarrativeBuilder {
+            graph,
+            interner,
+            installable: &installable,
+            merged: &merged,
+            facts: Vec::new(),
+            assigned: HashMap::default(),
+            group_assigned: HashMap::default(),
+        };
+
+        // Top-level: a failing root requirement either groups its non-installable
+        // targets or, if there's only one, recurses into it.
+        let mut root_failing_subjects: Vec<String> = Vec::new();
+        for e in g.edges(graph.root_node) {
+            let ConflictEdge::Requires(req) = e.weight() else {
+                continue;
+            };
+            // Collect non-installable targets for this requirement.
+            let targets: Vec<NodeIndex> = g
+                .edges(graph.root_node)
+                .filter(|e2| matches!(e2.weight(), ConflictEdge::Requires(r) if r == req))
+                .map(|e2| e2.target())
+                .collect();
+            if targets.iter().all(|t| installable.contains(t)) {
+                continue;
+            }
+            // Only process this requirement once.
+            if !targets.iter().any(|t| !installable.contains(t)) {
+                continue;
+            }
+            let req_text = req.display(interner).to_string();
+            // Deduplicate per requirement-text since we iterate over individual edges.
+            if root_failing_subjects.contains(&req_text) {
+                continue;
+            }
+            let name = interner.display_name(requirement_name_id(req, interner)).to_string();
+            root_failing_subjects.push(req_text.clone());
+            let _ = builder.build_from_root_requirement(req, &targets, &name);
+        }
+
+        // Locked at root — terminal facts after the chain.
+        let mut locked_subjects: Vec<String> = Vec::new();
+        for e in g.edges(graph.root_node) {
+            if let ConflictEdge::Conflict(ConflictCause::Locked(s)) = e.weight() {
+                let name = interner
+                    .display_name(interner.solvable_name(*s))
+                    .to_string();
+                let version_str = interner.display_merged_solvables(&[*s]).to_string();
+                let id = builder.next_id();
+                builder.facts.push(NarrativeFact {
+                    id,
+                    body: NarrativeFactBody::LockedFact {
+                        subject: name.clone(),
+                        locked: version_str.clone(),
+                    },
+                });
+                locked_subjects.push(format!("{name} is locked at {version_str}"));
+            }
+        }
+
+        // ── Header ─────────────────────────────────────────────────────────
+        writeln!(f, "× No solution.")?;
+
+        // List root's direct requirements.
+        let mut root_reqs: Vec<String> = Vec::new();
+        for e in g.edges(graph.root_node) {
+            if let ConflictEdge::Requires(req) = e.weight() {
+                let text = req.display(interner).to_string();
+                if !root_reqs.contains(&text) {
+                    root_reqs.push(text);
+                }
+            }
+        }
+        if !root_reqs.is_empty() {
+            writeln!(
+                f,
+                "  Root depends on {}, but these cannot all be satisfied.",
+                root_reqs.join(", ")
+            )?;
+        }
+
+        // Names involved.
+        let mut involved_names: BTreeSet<String> = BTreeSet::new();
+        for nx in g.node_indices() {
+            if let ConflictNode::Solvable(s) = g[nx] {
+                if let Some(sid) = s.solvable() {
+                    involved_names
+                        .insert(interner.display_name(interner.solvable_name(sid)).to_string());
+                }
+            }
+        }
+        if involved_names.len() > 1 {
+            writeln!(
+                f,
+                "  The conflict involves {}.",
+                involved_names.iter().cloned().collect::<Vec<_>>().join(", ")
+            )?;
+        }
+        writeln!(f)?;
+
+        // ── Render facts ───────────────────────────────────────────────────
+        for fact in &builder.facts {
+            render_narrative_fact(f, fact)?;
+        }
+
+        // ── Conclusion ─────────────────────────────────────────────────────
+        if !root_failing_subjects.is_empty() {
+            let nice = root_failing_subjects.join(" and ");
+            writeln!(
+                f,
+                "  ∴ root cannot be installed because it depends on {nice}."
+            )?;
+        } else if !locked_subjects.is_empty() {
+            writeln!(
+                f,
+                "  ∴ {}; this is incompatible with what the solve requires.",
+                locked_subjects.join(" and ")
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+struct NarrativeBuilder<'a, I: Interner> {
+    graph: &'a ConflictGraph,
+    interner: &'a I,
+    installable: &'a HashSet<NodeIndex>,
+    merged: &'a HashMap<SolvableId, Rc<MergedConflictNode>>,
+    facts: Vec<NarrativeFact>,
+    /// Node → fact id, for facts we've already built.
+    assigned: HashMap<NodeIndex, u32>,
+    /// `(parent, requirement)` → fact id, for group facts.
+    group_assigned: HashMap<(NodeIndex, Requirement), u32>,
+}
+
+impl<'a, I: Interner> NarrativeBuilder<'a, I> {
+    fn next_id(&self) -> u32 {
+        (self.facts.len() as u32) + 1
+    }
+
+    /// Returns true if `nx` is a "pure forbid-multi" node — its only reason
+    /// for being non-installable is that another version of the same package
+    /// is required. Such nodes get inlined into their parent's narrative
+    /// rather than getting their own fact.
+    fn is_inlinable_forbid(&self, nx: NodeIndex) -> Option<NodeIndex> {
+        let g = &self.graph.graph;
+        if self.installable.contains(&nx) {
+            return None;
+        }
+        let mut has_other_conflict = false;
+        let mut has_requires = false;
+        let mut forbid_target: Option<NodeIndex> = None;
+        for e in g.edges_directed(nx, Direction::Outgoing) {
+            match e.weight() {
+                ConflictEdge::Requires(_) => has_requires = true,
+                ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances) => {
+                    forbid_target = Some(e.target());
+                }
+                ConflictEdge::Conflict(_) => has_other_conflict = true,
+            }
+        }
+        if has_other_conflict || has_requires {
+            return None;
+        }
+        forbid_target
+    }
+
+    /// Given a node that is the forbid-multi target (i.e. the version that
+    /// *is* required), find the root-level Requires version-set whose
+    /// installable choice is this node.
+    fn root_requirement_pinning(&self, forbid_target: NodeIndex) -> Option<Requirement> {
+        let g = &self.graph.graph;
+        for e in g.edges_directed(forbid_target, Direction::Incoming) {
+            if e.source() != self.graph.root_node {
+                continue;
+            }
+            if let ConflictEdge::Requires(req) = e.weight() {
+                return Some(*req);
+            }
+        }
+        None
+    }
+
+    /// Render a candidate node's display text (with merged-versions handling).
+    fn render_node(&self, nx: NodeIndex) -> String {
+        let g = &self.graph.graph;
+        match g[nx] {
+            ConflictNode::Solvable(s) => render_solvable(s, self.merged, self.interner),
+            ConflictNode::UnresolvedDependency => "(no candidates)".to_string(),
+            ConflictNode::Excluded(_) => String::new(),
+        }
+    }
+
+    /// Build a fact for `nx` (or return its existing id). Returns the fact id
+    /// the caller should reference. Returns `None` if `nx` is itself
+    /// inlinable (caller should inline rather than reference).
+    fn build_for_node(&mut self, nx: NodeIndex) -> Option<u32> {
+        if let Some(&id) = self.assigned.get(&nx) {
+            return Some(id);
+        }
+        if self.is_inlinable_forbid(nx).is_some() {
+            return None;
+        }
+
+        let g = &self.graph.graph;
+        let subject = self.render_node(nx);
+
+        // Inspect outgoing edges.
+        let mut excluded_reason: Option<String> = None;
+        let mut constrains: Vec<VersionSetId> = Vec::new();
+        let mut requirements: Vec<(Requirement, Vec<NodeIndex>)> = Vec::new();
+        for e in g.edges_directed(nx, Direction::Outgoing) {
+            match e.weight() {
+                ConflictEdge::Conflict(ConflictCause::Excluded) => {
+                    if let ConflictNode::Excluded(s) = g[e.target()] {
+                        excluded_reason =
+                            Some(self.interner.display_string(s).to_string());
+                    }
+                }
+                ConflictEdge::Conflict(ConflictCause::Constrains(vs)) => {
+                    constrains.push(*vs);
+                }
+                ConflictEdge::Requires(r) => {
+                    if let Some(slot) = requirements.iter_mut().find(|(r0, _)| r0 == r) {
+                        slot.1.push(e.target());
+                    } else {
+                        requirements.push((*r, vec![e.target()]));
+                    }
+                }
+                ConflictEdge::Conflict(_) => {}
+            }
+        }
+
+        // Compute causes for each unsatisfied requirement.
+        let mut causes: Vec<NarrativeCause> = Vec::new();
+
+        for (req, targets) in &requirements {
+            // If at least one target is installable, this dep is fine — skip.
+            if targets.iter().any(|t| self.installable.contains(t)) {
+                continue;
+            }
+            let req_text = req.display(self.interner).to_string();
+            let non_installable: Vec<NodeIndex> = targets
+                .iter()
+                .copied()
+                .filter(|t| !self.installable.contains(t))
+                .collect();
+
+            // Case A: all non-installable targets are pure-forbid-multi → inline.
+            let inlinable_all: Vec<NodeIndex> = non_installable
+                .iter()
+                .filter_map(|&t| self.is_inlinable_forbid(t).map(|_| t))
+                .collect();
+            if inlinable_all.len() == non_installable.len() && !non_installable.is_empty() {
+                // First cause: "X depends on R"
+                causes.push(NarrativeCause::Depends {
+                    text: format!("{} depends on {}", subject, req_text),
+                    ruled_out_by: None,
+                });
+                // Second cause: try to find the root-level requirement that
+                // pinned the conflicting version. Use the first inlinable.
+                let pin = inlinable_all
+                    .iter()
+                    .find_map(|&t| {
+                        self.is_inlinable_forbid(t)
+                            .and_then(|fb_target| self.root_requirement_pinning(fb_target))
+                    });
+                if let Some(pin_req) = pin {
+                    let pin_text = pin_req.display(self.interner).to_string();
+                    causes.push(NarrativeCause::RootRequires(pin_text));
+                } else {
+                    // Fallback when we can't trace back to root.
+                    causes.push(NarrativeCause::Raw(format!(
+                        "another version of the required package is selected"
+                    )));
+                }
+                continue;
+            }
+
+            // Case B: multiple non-installable targets of the same name → group.
+            let same_name = non_installable.iter().all(|&t| match g[t] {
+                ConflictNode::Solvable(s) => match (s.solvable(), non_installable.first().and_then(|&first| {
+                    if let ConflictNode::Solvable(s0) = g[first] { s0.solvable() } else { None }
+                })) {
+                    (Some(a), Some(b)) => {
+                        self.interner.solvable_name(a) == self.interner.solvable_name(b)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            });
+            if non_installable.len() > 1 && same_name {
+                // Build (or reuse) a group fact for this (parent, requirement).
+                let group_key = (nx, *req);
+                let group_id = if let Some(&id) = self.group_assigned.get(&group_key) {
+                    id
+                } else {
+                    self.build_group(nx, *req, &non_installable)
+                };
+                causes.push(NarrativeCause::Depends {
+                    text: format!("{} depends on {}", subject, req_text),
+                    ruled_out_by: Some(group_id),
+                });
+                continue;
+            }
+
+            // Case C: a single non-installable target — recurse and reference.
+            if non_installable.len() == 1 {
+                let target = non_installable[0];
+                let target_id = self.build_for_node(target);
+                let suffix_id = target_id.unwrap_or(0);
+                if suffix_id != 0 {
+                    causes.push(NarrativeCause::Depends {
+                        text: format!("{} depends on {}", subject, req_text),
+                        ruled_out_by: Some(suffix_id),
+                    });
+                } else {
+                    // Target was inlinable but we got Case-A handling first;
+                    // this shouldn't reach here under the current logic.
+                    causes.push(NarrativeCause::Depends {
+                        text: format!("{} depends on {}", subject, req_text),
+                        ruled_out_by: None,
+                    });
+                }
+                continue;
+            }
+
+            // Case D: no candidates (unresolved sink).
+            if non_installable.len() == 1
+                && self.graph.unresolved_node == Some(non_installable[0])
+            {
+                causes.push(NarrativeCause::Raw(format!(
+                    "{} depends on {}, which has no candidates",
+                    subject, req_text
+                )));
+                continue;
+            }
+        }
+
+        // Excluded?
+        if let Some(reason) = excluded_reason {
+            causes.push(NarrativeCause::Excluded(reason));
+        }
+
+        // Constrains?
+        for vs in &constrains {
+            let name = self
+                .interner
+                .display_name(self.interner.version_set_name(*vs))
+                .to_string();
+            let vset = self.interner.display_version_set(*vs).to_string();
+            causes.push(NarrativeCause::Raw(format!(
+                "{} constrains {} {}, which conflicts with an installable version",
+                subject, name, vset
+            )));
+        }
+
+        // If we have no causes at all, this node's reason isn't captured by
+        // the current rules — emit a fallback so the user still sees something.
+        if causes.is_empty() {
+            causes.push(NarrativeCause::Raw(format!("{} cannot be selected", subject)));
+        }
+
+        let id = self.next_id();
+        self.assigned.insert(nx, id);
+        self.facts.push(NarrativeFact {
+            id,
+            body: NarrativeFactBody::Simple {
+                subject: subject.clone(),
+                causes,
+            },
+        });
+        Some(id)
+    }
+
+    /// Build a group fact for `parent → requirement → {member1, member2, ...}`.
+    /// Members are processed first so their facts get *lower* ids than the
+    /// group's, which makes the rendered output read leaf-first.
+    fn build_group(
+        &mut self,
+        parent: NodeIndex,
+        req: Requirement,
+        members: &[NodeIndex],
+    ) -> u32 {
+        if let Some(&id) = self.group_assigned.get(&(parent, req)) {
+            return id;
+        }
+
+        let g = &self.graph.graph;
+
+        // The group's display name — common name of all members.
+        let name = members
+            .first()
+            .and_then(|&t| match g[t] {
+                ConflictNode::Solvable(s) => s.solvable(),
+                _ => None,
+            })
+            .map(|s| self.interner.display_name(self.interner.solvable_name(s)).to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        // Build member lines, recursing into each member's cause *first* so
+        // child fact ids are assigned before the group's own id.
+        let mut member_lines: Vec<(String, NarrativeCause)> = Vec::new();
+        for &m in members {
+            let member_full = self.render_node(m);
+            // Strip the leading name so the bullet reads "10 depends on …"
+            // instead of "menu 10 depends on …" inside a group keyed by menu.
+            let member_short = strip_name_prefix(&member_full, &name);
+            // Find this member's outgoing requirement(s).
+            let mut maybe_req: Option<(Requirement, Vec<NodeIndex>)> = None;
+            for e in g.edges_directed(m, Direction::Outgoing) {
+                if let ConflictEdge::Requires(r) = e.weight() {
+                    let entry = maybe_req.get_or_insert((*r, Vec::new()));
+                    entry.1.push(e.target());
+                }
+            }
+            let cause = if let Some((mreq, mtargets)) = maybe_req {
+                let req_text = mreq.display(self.interner).to_string();
+                let non_inst: Vec<NodeIndex> = mtargets
+                    .iter()
+                    .copied()
+                    .filter(|t| !self.installable.contains(t))
+                    .collect();
+                if non_inst.len() == 1 {
+                    if let Some(fb) = self.is_inlinable_forbid(non_inst[0]) {
+                        match self.root_requirement_pinning(fb) {
+                            Some(pin_req) => NarrativeCause::Depends {
+                                text: format!(
+                                    "{} depends on {}, and {} is required by root",
+                                    member_full,
+                                    req_text,
+                                    pin_req.display(self.interner)
+                                ),
+                                ruled_out_by: None,
+                            },
+                            None => NarrativeCause::Depends {
+                                text: format!("{} depends on {}", member_full, req_text),
+                                ruled_out_by: None,
+                            },
+                        }
+                    } else {
+                        let child_id = self.build_for_node(non_inst[0]);
+                        NarrativeCause::Depends {
+                            text: format!("{} depends on {}", member_full, req_text),
+                            ruled_out_by: child_id,
+                        }
+                    }
+                } else if !non_inst.is_empty() {
+                    let child_id = self.build_for_node(non_inst[0]);
+                    NarrativeCause::Depends {
+                        text: format!("{} depends on {}", member_full, req_text),
+                        ruled_out_by: child_id,
+                    }
+                } else {
+                    NarrativeCause::Depends {
+                        text: format!("{} depends on {}", member_full, req_text),
+                        ruled_out_by: None,
+                    }
+                }
+            } else {
+                NarrativeCause::Raw(format!("{} cannot be selected", member_full))
+            };
+            member_lines.push((member_short, cause));
+        }
+
+        // Now allocate the group's id and push it *after* children.
+        let id = self.next_id();
+        self.group_assigned.insert((parent, req), id);
+        self.facts.push(NarrativeFact {
+            id,
+            body: NarrativeFactBody::Group {
+                name: name.clone(),
+                members: member_lines,
+                subject: name,
+            },
+        });
+        id
+    }
+
+    /// Entry point for a root-level requirement: returns the fact id of the
+    /// outermost fact describing why this requirement fails.
+    fn build_from_root_requirement(
+        &mut self,
+        req: &Requirement,
+        targets: &[NodeIndex],
+        name: &str,
+    ) -> Option<u32> {
+        let g = &self.graph.graph;
+        let non_inst: Vec<NodeIndex> = targets
+            .iter()
+            .copied()
+            .filter(|t| !self.installable.contains(t))
+            .collect();
+
+        if non_inst.is_empty() {
+            return None;
+        }
+
+        // No-candidates case: the only target is the unresolved sink.
+        if non_inst.len() == 1 && self.graph.unresolved_node == Some(non_inst[0]) {
+            let id = self.next_id();
+            self.facts.push(NarrativeFact {
+                id,
+                body: NarrativeFactBody::Simple {
+                    subject: req.display(self.interner).to_string(),
+                    causes: vec![NarrativeCause::Raw(format!(
+                        "no candidates were found for {}",
+                        req.display(self.interner)
+                    ))],
+                },
+            });
+            return Some(id);
+        }
+
+        // If there are multiple non-installable targets and they share a
+        // name, build a top-level group fact.
+        let same_name = non_inst.iter().all(|&t| match g[t] {
+            ConflictNode::Solvable(s) => match (s.solvable(), non_inst.first().and_then(|&first| {
+                if let ConflictNode::Solvable(s0) = g[first] { s0.solvable() } else { None }
+            })) {
+                (Some(a), Some(b)) => {
+                    self.interner.solvable_name(a) == self.interner.solvable_name(b)
+                }
+                _ => false,
+            },
+            _ => false,
+        });
+
+        if non_inst.len() > 1 && same_name {
+            let id = self.build_group(self.graph.root_node, *req, &non_inst);
+            return Some(id);
+        }
+
+        // Single non-installable target (or all different names) → recurse.
+        // Wrap in a single-name group iff there's exactly one member, for
+        // readability.
+        if non_inst.len() == 1 {
+            let single_id = self.build_for_node(non_inst[0]);
+            // If the single member is a solvable that is in fact the *only*
+            // version of its name, wrap it in a one-member group anyway so
+            // the conclusion line reads naturally ("…cannot be installed
+            // because it depends on <name>").
+            return single_id;
+        }
+
+        // Mixed names — recurse into each individually.
+        let mut last: Option<u32> = None;
+        for t in non_inst {
+            if let Some(id) = self.build_for_node(t) {
+                last = Some(id);
+            }
+        }
+        let _ = name; // currently unused; reserved for richer group framing
+        last
+    }
+}
+
+fn render_narrative_fact(f: &mut Formatter<'_>, fact: &NarrativeFact) -> fmt::Result {
+    let l = label(fact.id);
+    match &fact.body {
+        NarrativeFactBody::Simple { subject, causes } => match causes.len() {
+            0 => {
+                writeln!(f, "  {l} {subject} cannot be installed.")?;
+            }
+            1 => {
+                writeln!(
+                    f,
+                    "  {l} Because {}, {} cannot be installed.",
+                    render_cause(&causes[0]),
+                    subject
+                )?;
+            }
+            _ => {
+                writeln!(f, "  {l} Because {},", render_cause(&causes[0]))?;
+                for c in causes.iter().skip(1) {
+                    writeln!(f, "     and {},", render_cause(c))?;
+                }
+                writeln!(f, "     {} cannot be installed.", subject)?;
+            }
+        },
+        NarrativeFactBody::Group {
+            name,
+            members,
+            subject,
+        } => {
+            let version_set: Vec<String> = members.iter().map(|(s, _)| s.clone()).collect();
+            writeln!(
+                f,
+                "  {l} {name} has only versions {{{}}}:",
+                version_set.join(", ")
+            )?;
+            for (_, c) in members {
+                writeln!(f, "        - {}", render_cause(c))?;
+            }
+            writeln!(f, "     so {} cannot be installed.", subject)?;
+        }
+        NarrativeFactBody::LockedFact { subject, locked } => {
+            writeln!(f, "  {l} {subject} is locked at version {locked}.")?;
+        }
+    }
+    Ok(())
+}
+
+fn strip_name_prefix(full: &str, name: &str) -> String {
+    if let Some(rest) = full.strip_prefix(name) {
+        rest.trim_start().to_string()
+    } else {
+        full.to_string()
+    }
+}
+
+fn render_cause(c: &NarrativeCause) -> String {
+    match c {
+        NarrativeCause::Depends { text, ruled_out_by } => match ruled_out_by {
+            Some(id) => format!("{text}, ruled out by {}", label(*id)),
+            None => text.clone(),
+        },
+        NarrativeCause::RootRequires(s) => format!("{s} is required by root"),
+        NarrativeCause::Excluded(reason) => format!("which is excluded ({reason})"),
+        NarrativeCause::Locked(s) => format!("{s} is locked"),
+        NarrativeCause::Raw(s) => s.clone(),
+    }
+}
+
 // ─── Hints API ───────────────────────────────────────────────────────────────
 
 /// A structured, programmatically-inspectable hint about why a conflict
