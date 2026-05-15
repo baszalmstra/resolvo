@@ -13,6 +13,7 @@
 
 mod conditional_requirement;
 pub mod conflict;
+pub mod conflict_v2;
 pub(crate) mod internal;
 mod requirement;
 pub mod runtime;

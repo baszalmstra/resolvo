@@ -6,7 +6,7 @@ use bundle_box::{BundleBoxProvider, Pack};
 use insta::assert_snapshot;
 use itertools::Itertools;
 use resolvo::{
-    ConditionalRequirement, DependencyProvider, Interner, Problem, SolvableId, Solver,
+    ConditionalRequirement, DependencyProvider, Interner, NameId, Problem, SolvableId, Solver,
     UnsolvableOrCancelled, VersionSetId,
 };
 use tracing_test::traced_test;
@@ -1040,6 +1040,258 @@ fn serialize_snapshot(
 ) {
     let file = std::io::BufWriter::new(std::fs::File::create(destination.as_ref()).unwrap());
     serde_json::to_writer_pretty(file, snapshot).unwrap()
+}
+
+// ─── v2 prototype side-by-side comparison ─────────────────────────────────────
+// Runs four representative unsat scenarios and dumps the v1 / v2-tree /
+// v2-prose / hints output for each to /tmp/unsat_compare.txt for manual review.
+// Not a real test in the sense of asserting equality; this is a prototype
+// inspection tool that just has to run.
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let (m, n) = (a.chars().count(), b.chars().count());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr: Vec<usize> = vec![0; n + 1];
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = std::cmp::min(
+                std::cmp::min(curr[j] + 1, prev[j + 1] + 1),
+                prev[j] + cost,
+            );
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+struct StaticHintCtx<'a, I: Interner> {
+    names: Vec<NameId>,
+    interner: &'a I,
+}
+
+impl<I: Interner> resolvo::conflict_v2::HintContext for StaticHintCtx<'_, I> {
+    fn similar_name(&self, name: NameId) -> Option<NameId> {
+        let target = self.interner.display_name(name).to_string();
+        let mut best: Option<(NameId, usize)> = None;
+        for &cand in &self.names {
+            if cand == name {
+                continue;
+            }
+            let s = self.interner.display_name(cand).to_string();
+            let d = levenshtein(&target, &s);
+            if d <= 2 && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((cand, d));
+            }
+        }
+        best.map(|(n, _)| n)
+    }
+}
+
+fn render_all(
+    out: &mut String,
+    label: &str,
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    known_names: &[&str],
+) {
+    use std::fmt::Write as _;
+
+    // Intern known names before moving the provider into the solver.
+    let known_ids: Vec<NameId> = known_names
+        .iter()
+        .map(|n| provider.package_name(n))
+        .collect();
+
+    let requirements = provider.requirements(specs);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+
+    writeln!(out, "================================================================================").unwrap();
+    writeln!(out, "Scenario: {label}").unwrap();
+    writeln!(out, "  requirements: {:?}", specs).unwrap();
+    writeln!(out, "================================================================================").unwrap();
+
+    match solver.solve(problem) {
+        Ok(_) => {
+            writeln!(out, "  (UNEXPECTED: a solution was found)").unwrap();
+        }
+        Err(UnsolvableOrCancelled::Cancelled(_)) => {
+            writeln!(out, "  (cancelled)").unwrap();
+        }
+        Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
+            let graph = conflict.graph(&solver);
+            let interner = solver.provider();
+
+            writeln!(out, "\n--- v1 (current) ---").unwrap();
+            writeln!(out, "{}", conflict.display_user_friendly(&solver)).unwrap();
+
+            writeln!(out, "--- v2 tree (numbered refs, unified) ---").unwrap();
+            writeln!(
+                out,
+                "{}",
+                resolvo::conflict_v2::DisplayUnsatTree::new(&graph, interner)
+            )
+            .unwrap();
+
+            writeln!(out, "--- v2 prose (pubgrub style) ---").unwrap();
+            writeln!(
+                out,
+                "{}",
+                resolvo::conflict_v2::DisplayUnsatProse::new(&graph, interner)
+            )
+            .unwrap();
+
+            writeln!(out, "--- hints (programmatic) ---").unwrap();
+            let ctx = StaticHintCtx {
+                names: known_ids.clone(),
+                interner,
+            };
+            let hints = resolvo::conflict_v2::compute_hints(&graph, interner, &ctx);
+            if hints.is_empty() {
+                writeln!(out, "  (none)").unwrap();
+            } else {
+                for hint in hints {
+                    match hint {
+                        resolvo::conflict_v2::ConflictHint::NoCandidatesFor {
+                            name,
+                            requirement,
+                            suggestion,
+                        } => {
+                            writeln!(
+                                out,
+                                "  NoCandidatesFor: name={} requirement=({}) suggestion={}",
+                                interner.display_name(name),
+                                requirement.display(interner),
+                                match suggestion {
+                                    Some(s) => format!("\"{}\"", interner.display_name(s)),
+                                    None => "<none>".to_string(),
+                                }
+                            )
+                            .unwrap();
+                        }
+                        resolvo::conflict_v2::ConflictHint::LockedVersionMismatch { locked } => {
+                            writeln!(
+                                out,
+                                "  LockedVersionMismatch: locked={}",
+                                interner.display_solvable(locked)
+                            )
+                            .unwrap();
+                        }
+                        resolvo::conflict_v2::ConflictHint::AllCandidatesExcluded {
+                            name,
+                            reasons,
+                        } => {
+                            let reason_strs: Vec<String> = reasons
+                                .iter()
+                                .map(|r| interner.display_string(*r).to_string())
+                                .collect();
+                            writeln!(
+                                out,
+                                "  AllCandidatesExcluded: name={} reasons=[{}]",
+                                interner.display_name(name),
+                                reason_strs.join("; ")
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            }
+            writeln!(out).unwrap();
+        }
+    }
+}
+
+#[test]
+fn dump_v2_prototype_comparison() {
+    let mut out = String::new();
+
+    // 1. PubGrub article — multi-branch
+    render_all(
+        &mut out,
+        "PubGrub article (multi-branch)",
+        BundleBoxProvider::from_packages(&[
+            ("menu", 15, vec!["dropdown 2..3"]),
+            ("menu", 10, vec!["dropdown 1..2"]),
+            ("dropdown", 2, vec!["icons 2"]),
+            ("dropdown", 1, vec!["intl 3"]),
+            ("icons", 2, vec![]),
+            ("icons", 1, vec![]),
+            ("intl", 5, vec![]),
+            ("intl", 3, vec![]),
+        ]),
+        &["menu", "icons 1", "intl 5"],
+        &["menu", "dropdown", "icons", "intl"],
+    );
+
+    // 2. Bluesky — simple chain
+    render_all(
+        &mut out,
+        "Bluesky conflict (simple chain)",
+        BundleBoxProvider::from_packages(&[
+            ("suitcase-utils", 54, vec![]),
+            ("suitcase-utils", 53, vec![]),
+            (
+                "bluesky-widgets",
+                42,
+                vec![
+                    "bluesky-live 0..10",
+                    "numpy 0..10",
+                    "python 0..10",
+                    "suitcase-utils 0..54",
+                ],
+            ),
+            ("bluesky-live", 1, vec![]),
+            ("numpy", 1, vec![]),
+            ("python", 1, vec![]),
+        ]),
+        &["bluesky-widgets 0..100", "suitcase-utils 54..100"],
+        &[
+            "bluesky-widgets",
+            "bluesky-live",
+            "numpy",
+            "python",
+            "suitcase-utils",
+        ],
+    );
+
+    // 3. Locked + transitive conflict
+    {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("asdf", 1, vec!["c 2"]),
+            ("c", 2, vec![]),
+            ("c", 1, vec![]),
+        ]);
+        provider.set_locked("c", 1);
+        render_all(
+            &mut out,
+            "Locked & excluded",
+            provider,
+            &["asdf"],
+            &["asdf", "c"],
+        );
+    }
+
+    // 4. Typo — missing top-level dep with a close known name. We seed
+    //    `fghi` as a known package so the similarity hint can fire on the
+    //    user's `fghj` typo.
+    render_all(
+        &mut out,
+        "Typo: missing top-level dep with a close known name",
+        BundleBoxProvider::from_packages(&[("asdf", 1, vec![]), ("fghi", 1, vec![])]),
+        &["fghj"],
+        &["asdf", "fghi"],
+    );
+
+    std::fs::write("/tmp/unsat_compare.txt", &out).unwrap();
+    eprintln!("wrote /tmp/unsat_compare.txt ({} bytes)", out.len());
 }
 
 fn solve_for_snapshot<D: DependencyProvider>(
