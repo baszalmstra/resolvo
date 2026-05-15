@@ -856,8 +856,6 @@ enum NarrativeCause {
     },
     /// "Y is required by root" — used to inline a forbid-multi conclusion.
     RootRequires(String),
-    /// "Y is excluded because <reason>".
-    Excluded(String),
     /// Raw text — escape hatch.
     Raw(String),
 }
@@ -936,20 +934,21 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
         // Locked at root — try to build a chain-based explanation that
         // narrates the transitive dependency path leading into the locked
         // package, falling back to a terminal `LockedFact` when no chain
-        // can be found.
+        // can be found. Dedup by solvable id so the same lock doesn't
+        // produce multiple facts.
         let mut locked_subjects: Vec<String> = Vec::new();
+        let mut locked_seen: HashSet<SolvableId> = HashSet::new();
         for e in g.edges(graph.root_node) {
             if let ConflictEdge::Conflict(ConflictCause::Locked(s)) = e.weight() {
                 let s = *s;
+                if !locked_seen.insert(s) {
+                    continue;
+                }
                 let name = interner
                     .display_name(interner.solvable_name(s))
                     .to_string();
                 let version_str = interner.display_merged_solvables(&[s]).to_string();
                 if let Some(root_req) = builder.try_build_locked_chain(s) {
-                    // The chain fact already mentions the lock; surface the
-                    // chain's root requirement in the concluding line so it
-                    // reads "root cannot be installed because it depends on
-                    // <X>" rather than repeating the lock info.
                     let req_text = root_req.display(interner).to_string();
                     if !root_failing_subjects.contains(&req_text) {
                         root_failing_subjects.push(req_text);
@@ -965,6 +964,34 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
                     });
                     locked_subjects.push(format!("{name} is locked at {version_str}"));
                 }
+            }
+        }
+
+        // Constraints-at-root — root has a Conflict(Constrains(_)) edge that
+        // isn't expressible as a normal "requires" chain. Emit a single
+        // terminal fact for each unique constraint.
+        let mut constrains_seen: HashSet<VersionSetId> = HashSet::new();
+        for e in g.edges(graph.root_node) {
+            if let ConflictEdge::Conflict(ConflictCause::Constrains(vs)) = e.weight() {
+                let vs = *vs;
+                if !constrains_seen.insert(vs) {
+                    continue;
+                }
+                let name = interner
+                    .display_name(interner.version_set_name(vs))
+                    .to_string();
+                let vset = interner.display_version_set(vs).to_string();
+                let id = builder.next_id();
+                builder.facts.push(NarrativeFact {
+                    id,
+                    body: NarrativeFactBody::Simple {
+                        subject: format!("the constraint {name} {vset}"),
+                        causes: vec![NarrativeCause::Raw(format!(
+                            "the constraint {name} {vset} cannot be fulfilled"
+                        ))],
+                    },
+                });
+                root_failing_subjects.push(format!("the constraint {name} {vset}"));
             }
         }
 
@@ -1272,9 +1299,13 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
             }
         }
 
-        // Excluded?
+        // Excluded? Inline the subject so the resulting sentence reads
+        // "{subject} is excluded ({reason})" rather than "{which is excluded
+        // ({reason})}" — the Excluded variant doesn't know its subject.
         if let Some(reason) = excluded_reason {
-            causes.push(NarrativeCause::Excluded(reason));
+            causes.push(NarrativeCause::Raw(format!(
+                "{subject} is excluded ({reason})"
+            )));
         }
 
         // Constrains?
@@ -1641,12 +1672,21 @@ fn render_narrative_fact(f: &mut Formatter<'_>, fact: &NarrativeFact) -> fmt::Re
                 writeln!(f, "  {l} {subject} cannot be installed.")?;
             }
             1 => {
-                writeln!(
-                    f,
-                    "  {l} Because {}, {} cannot be installed.",
-                    render_cause(&causes[0]),
-                    subject
-                )?;
+                // If the single cause is a self-contained statement
+                // (NarrativeCause::Raw), just print it directly. The
+                // "Because X, Y cannot be installed." wrapper reads
+                // awkwardly when X already includes both the subject and
+                // the verb (e.g. "issue_717 2.1 is excluded (...)").
+                if matches!(&causes[0], NarrativeCause::Raw(_)) {
+                    writeln!(f, "  {l} {}.", render_cause(&causes[0]))?;
+                } else {
+                    writeln!(
+                        f,
+                        "  {l} Because {}, {} cannot be installed.",
+                        render_cause(&causes[0]),
+                        subject
+                    )?;
+                }
             }
             _ => {
                 writeln!(f, "  {l} Because {},", render_cause(&causes[0]))?;
@@ -1694,7 +1734,6 @@ fn render_cause(c: &NarrativeCause) -> String {
             None => text.clone(),
         },
         NarrativeCause::RootRequires(s) => format!("{s} is required"),
-        NarrativeCause::Excluded(reason) => format!("which is excluded ({reason})"),
         NarrativeCause::Raw(s) => s.clone(),
     }
 }
@@ -1756,10 +1795,16 @@ pub fn compute_hints(
     let g = &graph.graph;
     let mut hints: Vec<ConflictHint> = Vec::new();
 
-    // 1. Locked mismatches.
-    for e in g.edges(graph.root_node) {
-        if let ConflictEdge::Conflict(ConflictCause::Locked(locked)) = e.weight() {
-            hints.push(ConflictHint::LockedVersionMismatch { locked: *locked });
+    // 1. Locked mismatches. Dedup by SolvableId — a graph can have the
+    //    same locked clause referenced from multiple root requires.
+    {
+        let mut seen: HashSet<SolvableId> = HashSet::default();
+        for e in g.edges(graph.root_node) {
+            if let ConflictEdge::Conflict(ConflictCause::Locked(locked)) = e.weight() {
+                if seen.insert(*locked) {
+                    hints.push(ConflictHint::LockedVersionMismatch { locked: *locked });
+                }
+            }
         }
     }
 
