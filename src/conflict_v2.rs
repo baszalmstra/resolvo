@@ -967,13 +967,11 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
             }
         }
 
-        // Constraints-at-root — root has a Conflict(Constrains(_)) edge that
-        // isn't expressible as a normal "requires" chain. Emit one terminal
-        // fact per unique constraint. We deliberately don't push these
-        // into `root_failing_subjects` (the fact already reads as a
-        // complete sentence and the ∴ line would duplicate it), but we
-        // collect them into `constraint_subjects` so the concluding line
-        // can mention them when there are no other failure causes.
+        // Constraints-at-root — root has a Conflict(Constrains(_)) edge.
+        // Try to narrate the chain that forced an incompatible version
+        // (e.g. "xbar 1 depends on xfoo >=2, but the constraint xfoo ==1
+        // is required"); fall back to a terminal "the constraint X cannot
+        // be fulfilled" fact when no such chain exists.
         let mut constraint_subjects: Vec<String> = Vec::new();
         let mut constrains_seen: HashSet<VersionSetId> = HashSet::new();
         for e in g.edges(graph.root_node) {
@@ -986,17 +984,26 @@ impl<I: Interner> Display for DisplayUnsatNarrative<'_, '_, I> {
                     .display_name(interner.version_set_name(vs))
                     .to_string();
                 let vset = interner.display_version_set(vs).to_string();
-                let id = builder.next_id();
-                builder.facts.push(NarrativeFact {
-                    id,
-                    body: NarrativeFactBody::Simple {
-                        subject: format!("the constraint {name} {vset}"),
-                        causes: vec![NarrativeCause::Raw(format!(
-                            "The constraint {name} {vset} cannot be fulfilled"
-                        ))],
-                    },
-                });
-                constraint_subjects.push(format!("the constraint {name} {vset}"));
+                let constraint_text = format!("the constraint {name} {vset}");
+                if let Some(root_req) = builder.try_build_constraint_chain(vs) {
+                    let req_text = root_req.display(interner).to_string();
+                    if !root_failing_subjects.contains(&req_text) {
+                        root_failing_subjects.push(req_text);
+                    }
+                    constraint_subjects.push(constraint_text);
+                } else {
+                    let id = builder.next_id();
+                    builder.facts.push(NarrativeFact {
+                        id,
+                        body: NarrativeFactBody::Simple {
+                            subject: constraint_text.clone(),
+                            causes: vec![NarrativeCause::Raw(format!(
+                                "The constraint {name} {vset} cannot be fulfilled"
+                            ))],
+                        },
+                    });
+                    constraint_subjects.push(constraint_text);
+                }
             }
         }
 
@@ -1673,6 +1680,78 @@ impl<'a, I: Interner> NarrativeBuilder<'a, I> {
             }
         }
         None
+    }
+
+    /// For a constraint at root, attempt to find a transitive dependency
+    /// chain from a root requirement's installable target into the
+    /// constraint's package name. If found, narrate the chain ending with
+    /// "but the constraint X is required" — same style as the locked
+    /// chain, but the terminal cause references the constraint instead
+    /// of a lock. Returns the root-level `Requirement` that initiated the
+    /// chain (so the caller can list it in the failing-subjects line).
+    /// Falls back to `None` when no chain exists; the caller then emits
+    /// the terminal "the constraint X cannot be fulfilled" fact.
+    fn try_build_constraint_chain(&mut self, constraint: VersionSetId) -> Option<Requirement> {
+        let g = &self.graph.graph;
+        let constraint_name = self.interner.version_set_name(constraint);
+        let constraint_text = format!(
+            "{} {}",
+            self.interner.display_name(constraint_name),
+            self.interner.display_version_set(constraint),
+        );
+
+        let mut chain_info: Option<(Vec<NodeIndex>, Requirement, Requirement)> = None;
+        for e in g.edges(self.graph.root_node) {
+            let ConflictEdge::Requires(root_req) = e.weight() else {
+                continue;
+            };
+            let target = e.target();
+            if !self.installable.contains(&target) {
+                continue;
+            }
+            if let Some((path, endpoint)) = self.find_chain_to_name(target, constraint_name) {
+                chain_info = Some((path, endpoint, *root_req));
+                break;
+            }
+        }
+
+        let (chain, endpoint_req, root_req) = chain_info?;
+        let subject = self.render_node(chain[0]);
+        let mut causes: Vec<NarrativeCause> = Vec::new();
+
+        for window in chain.windows(2) {
+            let from = self.render_node(window[0]);
+            let req = g
+                .edges_directed(window[0], Direction::Outgoing)
+                .find_map(|e| match e.weight() {
+                    ConflictEdge::Requires(r) if e.target() == window[1] => Some(*r),
+                    _ => None,
+                })?;
+            causes.push(NarrativeCause::Depends {
+                text: format!("{} depends on {}", from, req.display(self.interner)),
+                ruled_out_by: None,
+            });
+        }
+        let last_node = self.render_node(*chain.last()?);
+        causes.push(NarrativeCause::Depends {
+            text: format!(
+                "{} depends on {}",
+                last_node,
+                endpoint_req.display(self.interner)
+            ),
+            ruled_out_by: None,
+        });
+        causes.push(NarrativeCause::Raw(format!(
+            "the constraint {constraint_text} is required",
+        )));
+
+        let id = self.next_id();
+        self.facts.push(NarrativeFact {
+            id,
+            body: NarrativeFactBody::Simple { subject, causes },
+        });
+        let _ = id;
+        Some(root_req)
     }
 
     /// For a locked solvable at root, attempt to build an explanation
