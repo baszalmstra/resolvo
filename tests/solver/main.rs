@@ -1329,6 +1329,71 @@ fn test_lazy_conditional_determinism() {
     }
 }
 
+/// Pin the observable semantic divergence between the lazy-conditional path
+/// and the prior eager SAT encoding.
+///
+/// Setup: `cond` has versions `1` and `2`. The condition VS `cond 2..3` matches
+/// only `cond=2`; its complement is `{cond=1}`. We externally exclude `cond=1`
+/// so the *complement* is fully decided-false, while *nothing* positively
+/// selects `cond=2`. The conditional requirement is `a` requires `b` if
+/// `cond>=2`.
+///
+/// Behaviour comparison:
+/// - **Eager (legacy) path**: emits the SAT clause `¬a v ¬C!1 v b1` (where
+///   `C!1` is the complement candidate `cond=1`). With `cond=1` excluded
+///   (decided false), `¬C!1` is satisfied, so the clause forces `b1`. `b`
+///   would appear in the resolution.
+/// - **Lazy path (current implementation)**: `condition_disjunct_holds`
+///   checks whether any **matching** candidate of the condition VS is
+///   positively decided. `cond=2` is never positively decided here, so the
+///   disjunct never holds and the deferred requirement never gets encoded.
+///   `b` is therefore absent from the resolution.
+///
+/// This divergence is deliberate and is documented in
+/// `docs/lazy-conditional-candidates.md` (the `condition_holds` pseudocode at
+/// ~lines 104-117). The lazy semantics align with what a human would expect
+/// from "if `cond>=2` is selected": exclusion of `cond=1` is not the same as
+/// selection of `cond=2`.
+///
+/// This test pins the lazy behaviour so any future regression that re-derives
+/// the eager semantics fails loudly.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_externally_excluded_complement_does_not_fire() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("a", 1, vec!["b; if cond 2..3"]),
+        ("b", 1, vec![]),
+        ("cond", 1, vec![]),
+        ("cond", 2, vec![]),
+    ]);
+    // Externally reject the *complement* candidate `cond=1`. Nothing forces
+    // `cond=2` to be selected; the only requirement is on `a`.
+    provider.exclude("cond", 1, "it is externally excluded");
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+
+    // `b` must NOT appear in the resolution: the lazy path correctly sees
+    // that `cond=2` (the *matching* candidate of `cond 2..3`) is never
+    // positively decided, so the deferred requirement never fires. The
+    // legacy eager path would have included `b` here -- see the doc-comment
+    // above for the contrast.
+    assert_snapshot!(result, @"a=1");
+
+    // The deferred entry must still be sitting in the map (its disjunct
+    // never held), confirming the lazy path's predicate is what kept `b`
+    // out -- not some unrelated reason like `a` being uninstallable.
+    assert_eq!(
+        solver.deferred_requirements_count(),
+        1,
+        "the `if cond 2..3` disjunct never fired, so its deferred entry \
+         must remain"
+    );
+}
+
 #[cfg(feature = "serde")]
 fn serialize_snapshot(
     snapshot: &resolvo::snapshot::DependencySnapshot,
