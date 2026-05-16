@@ -1033,6 +1033,251 @@ fn test_condition_missing_requirement() {
     assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @"menu=1");
 }
 
+// ---------------------------------------------------------------------------
+// Lazy conditional candidate loading
+// ---------------------------------------------------------------------------
+//
+// The tests below cover the edge cases of the lazy-conditional-candidates
+// mechanism: deferred requirements should only fetch the gated packages once
+// the condition actually fires, multi-disjunct conditions should fire
+// per-disjunct, deferral must survive backtracking, etc.
+
+/// The conditional requirement's "if C" gate never fires, so the gated package
+/// `bla` (and its dependency `dep`) should never have its candidates fetched.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_skips_unreached_candidates() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 1, vec!["bla; if bar"]),
+        ("bla", 1, vec!["dep"]),
+        ("dep", 1, vec![]),
+        ("bar", 1, vec![]),
+    ]);
+
+    // We do *not* require `bar`, so the condition `if bar` never fires.
+    let requirements = provider.requirements(&["foo"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @"foo=1");
+
+    let fetched = solver.provider().requested_package_names();
+    assert!(
+        !fetched.iter().any(|name| name == "bla"),
+        "expected `bla` to remain unfetched, got {fetched:?}"
+    );
+    assert!(
+        !fetched.iter().any(|name| name == "dep"),
+        "expected `dep` to remain unfetched, got {fetched:?}"
+    );
+}
+
+/// When the condition fires the deferred clause is encoded and the gated
+/// package is fetched. Sanity check that the eager observable behaviour still
+/// produces the right solution.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_fires_when_condition_holds() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 1, vec!["bla; if bar"]),
+        ("bla", 1, vec![]),
+        ("bar", 1, vec![]),
+    ]);
+
+    let requirements = provider.requirements(&["foo", "bar"]);
+    assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @r###"
+    bar=1
+    bla=1
+    foo=1
+    "###);
+}
+
+/// `a OR b` is a multi-disjunct condition. Firing only `a` should still
+/// produce a correct solution: the `a`-disjunct's clause is encoded when `a`
+/// is selected, and the `b`-disjunct stays deferred (and is never needed).
+#[test]
+#[traced_test]
+fn test_lazy_conditional_multi_disjunct_fires_per_disjunct() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 1, vec!["bla; if a or b"]),
+        ("bla", 1, vec![]),
+        ("a", 1, vec![]),
+        ("b", 1, vec![]),
+    ]);
+
+    // Only require `a`, not `b`. The disjunct gated on `a` must fire so that
+    // `bla` is included.
+    let requirements = provider.requirements(&["foo", "a"]);
+    assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @r###"
+    a=1
+    bla=1
+    foo=1
+    "###);
+}
+
+/// Multiple `requires ... if C` for the same condition should all be encoded
+/// when `C` fires. This exercises the "Multiple conditional requirements share
+/// the same `ConditionId`" edge case.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_shared_condition_fires_all() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 1, vec!["bla; if cond", "ext; if cond"]),
+        ("bla", 1, vec![]),
+        ("ext", 1, vec![]),
+        ("cond", 1, vec![]),
+    ]);
+
+    let requirements = provider.requirements(&["foo", "cond"]);
+    assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @r###"
+    bla=1
+    cond=1
+    ext=1
+    foo=1
+    "###);
+}
+
+/// When the condition fires *and* the requirement is unsolvable, the solver
+/// must report the conflict, not panic and not loop forever.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_late_arriving_conflict_is_reported() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 1, vec!["bla 2; if bar"]),
+        ("bar", 1, vec![]),
+        ("bla", 1, vec![]),
+    ]);
+
+    // The condition `if bar` will fire because we require `bar`; the gated
+    // requirement asks for `bla 2` but only `bla 1` exists, so the resolution
+    // is unsolvable.
+    let requirements = provider.requirements(&["foo", "bar"]);
+    assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @r###"
+    foo * cannot be installed because there are no viable options:
+    └─ foo 1 would require
+       └─ bla >=2, <3, for which no candidates were found.
+    The following packages are incompatible
+    └─ bar * can be installed with any of the following options:
+       └─ bar 1
+    "###);
+}
+
+/// Force backtracking through a deferred conditional requirement: `b 1` forces
+/// `cond`, which fires the deferred `bla; if cond`. Then the solver finds a
+/// conflict on `bla 2` and must backtrack. After backtracking it picks `b 2`
+/// (which does not force `cond`), and the deferred clause is *already*
+/// encoded (clauses are not unlearnt). The solver must still find a solution
+/// and must not encode the deferred clause twice.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_survives_backtracking() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 1, vec!["bla; if cond"]),
+        // `b=1` activates `cond` and demands `bla 2` (which does not exist).
+        ("b", 1, vec!["cond", "bla 2"]),
+        // `b=2` does not activate `cond`. The solver must pick this one.
+        ("b", 2, vec![]),
+        ("bla", 1, vec![]),
+        ("cond", 1, vec![]),
+    ]);
+
+    let requirements = provider.requirements(&["foo", "b"]);
+    assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @r###"
+    b=2
+    foo=1
+    "###);
+}
+
+/// `condition: None` requirements must continue to behave eagerly: the gated
+/// package should be fetched even though we never decide on it. This is the
+/// existing behaviour, kept here as a regression guard.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_unconditional_unaffected() {
+    let mut provider =
+        BundleBoxProvider::from_packages(&[("foo", 1, vec!["bla"]), ("bla", 1, vec![])]);
+
+    let requirements = provider.requirements(&["foo"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r###"
+    bla=1
+    foo=1
+    "###);
+
+    let fetched = solver.provider().requested_package_names();
+    assert!(
+        fetched.iter().any(|name| name == "bla"),
+        "unconditional requirements must still fetch their candidates; got {fetched:?}"
+    );
+}
+
+/// Empty-complement condition: `if bar` is `bar *`, whose complement is
+/// always empty (every candidate of `bar` matches `*`). The encoder relies
+/// on the at-least-one tracker for `bar` to gate the requires clause. The
+/// deferred path must agree with that semantics: the condition holds iff
+/// any candidate of `bar` is selected.
+#[test]
+#[traced_test]
+fn test_lazy_conditional_empty_complement_fires() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 1, vec!["bla; if bar"]),
+        // Multiple versions of bar — the VS `bar *` still matches all of
+        // them, so its complement is empty.
+        ("bar", 1, vec![]),
+        ("bar", 2, vec![]),
+        ("bla", 1, vec![]),
+    ]);
+
+    // With `bar` requested, the condition fires and the deferred clause is
+    // encoded.
+    let requirements = provider.requirements(&["foo", "bar"]);
+    assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @r###"
+    bar=2
+    bla=1
+    foo=1
+    "###);
+}
+
+/// Determinism: running the same problem ten times must produce the exact
+/// same solution. The deferred-requirement drain order must not depend on
+/// hash iteration.
+#[test]
+fn test_lazy_conditional_determinism() {
+    fn build_provider() -> BundleBoxProvider {
+        BundleBoxProvider::from_packages(&[
+            ("foo", 1, vec!["bla; if a", "ext; if b"]),
+            ("foo", 2, vec!["bla; if a", "ext; if b"]),
+            ("bla", 1, vec![]),
+            ("ext", 1, vec![]),
+            ("a", 1, vec![]),
+            ("b", 1, vec![]),
+        ])
+    }
+
+    let baseline = {
+        let mut provider = build_provider();
+        let requirements = provider.requirements(&["foo", "a", "b"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        transaction_to_string(solver.provider(), &solved)
+    };
+
+    for _ in 0..9 {
+        let mut provider = build_provider();
+        let requirements = provider.requirements(&["foo", "a", "b"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_eq!(result, baseline, "non-deterministic solve");
+    }
+}
+
 #[cfg(feature = "serde")]
 fn serialize_snapshot(
     snapshot: &resolvo::snapshot::DependencySnapshot,

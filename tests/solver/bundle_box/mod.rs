@@ -233,6 +233,17 @@ impl BundleBoxProvider {
     pub fn solvable_id(&self, name: impl Into<String>, version: impl Into<Pack>) -> SolvableId {
         self.intern_solvable(self.pool.intern_package_name(name.into()), version.into())
     }
+
+    /// Returns the package names for which the solver has issued a
+    /// `get_candidates` request. Used by tests that verify lazy candidate
+    /// loading does not fetch unreachable packages.
+    pub fn requested_package_names(&self) -> Vec<String> {
+        self.requested_candidates
+            .borrow()
+            .iter()
+            .map(|id| self.pool.resolve_package_name(*id).to_string())
+            .collect()
+    }
 }
 
 impl Interner for BundleBoxProvider {
