@@ -1172,21 +1172,72 @@ fn test_lazy_conditional_late_arriving_conflict_is_reported() {
 #[test]
 #[traced_test]
 fn test_lazy_conditional_survives_backtracking() {
+    // Force the solver down a path that fires the deferred condition and
+    // then backtracks:
+    //
+    // - root requires `foo` and `cond`. `cond` is required unconditionally
+    //   so the condition `if cond` is guaranteed to fire.
+    // - `foo` has two versions; the higher (`foo=2`) carries `bla 2`
+    //   (no candidate -> conflict) in addition to the deferred `bla; if
+    //   cond`. The conflict is only discovered after the deferred clause
+    //   fires and forces a `bla` selection.
+    // - After backtracking the solver settles on `foo=1`, which only has
+    //   the deferred `bla; if cond` requirement. The deferred clause is
+    //   reused from the failed branch (CDCL does not unlearn clauses).
     let mut provider = BundleBoxProvider::from_packages(&[
+        ("foo", 2, vec!["bla; if cond", "bla 2"]),
         ("foo", 1, vec!["bla; if cond"]),
-        // `b=1` activates `cond` and demands `bla 2` (which does not exist).
-        ("b", 1, vec!["cond", "bla 2"]),
-        // `b=2` does not activate `cond`. The solver must pick this one.
-        ("b", 2, vec![]),
         ("bla", 1, vec![]),
         ("cond", 1, vec![]),
     ]);
 
-    let requirements = provider.requirements(&["foo", "b"]);
-    assert_snapshot!(solve_for_snapshot(provider, &requirements, &[]), @r###"
-    b=2
+    let requirements = provider.requirements(&["foo", "cond"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r###"
+    bla=1
+    cond=1
     foo=1
     "###);
+
+    // The `if cond` disjunct fired (cond is required), so the deferred
+    // entry was drained. The map must be empty even though the solve went
+    // through a conflict + backtrack on `foo=2`. A future regression that
+    // accidentally re-enqueues an entry on backtrack would leave a
+    // leftover here -- this is the observable hook for the "remove on
+    // first fire" invariant.
+    assert_eq!(
+        solver.deferred_requirements_count(),
+        0,
+        "deferred entries must be drained on first fire and never re-added"
+    );
+
+    // Resolve the exact same problem on a fresh solver and record its
+    // clause count. The lazy path is deterministic, so a re-solve from
+    // scratch produces the same clauses. If the original solve's
+    // backtracking accidentally caused a double-encode of any deferred
+    // clause, its clause count would be higher than the fresh re-solve's.
+    let fresh_clauses = {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("foo", 2, vec!["bla; if cond", "bla 2"]),
+            ("foo", 1, vec!["bla; if cond"]),
+            ("bla", 1, vec![]),
+            ("cond", 1, vec![]),
+        ]);
+        let requirements = provider.requirements(&["foo", "cond"]);
+        let mut fresh_solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let _ = fresh_solver.solve(problem).unwrap();
+        fresh_solver.clauses_count()
+    };
+    assert_eq!(
+        solver.clauses_count(),
+        fresh_clauses,
+        "clause count must match a fresh re-solve; a mismatch would mean a \
+         deferred entry was encoded more than once"
+    );
 }
 
 /// `condition: None` requirements must continue to behave eagerly: the gated

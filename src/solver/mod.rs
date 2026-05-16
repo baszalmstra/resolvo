@@ -276,6 +276,23 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.cache.provider()
     }
 
+    /// Total number of deferred per-disjunct conditional requirements still
+    /// waiting for their condition to fire. Exposed under the `diagnostics`
+    /// feature so tests can guard the "remove on first fire" invariant of
+    /// the lazy-conditional-candidates path.
+    #[cfg(feature = "diagnostics")]
+    pub fn deferred_requirements_count(&self) -> usize {
+        self.state.deferred_requirements_count()
+    }
+
+    /// Number of clauses currently in the solver's clause set. Exposed under
+    /// the `diagnostics` feature so tests can detect duplicate clause
+    /// emission (e.g. a double-encode of a deferred requirement).
+    #[cfg(feature = "diagnostics")]
+    pub fn clauses_count(&self) -> usize {
+        self.state.clauses_count()
+    }
+
     /// Set the runtime of the solver to `runtime`.
     #[must_use]
     pub fn with_runtime<RT2: AsyncRuntime>(self, runtime: RT2) -> Solver<D, RT2> {
@@ -1598,5 +1615,24 @@ impl SolverState {
             .entry(entry.condition)
             .or_default()
             .push(entry);
+    }
+
+    /// Total number of deferred per-disjunct entries still waiting for their
+    /// condition to fire. Exposed under the `diagnostics` feature so tests
+    /// can guard the "remove on first fire" invariant.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn deferred_requirements_count(&self) -> usize {
+        self.deferred_requirements
+            .values()
+            .map(|entries| entries.len())
+            .sum()
+    }
+
+    /// Number of clauses currently in the solver's clause set. Exposed under
+    /// the `diagnostics` feature so tests can detect duplicate clause
+    /// emission (e.g. a double-encode of a deferred requirement).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn clauses_count(&self) -> usize {
+        self.clauses.kinds.len()
     }
 }
