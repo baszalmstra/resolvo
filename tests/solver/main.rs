@@ -1329,6 +1329,109 @@ fn test_lazy_conditional_determinism() {
     }
 }
 
+/// Multi-conjunct (`a AND b`) condition. `convert_conditions_to_dnf`
+/// distributes AND over OR, so `cond_a AND cond_b` becomes a single disjunct
+/// with two conjuncts. The lazy path's `condition_disjunct_holds` only fires
+/// when *every* conjunct in the disjunct holds.
+///
+/// Existing tests cover only single-conjunct disjuncts (`if x` or `if x or
+/// y`), leaving the `disjunct.iter().all(...)` arm of
+/// `condition_disjunct_holds` unexercised. This test fixes that gap with
+/// three sub-cases sharing the same fixture but with different root
+/// requirements.
+mod test_lazy_conditional_multi_conjunct_requires_all {
+    use super::*;
+
+    fn build_provider() -> BundleBoxProvider {
+        BundleBoxProvider::from_packages(&[
+            ("a", 1, vec!["b; if cond_a and cond_b"]),
+            ("b", 1, vec![]),
+            ("cond_a", 1, vec![]),
+            ("cond_b", 1, vec![]),
+        ])
+    }
+
+    /// Neither conjunct fires. `b` must not be in the resolution and must
+    /// not have its candidates fetched.
+    #[test]
+    #[traced_test]
+    fn neither_selected() {
+        let mut provider = build_provider();
+        let requirements = provider.requirements(&["a"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_snapshot!(result, @"a=1");
+
+        let fetched = solver.provider().requested_package_names();
+        assert!(
+            !fetched.iter().any(|n| n == "b"),
+            "expected `b` to remain unfetched when neither conjunct holds, \
+             got {fetched:?}"
+        );
+        assert_eq!(
+            solver.deferred_requirements_count(),
+            1,
+            "the AND-disjunct never held, its deferred entry must remain"
+        );
+    }
+
+    /// Only the first conjunct fires. `b` must not be in the resolution and
+    /// must not have its candidates fetched: the lazy path requires *every*
+    /// conjunct of the AND-disjunct to hold.
+    #[test]
+    #[traced_test]
+    fn only_first_selected() {
+        let mut provider = build_provider();
+        let requirements = provider.requirements(&["a", "cond_a"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_snapshot!(result, @r###"
+        a=1
+        cond_a=1
+        "###);
+
+        let fetched = solver.provider().requested_package_names();
+        assert!(
+            !fetched.iter().any(|n| n == "b"),
+            "expected `b` to remain unfetched when only one conjunct holds, \
+             got {fetched:?}"
+        );
+        assert_eq!(
+            solver.deferred_requirements_count(),
+            1,
+            "second conjunct (cond_b) did not hold, deferred entry must remain"
+        );
+    }
+
+    /// Both conjuncts fire. `b` must be in the resolution.
+    #[test]
+    #[traced_test]
+    fn both_selected() {
+        let mut provider = build_provider();
+        let requirements = provider.requirements(&["a", "cond_a", "cond_b"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_snapshot!(result, @r###"
+        a=1
+        b=1
+        cond_a=1
+        cond_b=1
+        "###);
+
+        assert_eq!(
+            solver.deferred_requirements_count(),
+            0,
+            "both conjuncts hold, the deferred entry must have been drained"
+        );
+    }
+}
+
 /// Determinism under non-deterministic async ordering. The plain
 /// [`test_lazy_conditional_determinism`] uses the default
 /// `sleep_before_return = false`, so every `get_candidates` future resolves
