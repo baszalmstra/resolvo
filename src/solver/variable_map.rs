@@ -74,6 +74,13 @@ impl VariableMap {
         }
     }
 
+    /// Looks up the variable for a solvable without allocating one. Returns
+    /// `None` if no variable has been allocated for this solvable yet, which
+    /// implies the solvable has not been decided.
+    pub fn lookup_solvable(&self, solvable_id: SolvableId) -> Option<VariableId> {
+        self.solvable_to_variable.get(&solvable_id).copied()
+    }
+
     #[cfg(feature = "diagnostics")]
     pub fn count(&self) -> usize {
         self.next_id
