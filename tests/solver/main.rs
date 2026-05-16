@@ -1329,6 +1329,84 @@ fn test_lazy_conditional_determinism() {
     }
 }
 
+/// Determinism under non-deterministic async ordering. The plain
+/// [`test_lazy_conditional_determinism`] uses the default
+/// `sleep_before_return = false`, so every `get_candidates` future resolves
+/// synchronously and ordering is trivially deterministic. This test enables
+/// `sleep_before_return = true` so each provider call awaits a 10 ms timer
+/// inside the tokio runtime, forcing the `FuturesUnordered` driving the
+/// encoder to actually interleave futures.
+///
+/// We then assert that across 10 runs of the same problem:
+/// - the resolution (the solvables list) is byte-identical, and
+/// - the sorted set of packages whose candidates were fetched
+///   (`requested_package_names`) is byte-identical.
+///
+/// The second assertion is the load-bearing one for this test: it guards the
+/// deferred-requirement drain order. A regression that drains
+/// `SolverState::deferred_requirements` by hash iteration would still yield
+/// the same final resolution (CDCL is deterministic given the same input
+/// clauses) but the *order* in which conditional packages get fetched would
+/// drift, observable here as differing `requested_package_names`.
+#[test]
+fn test_lazy_conditional_determinism_async() {
+    fn build_provider() -> BundleBoxProvider {
+        let mut p = BundleBoxProvider::from_packages(&[
+            // Multiple deferred conditional requirements sharing distinct
+            // conditions, plus an inner conditional on `bla` that only
+            // fires once `a` is selected. The graph is non-trivial enough
+            // that a buggy drain order would surface.
+            ("foo", 1, vec!["bla; if a", "ext; if b", "tail; if c"]),
+            ("foo", 2, vec!["bla; if a", "ext; if b", "tail; if c"]),
+            ("bla", 1, vec!["inner; if a"]),
+            ("ext", 1, vec![]),
+            ("tail", 1, vec![]),
+            ("inner", 1, vec![]),
+            ("a", 1, vec![]),
+            ("b", 1, vec![]),
+            ("c", 1, vec![]),
+        ]);
+        // Force every provider future to await a real timer so the encoder's
+        // `FuturesUnordered` driver actually has to interleave them.
+        p.sleep_before_return = true;
+        p
+    }
+
+    fn run() -> (String, Vec<String>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut provider = build_provider();
+        let requirements = provider.requirements(&["foo", "a", "b", "c"]);
+        let mut solver = Solver::new(provider).with_runtime(runtime);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        let mut fetched = solver.provider().requested_package_names();
+        // Sort so the assertion targets the *set* of fetched packages,
+        // which is what determinism guarantees -- the *insertion* order
+        // into the underlying HashSet is hash-randomised and not part of
+        // the solver's contract.
+        fetched.sort();
+        (result, fetched)
+    }
+
+    let baseline = run();
+    for i in 0..9 {
+        let next = run();
+        assert_eq!(
+            next.0, baseline.0,
+            "non-deterministic resolution under async ordering at iteration {i}"
+        );
+        assert_eq!(
+            next.1, baseline.1,
+            "non-deterministic fetched-packages set under async ordering at \
+             iteration {i}"
+        );
+    }
+}
+
 /// Pin the observable semantic divergence between the lazy-conditional path
 /// and the prior eager SAT encoding.
 ///
