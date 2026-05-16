@@ -128,8 +128,16 @@ impl Clause {
         condition: Option<(DisjunctionId, &[Literal])>,
         decision_tracker: &DecisionTracker,
     ) -> (Self, Option<[Literal; 2]>, bool) {
-        // It only makes sense to introduce a requires clause when the parent solvable
-        // is undecided or going to be installed
+        // It only makes sense to introduce a requires clause when the parent
+        // solvable is undecided or going to be installed: if the parent has
+        // already been decided false the clause `¬parent v ...` is trivially
+        // satisfied and adding it serves no purpose.
+        //
+        // Callers that may reach this function on the lazy-conditional path
+        // (e.g. `Encoder::on_requirement_candidates_available`) must filter
+        // out the parent-is-false case before getting here, because the lazy
+        // path can have the parent propagated false between the moment a
+        // requirement is deferred and the moment its condition fires.
         assert_ne!(decision_tracker.assigned_value(parent), Some(false));
 
         let kind = Clause::Requires(parent, condition.map(|d| d.0), requirement);
