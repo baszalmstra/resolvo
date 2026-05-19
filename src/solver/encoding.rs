@@ -151,8 +151,20 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         mut self,
         solvable_ids: impl IntoIterator<Item = SolvableOrRootId>,
     ) -> Result<Vec<ClauseId>, Box<dyn Any>> {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state.propagation_counters.encoding_counters.waves += 1;
+        }
+
         // Queue the initial solvables for processing.
         for solvable_id in solvable_ids {
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state
+                    .propagation_counters
+                    .encoding_counters
+                    .initial_solvables += 1;
+            }
             self.queue_solvable(solvable_id);
         }
 
@@ -206,6 +218,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             dependencies,
         }: DependenciesAvailable<'cache>,
     ) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state
+                .propagation_counters
+                .encoding_counters
+                .dependencies_available += 1;
+        }
+
         tracing::trace!(
             "dependencies available for {}",
             solvable_id.display(self.cache.provider()),
@@ -253,6 +273,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             package_candidates,
         }: CandidatesAvailable<'cache>,
     ) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state
+                .propagation_counters
+                .encoding_counters
+                .packages_available += 1;
+        }
+
         tracing::trace!(
             "Package candidates available for {}",
             self.cache.provider().display_name(name_id)
@@ -288,6 +316,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             condition,
         }: RequirementCandidatesAvailable<'cache>,
     ) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state
+                .propagation_counters
+                .encoding_counters
+                .requirements_available += 1;
+        }
+
         tracing::trace!(
             "Sorted candidates available for {}",
             requirement.requirement.display(self.cache.provider()),
@@ -325,6 +361,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // Queue requesting the dependencies of the candidates as well if they are
         // cheaply available from the dependency provider.
         for &candidate in candidates.iter().flat_map(|solvables| solvables.iter()) {
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state
+                    .propagation_counters
+                    .encoding_counters
+                    .eager_candidates_seen += 1;
+            }
             // Pre-check before `queue_solvable` does the same: skips the
             // `are_dependencies_available_for` query and the async closure
             // setup on the hot duplicate path.
@@ -333,12 +376,34 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 .clauses_added_for_solvable
                 .contains(SolvableOrRootId::from(candidate))
             {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state
+                        .propagation_counters
+                        .encoding_counters
+                        .eager_candidates_already_encoded += 1;
+                }
                 continue;
             }
             // If the dependencies are already available for the
             // candidate, queue the candidate for processing.
             if self.cache.are_dependencies_available_for(candidate) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state
+                        .propagation_counters
+                        .encoding_counters
+                        .eager_candidates_queued += 1;
+                }
                 self.queue_solvable(candidate.into())
+            } else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state
+                        .propagation_counters
+                        .encoding_counters
+                        .eager_candidates_not_available += 1;
+                }
             }
         }
 
@@ -405,6 +470,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 &self.state.decision_tracker,
             );
             let clause_id = self.state.add_clause(watched_literals, kind);
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state
+                    .propagation_counters
+                    .encoding_counters
+                    .clauses_by_source
+                    .requires += 1;
+            }
 
             self.state
                 .requires_clauses
@@ -435,6 +508,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             candidates,
         }: ConstraintCandidatesAvailable<'cache>,
     ) {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state
+                .propagation_counters
+                .encoding_counters
+                .constraints_available += 1;
+        }
+
         tracing::trace!(
             "non matching candidates available for {} {}",
             self.cache
@@ -443,23 +524,123 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             self.cache.provider().display_version_set(constraint),
         );
 
+        #[cfg(feature = "diagnostics")]
+        {
+            let estimate = self
+                .state
+                .propagation_counters
+                .encoding_counters
+                .constraint_selector_estimates
+                .entry(constraint)
+                .or_default();
+            estimate.occurrences += 1;
+            estimate.current_pair_clauses += candidates.len() as u64;
+            estimate.bad_candidate_clauses =
+                estimate.bad_candidate_clauses.max(candidates.len() as u64);
+        }
+
         let variable = self.state.variable_map.intern_solvable_or_root(solvable_id);
-        for &forbidden_candidate in candidates {
-            let forbidden_candidate_var =
-                self.state.variable_map.intern_solvable(forbidden_candidate);
-            let (watched_literals, conflict, kind) = WatchedLiterals::constrains(
-                variable,
-                forbidden_candidate_var,
-                constraint,
-                &self.state.decision_tracker,
-            );
+        let constraint_violation = match self
+            .state
+            .constraint_violation_trackers
+            .get(&constraint)
+            .copied()
+        {
+            Some(variable) => variable,
+            None => {
+                let variable = self
+                    .state
+                    .variable_map
+                    .alloc_constraint_violation_variable(constraint);
+                self.state
+                    .constraint_violation_trackers
+                    .insert(constraint, variable);
 
-            let clause_id = self.state.add_clause(watched_literals, kind);
+                for &forbidden_candidate in candidates {
+                    let forbidden_candidate_var =
+                        self.state.variable_map.intern_solvable(forbidden_candidate);
+                    let (watched_literals, kind) = WatchedLiterals::constraint_violation(
+                        variable,
+                        forbidden_candidate_var,
+                        constraint,
+                    );
+                    let (clause_id, conflict) =
+                        self.add_binary_clause_with_current_decisions(watched_literals, kind);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        self.state
+                            .propagation_counters
+                            .encoding_counters
+                            .clauses_by_source
+                            .constrains += 1;
+                    }
 
-            if conflict {
-                self.conflicting_clauses.push(clause_id);
+                    if conflict {
+                        self.conflicting_clauses.push(clause_id);
+                    }
+                }
+
+                variable
+            }
+        };
+
+        let (watched_literals, conflict, kind) = WatchedLiterals::constrains(
+            variable,
+            constraint_violation,
+            constraint,
+            &self.state.decision_tracker,
+        );
+        let (clause_id, binary_conflict) =
+            self.add_binary_clause_with_current_decisions(watched_literals, kind);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state
+                .propagation_counters
+                .encoding_counters
+                .clauses_by_source
+                .constrains += 1;
+        }
+
+        if conflict || binary_conflict {
+            self.conflicting_clauses.push(clause_id);
+        }
+    }
+
+    fn add_binary_clause_with_current_decisions(
+        &mut self,
+        watched_literals: Option<WatchedLiterals>,
+        kind: super::clause::Clause,
+    ) -> (ClauseId, bool) {
+        let literals = watched_literals.as_ref().map(|wl| wl.watched_literals);
+        let clause_id = self.state.add_clause(watched_literals, kind);
+
+        let Some([literal_a, literal_b]) = literals else {
+            return (clause_id, false);
+        };
+
+        let decision_map = self.state.decision_tracker.map();
+        let set_literal = match (literal_a.eval(decision_map), literal_b.eval(decision_map)) {
+            (Some(false), Some(false)) => return (clause_id, true),
+            (Some(false), None) => Some(literal_b),
+            (None, Some(false)) => Some(literal_a),
+            _ => None,
+        };
+
+        if let Some(literal) = set_literal {
+            if self
+                .state
+                .decision_tracker
+                .try_add_decision(
+                    Decision::new(literal.variable(), literal.satisfying_value(), clause_id),
+                    self.level,
+                )
+                .is_err()
+            {
+                return (clause_id, true);
             }
         }
+
+        (clause_id, false)
     }
 
     /// Adds clauses to forbid any other clauses than the locked solvable to be
@@ -481,6 +662,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             let (watched_literals, kind) =
                 WatchedLiterals::lock(locked_solvable_var, other_candidate_var);
             self.state.add_clause(watched_literals, kind);
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state
+                    .propagation_counters
+                    .encoding_counters
+                    .clauses_by_source
+                    .lock += 1;
+            }
         }
     }
 
@@ -495,6 +684,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // Allocate a clause for the exclusion
         let (watched_literals, kind) = WatchedLiterals::exclude(variable, reason);
         let clause_id = self.state.add_clause(watched_literals, kind);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state
+                .propagation_counters
+                .encoding_counters
+                .clauses_by_source
+                .excluded += 1;
+        }
 
         // Exclusions are negative assertions, tracked outside the watcher
         self.state.negative_assertions.push((variable, clause_id));
@@ -669,6 +866,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     // mutable borrow of `at_most_one_trackers`, so we cannot
                     // call `self.state.add_clause(..)` here.
                     let clause_id = self.state.clauses.alloc(watched_literals, kind);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        self.state
+                            .propagation_counters
+                            .encoding_counters
+                            .clauses_by_source
+                            .forbid_multiple += 1;
+                    }
                     if let Some(wl) =
                         self.state.clauses.watched_literals[clause_id.to_usize()].as_mut()
                     {
@@ -714,6 +919,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     let (watched_literals, kind) =
                         WatchedLiterals::any_of(at_least_one_variable, candidate_var);
                     self.state.add_clause(watched_literals, kind);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        self.state
+                            .propagation_counters
+                            .encoding_counters
+                            .clauses_by_source
+                            .any_of += 1;
+                    }
                 }
             }
         }
@@ -752,6 +965,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 let (watched_literals, kind) =
                     WatchedLiterals::any_of(at_least_one_variable, helper_var);
                 let clause_id = self.state.add_clause(watched_literals, kind);
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state
+                        .propagation_counters
+                        .encoding_counters
+                        .clauses_by_source
+                        .any_of += 1;
+                }
 
                 // Assign true if any of the variables is true.
                 if self.state.decision_tracker.assigned_value(helper_var) == Some(true) {

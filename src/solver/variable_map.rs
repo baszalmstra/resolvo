@@ -3,7 +3,7 @@ use std::fmt::Display;
 use ahash::HashMap;
 
 use crate::{
-    Interner, NameId, SolvableId,
+    Interner, NameId, SolvableId, VersionSetId,
     internal::{
         arena::ArenaId,
         id::{SolvableOrRootId, VariableId},
@@ -46,6 +46,10 @@ pub enum VariableOrigin {
     /// A variable that indicates that any solvable of a particular package is
     /// part of the solution.
     AtLeastOne(NameId),
+
+    /// A variable that indicates that a selected solvable violates a
+    /// constraint.
+    ConstraintViolation(VersionSetId),
 }
 
 impl Default for VariableMap {
@@ -113,6 +117,12 @@ impl VariableMap {
         self.alloc(VariableOrigin::AtLeastOne(name))
     }
 
+    /// Allocate a variable that helps encode whether any selected solvable
+    /// violates the specified constraint.
+    pub fn alloc_constraint_violation_variable(&mut self, version_set: VersionSetId) -> VariableId {
+        self.alloc(VariableOrigin::ConstraintViolation(version_set))
+    }
+
     /// Returns the origin of a variable. The origin describes the semantics of
     /// a variable.
     pub fn origin(&self, variable_id: VariableId) -> VariableOrigin {
@@ -164,6 +174,13 @@ impl<I: Interner> Display for VariableDisplay<'_, I> {
             VariableOrigin::AtLeastOne(name) => {
                 write!(f, "any-of({})", self.interner.display_name(name))
             }
+            VariableOrigin::ConstraintViolation(version_set) => write!(
+                f,
+                "constraint-violation({} {})",
+                self.interner
+                    .display_name(self.interner.version_set_name(version_set)),
+                self.interner.display_version_set(version_set)
+            ),
         }
     }
 }

@@ -43,7 +43,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 Clause::Learnt(..) => {
                     learned_clauses += 1;
                 }
-                Clause::Constrains(..) => {
+                Clause::Constrains(..) | Clause::ConstraintViolation(..) => {
                     constrains_clauses += 1;
                 }
                 Clause::AnyOf(..) => {
@@ -60,6 +60,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 None => assertion_clauses += 1,
                 Some(_) => match clause {
                     Clause::Constrains(..)
+                    | Clause::ConstraintViolation(..)
                     | Clause::ForbidMultipleInstances(..)
                     | Clause::Lock(..)
                     | Clause::AnyOf(..) => binary_watched += 1,
@@ -208,6 +209,138 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 writer,
                 "\nAvg clause visits per decision:\t{:.1}",
                 counters.clause_visits as f64 / counters.decisions_propagated.max(1) as f64
+            )
+            .unwrap();
+        }
+
+        let encoding = &counters.encoding_counters;
+        let encoding_clauses = &encoding.clauses_by_source;
+        writeln!(writer, "\n=== Encoding Statistics ===").unwrap();
+        writeln!(writer, "Encoding waves:\t{}", encoding.waves).unwrap();
+        writeln!(
+            writer,
+            "Initial solvables queued:\t{}",
+            encoding.initial_solvables
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "Dependencies processed:\t{}",
+            encoding.dependencies_available
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "Packages processed:\t{}",
+            encoding.packages_available
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "Requirements processed:\t{}",
+            encoding.requirements_available
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "Constraints processed:\t{}",
+            encoding.constraints_available
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "Eager dependency candidates seen:\t{}",
+            encoding.eager_candidates_seen
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "- Already encoded:\t{}",
+            encoding.eager_candidates_already_encoded
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "- Dependencies unavailable:\t{}",
+            encoding.eager_candidates_not_available
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "- Queued eagerly:\t{}",
+            encoding.eager_candidates_queued
+        )
+        .unwrap();
+        writeln!(writer, "Clauses emitted by encoder source:").unwrap();
+        writeln!(writer, "- Requires:\t{}", encoding_clauses.requires).unwrap();
+        writeln!(writer, "- Constrains:\t{}", encoding_clauses.constrains).unwrap();
+        writeln!(writer, "- Lock:\t{}", encoding_clauses.lock).unwrap();
+        writeln!(writer, "- Excluded:\t{}", encoding_clauses.excluded).unwrap();
+        writeln!(
+            writer,
+            "- ForbidMultiple:\t{}",
+            encoding_clauses.forbid_multiple
+        )
+        .unwrap();
+        writeln!(writer, "- AnyOf:\t{}", encoding_clauses.any_of).unwrap();
+        let constraint_estimates = &encoding.constraint_selector_estimates;
+        let current_constraint_clauses: u64 = constraint_estimates
+            .values()
+            .map(|estimate| estimate.current_pair_clauses)
+            .sum();
+        let projected_selector_clauses: u64 = constraint_estimates
+            .values()
+            .map(|estimate| estimate.occurrences + estimate.bad_candidate_clauses)
+            .sum();
+        let projected_savings =
+            current_constraint_clauses.saturating_sub(projected_selector_clauses);
+        writeln!(writer, "\nConstraint selector estimate:").unwrap();
+        writeln!(
+            writer,
+            "- Unique constrained version sets:\t{}",
+            constraint_estimates.len()
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "- Current pair clauses:\t{}",
+            current_constraint_clauses
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "- Projected selector clauses:\t{}",
+            projected_selector_clauses
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "- Projected clause reduction:\t{}",
+            projected_savings
+        )
+        .unwrap();
+        writeln!(writer, "- Largest projected wins:").unwrap();
+        for (version_set, estimate) in constraint_estimates
+            .iter()
+            .sorted_by_key(|(_, estimate)| {
+                estimate
+                    .current_pair_clauses
+                    .saturating_sub(estimate.occurrences + estimate.bad_candidate_clauses)
+            })
+            .rev()
+            .take(5)
+        {
+            let projected = estimate.occurrences + estimate.bad_candidate_clauses;
+            writeln!(
+                writer,
+                "  - {} {}:\t{} -> {}\t({} occurrences, {} bad candidates)",
+                self.provider()
+                    .display_name(self.provider().version_set_name(*version_set)),
+                self.provider().display_version_set(*version_set),
+                estimate.current_pair_clauses,
+                projected,
+                estimate.occurrences,
+                estimate.bad_candidate_clauses
             )
             .unwrap();
         }

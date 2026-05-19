@@ -15,7 +15,7 @@ use crate::{
     DependencyProvider, Interner, Requirement,
     internal::{
         arena::ArenaId,
-        id::{ClauseId, SolvableId, SolvableOrRootId, StringId, VersionSetId},
+        id::{ClauseId, SolvableId, SolvableOrRootId, StringId, VariableId, VersionSetId},
     },
     runtime::AsyncRuntime,
     solver::{Solver, clause::Clause, variable_map::VariableOrigin},
@@ -56,6 +56,31 @@ impl Conflict {
         let root_node = Self::add_node(&mut graph, &mut nodes, SolvableOrRootId::root());
         let unresolved_node = graph.add_node(ConflictNode::UnresolvedDependency);
         let mut last_node_by_name = HashMap::default();
+        let mut constraint_guards: HashMap<VariableId, Vec<(SolvableOrRootId, VersionSetId)>> =
+            HashMap::default();
+
+        for clause_id in &self.clauses {
+            let &Clause::Constrains(package_id, constraint_variable, version_set_id) =
+                &state.clauses.kinds[clause_id.to_usize()]
+            else {
+                continue;
+            };
+
+            if !matches!(
+                state.variable_map.origin(constraint_variable),
+                VariableOrigin::ConstraintViolation(_)
+            ) {
+                continue;
+            }
+
+            let package_solvable = package_id
+                .as_solvable_or_root(&state.variable_map)
+                .expect("only solvables can introduce constraints");
+            constraint_guards
+                .entry(constraint_variable)
+                .or_default()
+                .push((package_solvable, version_set_id));
+        }
 
         for clause_id in &self.clauses {
             let clause = &state.clauses.kinds[clause_id.to_usize()];
@@ -145,6 +170,13 @@ impl Conflict {
                     }
                 }
                 &Clause::Constrains(package_id, dep_id, version_set_id) => {
+                    if matches!(
+                        state.variable_map.origin(dep_id),
+                        VariableOrigin::ConstraintViolation(_)
+                    ) {
+                        continue;
+                    }
+
                     let package_solvable = package_id
                         .as_solvable_or_root(&state.variable_map)
                         .expect("only solvables can be excluded");
@@ -160,6 +192,25 @@ impl Conflict {
                         dep_node,
                         ConflictEdge::Conflict(ConflictCause::Constrains(version_set_id)),
                     );
+                }
+                &Clause::ConstraintViolation(selector, dep_id, version_set_id) => {
+                    let dependency_solvable = dep_id
+                        .as_solvable_or_root(&state.variable_map)
+                        .expect("only solvables can violate constraints");
+                    let dep_node = Self::add_node(&mut graph, &mut nodes, dependency_solvable);
+
+                    for &(package_solvable, guard_version_set) in
+                        constraint_guards.get(&selector).into_iter().flatten()
+                    {
+                        debug_assert_eq!(guard_version_set, version_set_id);
+                        let package_node = Self::add_node(&mut graph, &mut nodes, package_solvable);
+
+                        graph.add_edge(
+                            package_node,
+                            dep_node,
+                            ConflictEdge::Conflict(ConflictCause::Constrains(version_set_id)),
+                        );
+                    }
                 }
                 Clause::AnyOf(selected, _variable) => {
                     // Assumption: since `AnyOf` of clause can never be false, we dont add an edge

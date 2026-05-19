@@ -71,17 +71,21 @@ pub(crate) enum Clause {
     ///
     /// In SAT terms: (¬A ∨ ¬B)
     ForbidMultipleInstances(VariableId, Literal, NameId),
-    /// Forbids packages that do not satisfy a solvable's constrains
+    /// Forbids selecting a solvable together with a constraint violation.
     ///
-    /// Usage: for each constrains relationship in a package, determine all the
-    /// candidates that do _not_ satisfy it, and create one
-    /// [`Clause::Constrains`]. The clause itself forbids two solvables from
-    /// being installed at the same time, just as
-    /// [`Clause::ForbidMultipleInstances`], but it pays off to have a
-    /// separate variant for user-friendly error messages.
+    /// Usage: for each constrains relationship in a package, determine the
+    /// selector variable that tracks whether any selected solvable violates the
+    /// constraint, and create one [`Clause::Constrains`]. The companion
+    /// [`Clause::ConstraintViolation`] clauses define when the selector becomes
+    /// true.
     ///
     /// In SAT terms: (¬A ∨ ¬B)
     Constrains(VariableId, VariableId, VersionSetId),
+    /// Indicates that a particular solvable violates a constraint selector.
+    ///
+    /// In SAT terms: (¬B ∨ C), where C is a helper variable indicating that
+    /// some selected solvable violates the constraint.
+    ConstraintViolation(VariableId, VariableId, VersionSetId),
     /// Forbids the package on the right-hand side
     ///
     /// Note that the package on the left-hand side is not part of the clause,
@@ -117,6 +121,7 @@ impl Clause {
         matches!(
             self,
             Clause::Constrains(..)
+                | Clause::ConstraintViolation(..)
                 | Clause::ForbidMultipleInstances(..)
                 | Clause::Lock(..)
                 | Clause::AnyOf(..)
@@ -191,14 +196,14 @@ impl Clause {
     /// These building blocks are:
     ///
     /// - The [Clause] itself;
-    /// - The ids of the solvables that will be watched;
+    /// - The ids of the literals that will be watched;
     /// - A boolean indicating whether the clause conflicts with existing
     ///   decisions. This should always be false when adding clauses before
     ///   starting the solving process, but can be true for clauses that are
     ///   added dynamically.
     fn constrains(
         parent: VariableId,
-        forbidden_solvable: VariableId,
+        constraint_violation: VariableId,
         via: VersionSetId,
         decision_tracker: &DecisionTracker,
     ) -> (Self, Option<[Literal; 2]>, bool) {
@@ -206,15 +211,29 @@ impl Clause {
         // is undecided or going to be installed
         assert_ne!(decision_tracker.assigned_value(parent), Some(false));
 
-        // If the forbidden solvable is already assigned to true, that means that there
-        // is a conflict with current decisions, because it implies the parent
-        // solvable would be false (and we just asserted that it is not)
-        let conflict = decision_tracker.assigned_value(forbidden_solvable) == Some(true);
+        // If a violating solvable is already selected, that means that there
+        // is a conflict with current decisions because it implies the parent
+        // solvable would be false (and we just asserted that it is not).
+        let conflict = decision_tracker.assigned_value(constraint_violation) == Some(true);
 
         (
-            Clause::Constrains(parent, forbidden_solvable, via),
-            Some([parent.negative(), forbidden_solvable.negative()]),
+            Clause::Constrains(parent, constraint_violation, via),
+            Some([parent.negative(), constraint_violation.negative()]),
             conflict,
+        )
+    }
+
+    fn constraint_violation(
+        constraint_violation: VariableId,
+        forbidden_solvable: VariableId,
+        via: VersionSetId,
+    ) -> (Self, Option<[Literal; 2]>) {
+        (
+            Clause::ConstraintViolation(constraint_violation, forbidden_solvable, via),
+            Some([
+                forbidden_solvable.negative(),
+                constraint_violation.positive(),
+            ]),
         )
     }
 
@@ -313,6 +332,9 @@ impl Clause {
                     .try_fold(init, visit)
             }
             Clause::Constrains(s1, s2, _) => [s1.negative(), s2.negative()]
+                .into_iter()
+                .try_fold(init, visit),
+            Clause::ConstraintViolation(s1, s2, _) => [s2.negative(), s1.positive()]
                 .into_iter()
                 .try_fold(init, visit),
             Clause::ForbidMultipleInstances(s1, s2, _) => {
@@ -427,13 +449,13 @@ impl WatchedLiterals {
     /// conflict.
     pub fn constrains(
         candidate: VariableId,
-        constrained_package: VariableId,
+        constraint_violation: VariableId,
         requirement: VersionSetId,
         decision_tracker: &DecisionTracker,
     ) -> (Option<Self>, bool, Clause) {
         let (kind, watched_literals, conflict) = Clause::constrains(
             candidate,
-            constrained_package,
+            constraint_violation,
             requirement,
             decision_tracker,
         );
@@ -443,6 +465,16 @@ impl WatchedLiterals {
             conflict,
             kind,
         )
+    }
+
+    pub fn constraint_violation(
+        constraint_violation: VariableId,
+        forbidden_solvable: VariableId,
+        requirement: VersionSetId,
+    ) -> (Option<Self>, Clause) {
+        let (kind, watched_literals) =
+            Clause::constraint_violation(constraint_violation, forbidden_solvable, requirement);
+        (Self::from_kind_and_initial_watches(watched_literals), kind)
     }
 
     pub fn lock(
@@ -644,6 +676,17 @@ impl<I: Interner> Display for ClauseDisplay<'_, I> {
                 write!(
                     f,
                     "Constrains({}({:?}), {}({:?}), {})",
+                    v1.display(self.variable_map, self.interner),
+                    v1,
+                    v2.display(self.variable_map, self.interner),
+                    v2,
+                    self.interner.display_version_set(version_set_id)
+                )
+            }
+            Clause::ConstraintViolation(v1, v2, version_set_id) => {
+                write!(
+                    f,
+                    "ConstraintViolation({}({:?}), {}({:?}), {})",
                     v1.display(self.variable_map, self.interner),
                     v1,
                     v2.display(self.variable_map, self.interner),

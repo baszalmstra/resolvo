@@ -188,6 +188,7 @@ pub(crate) struct SolverState {
     clauses_added_for_package: IndexedSet<NameId>,
     clauses_added_for_solvable: IndexedSet<SolvableOrRootId>,
     at_most_one_trackers: HashMap<NameId, AtMostOnceTracker<VariableId>>,
+    constraint_violation_trackers: HashMap<VersionSetId, VariableId>,
 
     /// Keeps track of auxiliary variables that are used to encode at-least-one
     /// solvable for a package.
@@ -227,6 +228,43 @@ pub(crate) struct PropagationCounters {
     pub decide_duration: std::time::Duration,
     /// Time spent in [`Self::analyze`] / `learn_from_conflict`.
     pub learn_duration: std::time::Duration,
+    pub encoding_counters: EncodingCounters,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct EncodingCounters {
+    pub waves: u64,
+    pub initial_solvables: u64,
+    pub dependencies_available: u64,
+    pub packages_available: u64,
+    pub requirements_available: u64,
+    pub constraints_available: u64,
+    pub eager_candidates_seen: u64,
+    pub eager_candidates_already_encoded: u64,
+    pub eager_candidates_not_available: u64,
+    pub eager_candidates_queued: u64,
+    pub clauses_by_source: EncodingClausesBySource,
+    pub constraint_selector_estimates: HashMap<VersionSetId, ConstraintSelectorEstimate>,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct EncodingClausesBySource {
+    pub requires: u64,
+    pub constrains: u64,
+    pub lock: u64,
+    pub excluded: u64,
+    pub forbid_multiple: u64,
+    pub any_of: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct ConstraintSelectorEstimate {
+    pub occurrences: u64,
+    pub current_pair_clauses: u64,
+    pub bad_candidate_clauses: u64,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -246,7 +284,7 @@ impl PropagationVisitsByType {
     fn count(&mut self, clause: &Clause) {
         match clause {
             Clause::Requires(..) => self.requires += 1,
-            Clause::Constrains(..) => self.constrains += 1,
+            Clause::Constrains(..) | Clause::ConstraintViolation(..) => self.constrains += 1,
             Clause::ForbidMultipleInstances(..) => self.forbid_multiple += 1,
             Clause::Lock(..) => self.lock += 1,
             Clause::Learnt(..) => self.learnt += 1,
@@ -398,8 +436,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         };
         assert_eq!(root_clause, ClauseId::install_root());
 
+        let root_result = self.run_sat(SolvableOrRootId::root(), &root_dependencies);
+        let root_solvable = match root_result {
+            Ok(root_solvable) => root_solvable,
+            Err(err) => {
+                #[cfg(feature = "diagnostics")]
+                self.report_diagnostics();
+                return Err(err);
+            }
+        };
         assert!(
-            self.run_sat(SolvableOrRootId::root(), &root_dependencies)?,
+            root_solvable,
             "bug: Since root is the first requested solvable, \
                   should have returned Err instead of Ok(false) if root is unsolvable"
         );
@@ -413,7 +460,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .assigned_value(additional_var)
                 .is_none()
             {
-                self.run_sat(additional.into(), &root_dependencies)?;
+                if let Err(err) = self.run_sat(additional.into(), &root_dependencies) {
+                    #[cfg(feature = "diagnostics")]
+                    self.report_diagnostics();
+                    return Err(err);
+                }
             }
         }
 
