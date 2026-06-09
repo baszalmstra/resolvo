@@ -203,7 +203,8 @@ impl<N: SolverId, S: SolverId> VariableMap<N, S> {
 
     /// Look up an already-interned "absent" literal for a package name.
     /// Returns `None` if the literal has not been interned yet.
-    // Used in M2+ (universal solve extraction); suppress dead_code until then.
+    // Only used from unit tests today; the M2 cell extraction will use it
+    // from non-test code, at which point this allow can be dropped.
     #[allow(dead_code)]
     pub fn get_env_absent(&self, package_name: N) -> Option<VariableId> {
         self.env_absent_to_variable.get(&package_name).copied()

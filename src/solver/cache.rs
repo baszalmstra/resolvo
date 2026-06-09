@@ -186,8 +186,9 @@ impl<D: DependencyProvider> SolverCache<D> {
                     PackageCandidates::Candidates(c) => c,
                     PackageCandidates::Environment(_) => {
                         panic!(
-                            "encountered environment package '{}' in a non-universal solve; \
-                             concrete solves must inject concrete virtual packages",
+                            "internal error: candidates were requested for environment package \
+                             '{}'; the encoder must classify environment packages before \
+                             fetching candidates",
                             self.provider.display_name(package_name_id)
                         )
                     }
@@ -234,8 +235,9 @@ impl<D: DependencyProvider> SolverCache<D> {
                     PackageCandidates::Candidates(c) => c,
                     PackageCandidates::Environment(_) => {
                         panic!(
-                            "encountered environment package '{}' in a non-universal solve; \
-                             concrete solves must inject concrete virtual packages",
+                            "internal error: candidates were requested for environment package \
+                             '{}'; the encoder must classify environment packages before \
+                             fetching candidates",
                             self.provider.display_name(package_name_id)
                         )
                     }
@@ -332,8 +334,8 @@ impl<D: DependencyProvider> SolverCache<D> {
             PackageCandidates::Candidates(c) => c,
             PackageCandidates::Environment(_) => {
                 panic!(
-                    "encountered environment package '{}' in a non-universal solve; \
-                     concrete solves must inject concrete virtual packages",
+                    "internal error: candidates were requested for environment package '{}'; \
+                     the encoder must classify environment packages before fetching candidates",
                     self.provider.display_name(package_name_id)
                 )
             }

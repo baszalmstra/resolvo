@@ -314,34 +314,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 // Record that this is an environment package.
                 self.state.env_packages.set(name_id, Some(*env_pkg));
 
-                // If the package can be absent, intern the absent literal now
-                // (before any matches literals for it) so that later
-                // `intern_env_matches` calls can find it and emit the
-                // absent-vs-matches exclusion clause.
+                // If the package can be absent, intern the absent literal.
+                // Matches literals interned later find it and emit the
+                // absent-vs-matches exclusion clause; if any matches literals
+                // already exist (possible under an async runtime, where task
+                // results arrive in arbitrary order) the helper emits the
+                // exclusion clauses for them here.
                 if env_pkg.can_be_absent {
-                    let (ab_var, is_new, prior_matches) =
-                        self.state.variable_map.intern_env_absent(name_id);
-                    if is_new {
-                        // Emit `(not Ab_p or not L_b)` for every previously
-                        // interned matches literal of this package. At this
-                        // point there are none (we just started), so this loop
-                        // is empty; it is here for correctness in edge cases
-                        // where the absent literal might be interned multiple
-                        // times.
-                        for prior_vs in &prior_matches {
-                            let l_b_var = self
-                                .state
-                                .variable_map
-                                .get_env_matches(*prior_vs)
-                                .expect("variable for prior_vs must exist");
-                            let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                                ab_var.negative(),
-                                l_b_var.negative(),
-                            );
-                            self.state.add_clause(wl, kind);
-                        }
-                    }
-                    let _ = ab_var;
+                    self.intern_env_absent_with_oracle_clauses(name_id);
                 }
                 return;
             }
@@ -604,33 +584,12 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         let package_name = self.cache.provider().version_set_name(constraint);
         let matches_var = self.intern_env_matches_with_oracle_clauses(constraint, package_name);
 
-        // Intern the absent literal if the package can be absent.
-        let absent_var: Option<VariableId> = if env_pkg.can_be_absent {
-            let (ab_var, is_new, prior_matches) =
-                self.state.variable_map.intern_env_absent(package_name);
-            if is_new {
-                // The absent literal is being interned for the first time
-                // here (it might have been interned earlier in
-                // on_candidates_available, but not necessarily). Emit
-                // absent-vs-matches exclusion clauses for all matches
-                // literals that already exist.
-                for prior_vs in &prior_matches {
-                    let l_b_var = self
-                        .state
-                        .variable_map
-                        .get_env_matches(*prior_vs)
-                        .expect("variable for prior_vs must exist");
-                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                        ab_var.negative(),
-                        l_b_var.negative(),
-                    );
-                    self.state.add_clause(wl, kind);
-                }
-            }
-            Some(ab_var)
-        } else {
-            None
-        };
+        // Intern the absent literal if the package can be absent. It usually
+        // already exists (interned by `on_candidates_available`), but task
+        // results can arrive in arbitrary order under an async runtime.
+        let absent_var = env_pkg
+            .can_be_absent
+            .then(|| self.intern_env_absent_with_oracle_clauses(package_name));
 
         let parent_var = self.state.variable_map.intern_solvable_or_root(solvable_id);
 
@@ -661,6 +620,36 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         if conflict {
             self.conflicting_clauses.push(clause_id);
         }
+    }
+
+    /// Intern the "absent" literal `Ab_p` for the environment package named
+    /// `package_name`. On first interning, emits the absent-vs-matches
+    /// exclusion clause `(not Ab_p or not L_S)` for every matches literal of
+    /// the package that already exists. Idempotent: repeat calls return the
+    /// existing variable without emitting anything.
+    ///
+    /// This is the only place that interns absent literals, so each exclusion
+    /// clause is emitted exactly once: either here (matches literal interned
+    /// first) or in [`Self::intern_env_matches_with_oracle_clauses`] (absent
+    /// literal interned first).
+    fn intern_env_absent_with_oracle_clauses(&mut self, package_name: D::NameId) -> VariableId {
+        let (ab_var, is_new, prior_matches) =
+            self.state.variable_map.intern_env_absent(package_name);
+        if is_new {
+            for prior_vs in &prior_matches {
+                let matches_var = self
+                    .state
+                    .variable_map
+                    .get_env_matches(*prior_vs)
+                    .expect("variable for a previously interned version set must exist");
+                let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                    ab_var.negative(),
+                    matches_var.negative(),
+                );
+                self.state.add_clause(wl, kind);
+            }
+        }
+        ab_var
     }
 
     /// Intern an env-matches literal `L_S` for `version_set_id` (which belongs
