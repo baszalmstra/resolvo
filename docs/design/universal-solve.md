@@ -219,9 +219,14 @@ candidate lists must branch. The C++ bindings in `cpp/` should keep building
 by wrapping their existing struct in `PackageCandidates::Candidates`;
 exposing universal solving over the C++ API is out of scope.
 
-In a non-universal `solve`, encountering `PackageCandidates::Environment` is
-an error (panic with a clear message); concrete solves must keep injecting
-concrete virtual packages as today.
+Behavior of a plain (non-universal) `solve` with environment packages: in
+M0 this panics with a clear message (transitional). From M1 onward the
+encoding handles environment literals everywhere, and a plain `solve`
+legitimately yields the baseline solution (all environment literals false,
+per the split policy): the solution for the least capable machine. This is
+also what makes M1 testable before `solve_universal` exists. Concrete
+solves that want a specific machine keep injecting concrete virtual
+packages as today.
 
 ### 5.4 Encoding changes
 
