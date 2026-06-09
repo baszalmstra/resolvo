@@ -1,9 +1,10 @@
-use std::{any::Any, collections::VecDeque, future::ready};
+use std::{any::Any, collections::VecDeque};
 
 use super::{EnvConstrainsEntry, SolverState, clause::WatchedLiterals, conditions};
 use crate::{
     ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
-    PackageCandidates, SolverCache, StringId, VariableId, VersionSetId, VersionSetRelation,
+    EnvironmentPackage, PackageCandidates, SolverCache, StringId, VariableId, VersionSetId,
+    VersionSetRelation,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     solver::{conditions::Disjunction, decision::Decision},
     solver_id::{IdMap, IdSet},
@@ -83,8 +84,23 @@ struct CandidatesAvailable<'a, D: DependencyProvider> {
 struct RequirementCandidatesAvailable<'a, D: DependencyProvider> {
     solvable_id: SolvableIdOrRoot<D::SolvableId>,
     requirement: ConditionalRequirement,
-    candidates: Vec<&'a [D::SolvableId]>,
+    candidates: Vec<RequirementCandidates<'a, D::SolvableId>>,
     condition: RequirementCondition<'a, D::SolvableId>,
+}
+
+/// The candidates for a single version set of a requirement, classified by
+/// the kind of package the version set refers to. Classification happens in
+/// the queued future (where awaiting the candidates is legal); all variable
+/// interning and clause emission happens in
+/// [`Encoder::on_requirement_candidates_available`].
+enum RequirementCandidates<'a, S> {
+    /// The version set is on a concrete package; these are its sorted
+    /// matching candidates.
+    Concrete(&'a [S]),
+    /// The version set is on an environment package. The only candidate is
+    /// the env-matches literal `L_S` for this version set, interned by the
+    /// handler.
+    Environment(VersionSetId),
 }
 
 /// The complement of a solvables that match aVersionSet or an empty set.
@@ -93,25 +109,28 @@ enum DisjunctionComplement<'a, S> {
     Empty(VersionSetId),
     /// The condition version set is on an environment package. The complement
     /// of `L_S` is the negative literal `not L_S`, so the disjunction for
-    /// "condition does not hold" is just `not L_S` (a single literal).
-    EnvLiteral(VariableId),
-}
-
-/// Owned version of [`DisjunctionComplement`] used to pass pre-processed
-/// condition data into an async closure.
-enum DisjunctionComplementOwned {
-    /// The condition version set is on an env package; literal already interned.
-    EnvLiteral(VariableId),
-    /// The condition version set is on a concrete package; fetch non-matching
-    /// candidates asynchronously.
-    NeedsFetch(VersionSetId),
+    /// "condition does not hold" is just `not L_S` (a single literal). The
+    /// literal is interned by the handler.
+    EnvLiteral(VersionSetId),
 }
 
 /// Result of querying candidates for a particular constraint.
 struct ConstraintCandidatesAvailable<'a, S> {
     solvable_id: SolvableIdOrRoot<S>,
     constraint: VersionSetId,
-    candidates: &'a [S],
+    candidates: ConstraintCandidates<'a, S>,
+}
+
+/// The candidates for a constraint, classified by the kind of package the
+/// constraint's version set refers to. Like [`RequirementCandidates`],
+/// classification happens in the queued future and encoding in
+/// [`Encoder::on_constraint_candidates_available`].
+enum ConstraintCandidates<'a, S> {
+    /// The constraint is on a concrete package; these are the candidates that
+    /// do *not* match the version set.
+    Concrete(&'a [S]),
+    /// The constraint is on an environment package.
+    Environment(EnvironmentPackage),
 }
 
 impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
@@ -246,10 +265,10 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         }
 
         // Also queue packages referenced only in conditions (e.g. `if cuda
-        // 11..100`). The condition version sets are not part of the requirement
-        // itself, so they would otherwise never be fetched, leaving
-        // `get_env_package_if_cached` returning `None` when the condition is
-        // pre-processed synchronously below.
+        // 11..100`). The condition version sets are not part of the
+        // requirement itself, so `on_candidates_available` (which records
+        // environment packages and handles locked/excluded candidates) would
+        // otherwise never run for them.
         for condition_id in requirements.iter().filter_map(|r| r.condition) {
             for vs in conditions::convert_conditions_to_dnf(condition_id, self.cache.provider())
                 .into_iter()
@@ -354,16 +373,39 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             requirement.requirement.display(self.cache.provider()),
         );
 
+        // Reject `Requirement::Union` mixing environment and concrete version
+        // sets (unsupported in v1).
+        let has_env = candidates
+            .iter()
+            .any(|c| matches!(c, RequirementCandidates::Environment(_)));
+        let has_concrete = candidates
+            .iter()
+            .any(|c| matches!(c, RequirementCandidates::Concrete(_)));
+        if has_env && has_concrete {
+            panic!(
+                "Requirement::Union mixing environment and concrete version sets is not \
+                 supported in v1 (requirement: {})",
+                requirement.requirement.display(self.cache.provider())
+            );
+        }
+
         let variable = self.state.variable_map.intern_solvable_or_root(solvable_id);
 
-        // Get the variables associated with the individual candidates.
+        // Get the variables associated with the individual candidates. For a
+        // version set on an environment package the single candidate is the
+        // env-matches literal `L_S` (interned here, together with its oracle
+        // consistency clauses).
         let version_set_variables = candidates
             .iter()
-            .map(|&candidates| {
-                candidates
+            .map(|candidate_set| match candidate_set {
+                RequirementCandidates::Concrete(solvables) => solvables
                     .iter()
                     .map(|&var| self.state.variable_map.intern_solvable(var))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                &RequirementCandidates::Environment(version_set) => {
+                    let package_name = self.cache.provider().version_set_name(version_set);
+                    vec![self.intern_env_matches_with_oracle_clauses(version_set, package_name)]
+                }
             })
             .collect::<Vec<_>>();
 
@@ -371,21 +413,28 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // clause to force one solvable per package name.
         //
         // We only add these clauses for packages that can actually be selected to
-        // reduce the overall number of clauses.
-        for (solvable, variable_id) in candidates
-            .iter()
-            .zip(version_set_variables.iter())
-            .flat_map(|(&candidates, variable)| {
-                candidates.iter().copied().zip(variable.iter().copied())
-            })
-        {
-            let name_id = self.cache.provider().solvable_name(solvable);
-            self.register_forbid_target(name_id, variable_id);
+        // reduce the overall number of clauses. Environment version sets have no
+        // concrete candidates, so they never produce forbid clauses.
+        for (candidate_set, variables) in candidates.iter().zip(version_set_variables.iter()) {
+            let RequirementCandidates::Concrete(solvables) = candidate_set else {
+                continue;
+            };
+            for (&solvable, &variable_id) in solvables.iter().zip(variables.iter()) {
+                let name_id = self.cache.provider().solvable_name(solvable);
+                self.register_forbid_target(name_id, variable_id);
+            }
         }
 
         // Queue requesting the dependencies of the candidates as well if they are
         // cheaply available from the dependency provider.
-        for &candidate in candidates.iter().flat_map(|solvables| solvables.iter()) {
+        for &candidate in candidates
+            .iter()
+            .filter_map(|candidate_set| match candidate_set {
+                RequirementCandidates::Concrete(solvables) => Some(*solvables),
+                RequirementCandidates::Environment(_) => None,
+            })
+            .flat_map(|solvables| solvables.iter())
+        {
             // Pre-check before `queue_solvable` does the same: skips the
             // `are_dependencies_available_for` query and the async closure
             // setup on the hot duplicate path.
@@ -437,9 +486,12 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                                 };
                             disjunction_literals.push(at_least_one_of_var.negative());
                         }
-                        DisjunctionComplement::EnvLiteral(var) => {
+                        DisjunctionComplement::EnvLiteral(version_set) => {
                             // The complement of an env literal L_S is `not L_S`.
-                            disjunction_literals.push(var.negative());
+                            let package_name = self.cache.provider().version_set_name(version_set);
+                            let variable = self
+                                .intern_env_matches_with_oracle_clauses(version_set, package_name);
+                            disjunction_literals.push(variable.negative());
                         }
                     }
                 }
@@ -455,8 +507,12 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         }
 
         for condition in conditions {
-            // Add the requirements clause
-            let no_candidates = candidates.iter().all(|candidates| candidates.is_empty());
+            // Add the requirements clause. Environment version sets always
+            // contribute their literal as a candidate, so they are never
+            // empty.
+            let no_candidates = version_set_variables
+                .iter()
+                .all(|variables| variables.is_empty());
             let condition_literals =
                 condition.map(|id| self.state.disjunctions[id].literals.as_slice());
             let (watched_literals, conflict, kind) = WatchedLiterals::requires(
@@ -498,29 +554,103 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         }: ConstraintCandidatesAvailable<'cache, D::SolvableId>,
     ) {
         tracing::trace!(
-            "non matching candidates available for {} {}",
+            "constraint candidates available for {} {}",
             self.cache
                 .provider()
                 .display_name(self.cache.provider().version_set_name(constraint)),
             self.cache.provider().display_version_set(constraint),
         );
 
-        let variable = self.state.variable_map.intern_solvable_or_root(solvable_id);
-        for &forbidden_candidate in candidates {
-            let forbidden_candidate_var =
-                self.state.variable_map.intern_solvable(forbidden_candidate);
-            let (watched_literals, conflict, kind) = WatchedLiterals::constrains(
-                variable,
-                forbidden_candidate_var,
-                constraint,
-                &self.state.decision_tracker,
-            );
+        match candidates {
+            ConstraintCandidates::Concrete(candidates) => {
+                let variable = self.state.variable_map.intern_solvable_or_root(solvable_id);
+                for &forbidden_candidate in candidates {
+                    let forbidden_candidate_var =
+                        self.state.variable_map.intern_solvable(forbidden_candidate);
+                    let (watched_literals, conflict, kind) = WatchedLiterals::constrains(
+                        variable,
+                        forbidden_candidate_var,
+                        constraint,
+                        &self.state.decision_tracker,
+                    );
 
-            let clause_id = self.state.add_clause(watched_literals, kind);
+                    let clause_id = self.state.add_clause(watched_literals, kind);
 
-            if conflict {
-                self.conflicting_clauses.push(clause_id);
+                    if conflict {
+                        self.conflicting_clauses.push(clause_id);
+                    }
+                }
             }
+            ConstraintCandidates::Environment(env_pkg) => {
+                self.add_env_constrains_clause(solvable_id, constraint, env_pkg);
+            }
+        }
+    }
+
+    /// Encode a constraint on an environment package as an `EnvConstrains`
+    /// clause `(not parent or Ab_p or L_S)` (just `(not parent or L_S)` when
+    /// the package cannot be absent) and register it with `decide()` so the
+    /// solver can make progress on it.
+    fn add_env_constrains_clause(
+        &mut self,
+        solvable_id: SolvableIdOrRoot<D::SolvableId>,
+        constraint: VersionSetId,
+        env_pkg: EnvironmentPackage,
+    ) {
+        let package_name = self.cache.provider().version_set_name(constraint);
+        let matches_var = self.intern_env_matches_with_oracle_clauses(constraint, package_name);
+
+        // Intern the absent literal if the package can be absent.
+        let absent_var: Option<VariableId> = if env_pkg.can_be_absent {
+            let (ab_var, is_new, prior_matches) =
+                self.state.variable_map.intern_env_absent(package_name);
+            if is_new {
+                // The absent literal is being interned for the first time
+                // here (it might have been interned earlier in
+                // on_candidates_available, but not necessarily). Emit
+                // absent-vs-matches exclusion clauses for all matches
+                // literals that already exist.
+                for prior_vs in &prior_matches {
+                    let l_b_var = self
+                        .state
+                        .variable_map
+                        .get_env_matches(*prior_vs)
+                        .expect("variable for prior_vs must exist");
+                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                        ab_var.negative(),
+                        l_b_var.negative(),
+                    );
+                    self.state.add_clause(wl, kind);
+                }
+            }
+            Some(ab_var)
+        } else {
+            None
+        };
+
+        let parent_var = self.state.variable_map.intern_solvable_or_root(solvable_id);
+
+        let (watched_literals, conflict, kind) = WatchedLiterals::env_constrains::<D::NameId>(
+            parent_var,
+            absent_var,
+            matches_var,
+            constraint,
+            &self.state.decision_tracker,
+        );
+        let clause_id = self.state.add_clause(watched_literals, kind);
+
+        self.state
+            .env_constrains_clauses
+            .entry(parent_var)
+            .or_default()
+            .push(EnvConstrainsEntry {
+                absent_var,
+                matches_var,
+                clause_id,
+            });
+
+        if conflict {
+            self.conflicting_clauses.push(clause_id);
         }
     }
 
@@ -712,263 +842,76 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// Enqueues retrieving the candidates for a particular requirement. These
     /// candidates are already filtered and sorted.
     ///
-    /// When the requirement targets an environment package this method handles
-    /// the encoding synchronously (no async fetch needed): it interns the
-    /// `EnvMatches` literal and emits oracle consistency clauses immediately,
-    /// then produces a binary requires clause.
-    ///
-    /// `Requirement::Union` mixing environment and concrete version sets is
-    /// rejected with a clear panic (unsupported in v1).
+    /// The queued future classifies every version set of the requirement (and
+    /// of its condition, if any) as targeting either a concrete or an
+    /// environment package by awaiting the package candidates. Candidates are
+    /// only fetched for concrete version sets. The classification is returned
+    /// in the task result; all variable interning and clause emission happens
+    /// in [`Self::on_requirement_candidates_available`].
     fn queue_conditional_requirement(
         &mut self,
         solvable_id: SolvableIdOrRoot<D::SolvableId>,
         requirement: ConditionalRequirement,
     ) {
-        // Check whether any of the requirement's version sets refer to an
-        // environment package. We do this synchronously so we can mutate state.
-        let version_sets: Vec<VersionSetId> = requirement
-            .requirement
-            .version_sets(self.cache.provider())
-            .collect();
-
-        // Determine which version sets are on environment packages.
-        // Use the cache directly (which is populated by queue_package before
-        // queue_conditional_requirement is called in the same
-        // on_dependencies_available pass).
-        let env_flags: Vec<bool> = version_sets
-            .iter()
-            .map(|&vs| {
-                let name = self.cache.provider().version_set_name(vs);
-                self.cache.get_env_package_if_cached(name).is_some()
-            })
-            .collect();
-
-        let has_env = env_flags.iter().any(|&f| f);
-        let has_concrete = env_flags.iter().any(|&f| !f);
-
-        if has_env && has_concrete {
-            panic!(
-                "Requirement::Union mixing environment and concrete version sets is not \
-                 supported in v1 (requirement: {})",
-                requirement.requirement.display(self.cache.provider())
-            );
-        }
-
-        if has_env {
-            // Environment-package requirement: encode synchronously without
-            // querying candidates from the cache.
-            // For Union over multiple env version sets: each is independent.
-            // Per v1 the caller should only use Single requirements on env
-            // packages (Union of env packages is unusual), but we handle it.
-
-            // Intern env-matches literals and emit oracle clauses.
-            let env_vars: Vec<VariableId> = version_sets
-                .iter()
-                .map(|&vs| {
-                    let name = self.cache.provider().version_set_name(vs);
-                    self.intern_env_matches_with_oracle_clauses(vs, name)
-                })
-                .collect();
-
-            // Handle the condition (if any). Each condition version set that
-            // is on an env package becomes `DisjunctionComplement::EnvLiteral`.
-            // Condition version sets on concrete packages use the normal path
-            // (non-matching candidates). Mixing is not rejected but may behave
-            // unexpectedly; it can happen when a condition is itself a compound
-            // expression. For now we process synchronously for env parts.
-            let condition_dnf: Option<Vec<Vec<DisjunctionComplement<'_, D::SolvableId>>>> =
-                requirement.condition.map(|condition| {
-                    conditions::convert_conditions_to_dnf(condition, self.cache.provider())
-                        .into_iter()
-                        .map(|conjunction| {
-                            conjunction
-                                .into_iter()
-                                .map(|vs| {
-                                    let cond_name = self.cache.provider().version_set_name(vs);
-                                    if self.cache.get_env_package_if_cached(cond_name).is_some() {
-                                        // Intern and collect oracle clauses.
-                                        let var = self
-                                            .intern_env_matches_with_oracle_clauses(vs, cond_name);
-                                        DisjunctionComplement::EnvLiteral(var)
-                                    } else {
-                                        // Condition on concrete package: we
-                                        // cannot fetch non-matching candidates
-                                        // synchronously here. Fall back to
-                                        // empty-complement sentinel (this means
-                                        // the condition never holds, i.e. the
-                                        // requirement is unconditional, which is
-                                        // wrong but safe -- it will just install
-                                        // the dependent solvable).
-                                        // TODO: handle mixed env/concrete
-                                        // conditions in a later milestone.
-                                        DisjunctionComplement::Empty(vs)
-                                    }
-                                })
-                                .collect()
-                        })
-                        .collect()
-                });
-
-            let parent_var = self.state.variable_map.intern_solvable_or_root(solvable_id);
-
-            // Build disjunction objects for the condition.
-            let mut conditions_prepared: Vec<Option<conditions::DisjunctionId>> = Vec::new();
-            if let Some(dnf) = condition_dnf {
-                for conjunction in dnf {
-                    let mut disjunction_literals = Vec::new();
-                    for complement in conjunction {
-                        match complement {
-                            DisjunctionComplement::EnvLiteral(var) => {
-                                // The complement of L_S is `not L_S`.
-                                disjunction_literals.push(var.negative());
-                            }
-                            DisjunctionComplement::Solvables(vs, solvables) => {
-                                let cond_name = self.cache.provider().version_set_name(vs);
-                                for &solvable in solvables {
-                                    let v = self.state.variable_map.intern_solvable(solvable);
-                                    disjunction_literals.push(v.positive());
-                                    self.register_forbid_target(cond_name, v);
-                                }
-                            }
-                            DisjunctionComplement::Empty(vs) => {
-                                let cond_name = self.cache.provider().version_set_name(vs);
-                                let at_least_one_var =
-                                    match self.state.at_least_one_tracker.get(cond_name).or_else(
-                                        || self.new_at_least_one_packages.get(&cond_name).copied(),
-                                    ) {
-                                        Some(v) => v,
-                                        None => {
-                                            let v = self
-                                                .state
-                                                .variable_map
-                                                .alloc_at_least_one_variable(cond_name);
-                                            self.new_at_least_one_packages.insert(cond_name, v);
-                                            v
-                                        }
-                                    };
-                                disjunction_literals.push(at_least_one_var.negative());
-                            }
-                        }
-                    }
-                    let disjunction_id = self.state.disjunctions.alloc(conditions::Disjunction {
-                        literals: disjunction_literals,
-                        _condition: requirement.condition.unwrap(),
-                    });
-                    conditions_prepared.push(Some(disjunction_id));
-                }
-            } else {
-                conditions_prepared.push(None);
-            }
-
-            // Now emit the requires clause(s).
-            for condition_opt in conditions_prepared {
-                let condition_literals =
-                    condition_opt.map(|id| self.state.disjunctions[id].literals.as_slice());
-                let (watched_literals, conflict, kind) = WatchedLiterals::requires::<D::NameId>(
-                    parent_var,
-                    requirement.requirement,
-                    env_vars.iter().copied(),
-                    condition_opt.zip(condition_literals),
-                    &self.state.decision_tracker,
-                );
-                let clause_id = self.state.add_clause(watched_literals, kind);
-                self.state
-                    .requires_clauses
-                    .entry(parent_var)
-                    .or_default()
-                    .push((requirement.requirement, condition_opt, clause_id));
-
-                if conflict {
-                    self.conflicting_clauses.push(clause_id);
-                }
-            }
-
-            // Store env_vars as the sorted candidates for this requirement.
-            self.state
-                .requirement_to_sorted_candidates
-                .insert(requirement.requirement, vec![env_vars]);
-
-            return;
-        }
-
-        // Normal (non-env) path: queue async fetch of candidates.
-        //
-        // Pre-process the condition to handle any env-package version sets
-        // synchronously. We identify env-vs-concrete split and intern env
-        // literals now (while we have access to state).
-        //
-        // The result is an optional pre-built condition DNF (all env) or a
-        // sentinel list that marks which version sets need async fetches.
-        let prebuilt_condition: Option<(ConditionId, Vec<Vec<DisjunctionComplementOwned>>)> =
-            requirement.condition.map(|cond_id| {
-                let dnf = conditions::convert_conditions_to_dnf(cond_id, self.cache.provider());
-                let pre = dnf
-                    .into_iter()
-                    .map(|conjunction| {
-                        conjunction
-                            .into_iter()
-                            .map(|vs| {
-                                let cond_name = self.cache.provider().version_set_name(vs);
-                                if self.cache.get_env_package_if_cached(cond_name).is_some() {
-                                    let var =
-                                        self.intern_env_matches_with_oracle_clauses(vs, cond_name);
-                                    DisjunctionComplementOwned::EnvLiteral(var)
-                                } else {
-                                    DisjunctionComplementOwned::NeedsFetch(vs)
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                (cond_id, pre)
-            });
-
         let cache = self.cache;
         self.queue_future(async move {
+            // Classify each version set of the requirement and fetch the
+            // sorted candidates for the concrete ones.
             let candidates = futures::future::try_join_all(
-                requirement
-                    .requirement
-                    .version_sets(cache.provider())
-                    .map(|version_set| {
-                        cache.get_or_cache_sorted_candidates_for_version_set(version_set)
-                    }),
-            );
-
-            // Resolve any NeedsFetch entries in the pre-built condition.
-            #[allow(clippy::type_complexity)]
-            let condition_candidates: futures::future::LocalBoxFuture<
-                '_,
-                Result<RequirementCondition<'_, D::SolvableId>, Box<dyn std::any::Any>>,
-            > = match prebuilt_condition {
-                None => Box::pin(ready(Ok(None))),
-                Some((cond_id, pre_dnf)) => Box::pin(async move {
-                    let mut resolved: Vec<Vec<DisjunctionComplement<'_, D::SolvableId>>> =
-                        Vec::with_capacity(pre_dnf.len());
-                    for conjunction in pre_dnf {
-                        let mut resolved_conj = Vec::with_capacity(conjunction.len());
-                        for item in conjunction {
-                            match item {
-                                DisjunctionComplementOwned::EnvLiteral(var) => {
-                                    resolved_conj.push(DisjunctionComplement::EnvLiteral(var));
-                                }
-                                DisjunctionComplementOwned::NeedsFetch(vs) => {
-                                    let candidates =
-                                        cache.get_or_cache_non_matching_candidates(vs).await?;
-                                    resolved_conj.push(if candidates.is_empty() {
-                                        DisjunctionComplement::Empty(vs)
-                                    } else {
-                                        DisjunctionComplement::Solvables(vs, candidates)
-                                    });
-                                }
+                requirement.requirement.version_sets(cache.provider()).map(
+                    |version_set| async move {
+                        let package_name = cache.provider().version_set_name(version_set);
+                        match cache.get_or_cache_candidates(package_name).await? {
+                            PackageCandidates::Environment(_) => {
+                                Ok(RequirementCandidates::Environment(version_set))
+                            }
+                            PackageCandidates::Candidates(_) => {
+                                Ok(RequirementCandidates::Concrete(
+                                    cache
+                                        .get_or_cache_sorted_candidates_for_version_set(version_set)
+                                        .await?,
+                                ))
                             }
                         }
-                        resolved.push(resolved_conj);
+                    },
+                ),
+            );
+
+            // Classify each version set of the condition DNF and fetch the
+            // non-matching candidates (the complement) for the concrete ones.
+            let condition = async move {
+                let Some(condition_id) = requirement.condition else {
+                    return Ok(None);
+                };
+                let dnf = conditions::convert_conditions_to_dnf(condition_id, cache.provider());
+                let mut resolved = Vec::with_capacity(dnf.len());
+                for conjunction in dnf {
+                    let mut resolved_conjunction = Vec::with_capacity(conjunction.len());
+                    for version_set in conjunction {
+                        let package_name = cache.provider().version_set_name(version_set);
+                        match cache.get_or_cache_candidates(package_name).await? {
+                            PackageCandidates::Environment(_) => {
+                                resolved_conjunction
+                                    .push(DisjunctionComplement::EnvLiteral(version_set));
+                            }
+                            PackageCandidates::Candidates(_) => {
+                                let candidates = cache
+                                    .get_or_cache_non_matching_candidates(version_set)
+                                    .await?;
+                                resolved_conjunction.push(if candidates.is_empty() {
+                                    DisjunctionComplement::Empty(version_set)
+                                } else {
+                                    DisjunctionComplement::Solvables(version_set, candidates)
+                                });
+                            }
+                        }
                     }
-                    Ok(Some((cond_id, resolved)))
-                }),
+                    resolved.push(resolved_conjunction);
+                }
+                Ok(Some((condition_id, resolved)))
             };
 
-            let (candidates, condition) = futures::try_join!(candidates, condition_candidates)?;
+            let (candidates, condition) = futures::try_join!(candidates, condition)?;
 
             Ok(TaskResult::RequirementCandidates(
                 RequirementCandidatesAvailable {
@@ -984,87 +927,32 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// Enqueues retrieving the candidates for a particular constraint. These
     /// are the candidates that do *not* match the version set.
     ///
-    /// When the constraint targets an environment package this method handles
-    /// the encoding synchronously: it emits an `EnvConstrains` clause
-    /// (`not parent or Ab_p or L_S`) and registers it with `decide()` so the
-    /// solver can make progress on it.
+    /// Like [`Self::queue_conditional_requirement`], the queued future
+    /// classifies the constraint's package as concrete or environment;
+    /// encoding happens in [`Self::on_constraint_candidates_available`].
     fn queue_constraint(
         &mut self,
         solvable_id: SolvableIdOrRoot<D::SolvableId>,
         constraint: VersionSetId,
     ) {
-        let package_name = self.cache.provider().version_set_name(constraint);
-        if self.cache.get_env_package_if_cached(package_name).is_some() {
-            // Env-package constraint: emit EnvConstrains clause synchronously.
-            let env_pkg_info = *self.cache.get_env_package_if_cached(package_name).unwrap();
-            let matches_var = self.intern_env_matches_with_oracle_clauses(constraint, package_name);
-
-            // Intern the absent literal if the package can be absent.
-            let absent_var: Option<VariableId> = if env_pkg_info.can_be_absent {
-                let (ab_var, is_new, prior_matches) =
-                    self.state.variable_map.intern_env_absent(package_name);
-                if is_new {
-                    // The absent literal is being interned for the first time
-                    // here (it might have been interned earlier in
-                    // on_candidates_available, but not necessarily). Emit
-                    // absent-vs-matches exclusion clauses for all matches
-                    // literals that already exist.
-                    for prior_vs in &prior_matches {
-                        let l_b_var = self
-                            .state
-                            .variable_map
-                            .get_env_matches(*prior_vs)
-                            .expect("variable for prior_vs must exist");
-                        let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                            ab_var.negative(),
-                            l_b_var.negative(),
-                        );
-                        self.state.add_clause(wl, kind);
-                    }
-                }
-                Some(ab_var)
-            } else {
-                None
-            };
-
-            let parent_var = self.state.variable_map.intern_solvable_or_root(solvable_id);
-
-            let (watched_literals, conflict, kind) = WatchedLiterals::env_constrains::<D::NameId>(
-                parent_var,
-                absent_var,
-                matches_var,
-                constraint,
-                &self.state.decision_tracker,
-            );
-            let clause_id = self.state.add_clause(watched_literals, kind);
-
-            self.state
-                .env_constrains_clauses
-                .entry(parent_var)
-                .or_default()
-                .push(EnvConstrainsEntry {
-                    absent_var,
-                    matches_var,
-                    clause_id,
-                });
-
-            if conflict {
-                self.conflicting_clauses.push(clause_id);
-            }
-            return;
-        }
-
-        // Normal (non-env) constraint: fetch non-matching candidates async.
         let cache = self.cache;
         self.queue_future(async move {
-            let non_matching_candidates = cache
-                .get_or_cache_non_matching_candidates(constraint)
-                .await?;
+            let package_name = cache.provider().version_set_name(constraint);
+            let candidates = match cache.get_or_cache_candidates(package_name).await? {
+                PackageCandidates::Environment(env_pkg) => {
+                    ConstraintCandidates::Environment(*env_pkg)
+                }
+                PackageCandidates::Candidates(_) => ConstraintCandidates::Concrete(
+                    cache
+                        .get_or_cache_non_matching_candidates(constraint)
+                        .await?,
+                ),
+            };
             Ok(TaskResult::ConstraintCandidates(
                 ConstraintCandidatesAvailable {
                     solvable_id,
                     constraint,
-                    candidates: non_matching_candidates,
+                    candidates,
                 },
             ))
         });

@@ -1414,6 +1414,34 @@ fn test_env_requirement_forces_literal_true() {
     assert_eq!(solved, vec![]);
 }
 
+/// Environment-package encoding must also work under a real async runtime
+/// (tokio with `sleep_before_return = true`): classification of environment
+/// packages happens inside the queued futures where awaiting is legal, not
+/// via synchronous cache peeks that only hold under `NowOrNeverRuntime`.
+///
+/// `a` requires the env package itself (forcing the literal true) and has a
+/// conditional dependency on `b` that becomes active because of it. `a` also
+/// constrains the env package, exercising the constraint path as well.
+#[test]
+fn test_env_encoding_under_async_runtime() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["cuda 11..100", "b 1..2; if cuda 11..100"],
+        &["cuda 5..100"],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    // `solve_snapshot` uses the tokio runtime and sets `sleep_before_return`.
+    let result = solve_snapshot(provider, &["a"]);
+    assert_snapshot!(result, @r"
+    a=1
+    b=1
+    ");
+}
+
 /// Multiple constraints from different parents on the same package.
 #[test]
 fn test_constrains_multiple_parents() {

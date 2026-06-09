@@ -401,33 +401,4 @@ impl<D: DependencyProvider> SolverCache<D> {
             self.hint_dependencies_available.borrow().contains(solvable)
         }
     }
-
-    /// Returns `true` if the candidates for the given package have been
-    /// fetched and the package is an environment package.
-    ///
-    /// Returns `false` if the candidates have not been fetched yet or if
-    /// the package is a concrete package.
-    pub fn is_env_package_if_cached(&self, package_name: D::NameId) -> bool {
-        let Some(candidates_id) = self.package_name_to_candidates.get(package_name) else {
-            return false;
-        };
-        matches!(
-            &self.candidates[candidates_id],
-            PackageCandidates::Environment(_)
-        )
-    }
-
-    /// Returns the `EnvironmentPackage` metadata for a package if it is an
-    /// environment package and its candidates have been fetched. Returns
-    /// `None` otherwise.
-    pub fn get_env_package_if_cached(
-        &self,
-        package_name: D::NameId,
-    ) -> Option<&crate::EnvironmentPackage> {
-        let candidates_id = self.package_name_to_candidates.get(package_name)?;
-        match &self.candidates[candidates_id] {
-            PackageCandidates::Environment(env) => Some(env),
-            PackageCandidates::Candidates(_) => None,
-        }
-    }
 }
