@@ -1799,6 +1799,125 @@ fn test_universal_cancellation() {
     assert_snapshot!(result, @"cancelled");
 }
 
+/// AND-condition over two environment packages where one literal is forced
+/// true by the model. The condition complement disjunction is
+/// `(not L_cuda or not L_rocm)` and the baseline solution has
+/// `L_rocm = true` (model assertion) and `L_cuda` undecided: the clause is
+/// supported by `not L_cuda` ALONE. The rocm literal must not be recorded
+/// (its complement is false and contributes nothing); recording it would
+/// claim the solution is valid where rocm does not match, which is wrong.
+#[test]
+fn test_universal_and_condition_with_forced_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["rocm 5..100"]]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
+/// AND-condition where BOTH environment literals are false in the baseline:
+/// exactly the FIRST literal of the disjunction (in encoding order, cuda
+/// before rocm) is recorded, which pins the determinism rule and gives the
+/// most general baseline cell (it covers any rocm value). The partition is
+/// three cells, not a full cross product.
+#[test]
+fn test_universal_and_condition_baseline_records_first_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <100)
+      a=1
+    cell: cuda in >=11, <100 AND rocm in >=5, <100
+      a=1
+      b=1
+    ");
+}
+
+/// The supervisor reproduction variant where the rocm literal is forced
+/// true by a ROOT REQUIREMENT instead of (only) the model: the requirement
+/// clause `(not root or L_rocm)` is genuine support, so `rocm in 5..100`
+/// legitimately appears in every cell condition, while the rocm complement
+/// still contributes nothing to the conditional clause.
+#[test]
+fn test_universal_and_condition_with_required_env_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a", "rocm 5..100"], &[&["rocm 5..100"]]);
+    assert_snapshot!(result, @r"
+    cell: rocm in >=5, <100 AND not (cuda in >=11, <100)
+      a=1
+    cell: rocm in >=5, <100 AND cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
+/// OR-condition over two environment packages: the DNF machinery produces
+/// TWO conditional requires clauses, one per disjunct. Each clause records
+/// its own complement literal in the baseline, and the enumeration covers
+/// the space in three cells (the cuda cell generalizes over rocm because
+/// `b` is installed there regardless of rocm).
+#[test]
+fn test_universal_or_condition_dnf_partition() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 or rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <100
+      a=1
+      b=1
+    ");
+}
+
 /// The environment model may only reference environment packages; a
 /// concrete package is reported with a clear panic.
 #[test]

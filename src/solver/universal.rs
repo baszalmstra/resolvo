@@ -422,35 +422,38 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         continue;
                     }
 
-                    // Otherwise the environment condition literals carry the
-                    // support: the clause is satisfied by `not L` being true,
-                    // so record `L = false` for the env condition literals.
+                    // Otherwise an environment condition complement literal
+                    // carries the support. A single true complement literal
+                    // `not L` keeps the clause satisfied throughout the cell,
+                    // so record exactly the FIRST env literal in disjunction
+                    // order whose assigned value is not true (deterministic:
+                    // the disjunction's literal order is fixed at encoding).
                     // `L` may be merely undecided; undecided counts as false
                     // and must still be recorded (soundness critical: a later
                     // environment where `L` is true would activate the
                     // requirement, which this solution does not satisfy).
-                    let mut recorded_any = false;
-                    for literal in literals {
-                        if is_env_variable(state, literal.variable()) {
-                            debug_assert!(
-                                literal.negate(),
-                                "bug: condition complements of env literals are negative literals"
-                            );
-                            debug_assert_ne!(
-                                state.decision_tracker.assigned_value(literal.variable()),
-                                Some(true),
-                                "bug: the condition complement cannot support the clause if the \
-                                 env literal is true"
-                            );
-                            record(&mut cell, literal.variable(), false);
-                            recorded_any = true;
-                        }
-                    }
+                    // Env literals that are assigned TRUE must not be
+                    // recorded: their complement is false and contributes
+                    // nothing (e.g. an AND condition where another clause
+                    // forces one of the literals true).
+                    let supporting = literals.iter().find(|literal| {
+                        is_env_variable(state, literal.variable())
+                            && state.decision_tracker.assigned_value(literal.variable())
+                                != Some(true)
+                    });
+                    let Some(literal) = supporting else {
+                        debug_assert!(
+                            false,
+                            "bug: requires clause with installed parent has neither an \
+                             installed candidate nor a satisfying condition complement"
+                        );
+                        continue;
+                    };
                     debug_assert!(
-                        recorded_any,
-                        "bug: requires clause with installed parent has neither an installed \
-                         candidate nor a satisfying condition complement"
+                        literal.negate(),
+                        "bug: condition complements of env literals are negative literals"
                     );
+                    record(&mut cell, literal.variable(), false);
                 }
                 Clause::EnvConstrains(env_constrains_id) => {
                     let payload = state.env_constrains[env_constrains_id];
