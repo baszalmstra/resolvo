@@ -1767,6 +1767,71 @@ fn test_universal_plain_solve_unchanged() {
     ");
 }
 
+/// A negative model literal: the model `not (cuda in 11..100)` excludes the
+/// matching region entirely, so the conditional dependency can never
+/// activate and the enumeration stops after the baseline cell. The cell is
+/// still conditioned on `not L_11` (the condition complement is load
+/// bearing), and the blocking clause `(L_11)` then contradicts the model
+/// assertion, which the witness check recognizes as full coverage.
+#[test]
+fn test_universal_negative_model_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["not cuda 11..100"]]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    ");
+}
+
+/// Cancellation during a universal solve propagates out as
+/// [`UniversalFailure::Cancelled`].
+#[test]
+fn test_universal_cancellation() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1).cancel_during_get_dependencies(), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["cuda absent", "cuda 11..100"]]);
+    assert_snapshot!(result, @"cancelled");
+}
+
+/// The environment model may only reference environment packages; a
+/// concrete package is reported with a clear panic.
+#[test]
+#[should_panic(expected = "is not an environment package")]
+fn test_universal_model_rejects_concrete_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let _ = universal_solve_snapshot(provider, &[], &[&["b 1..2"]]);
+}
+
+/// An absent literal in the model for a package declared with
+/// `can_be_absent: false` is reported with a clear panic.
+#[test]
+#[should_panic(expected = "can_be_absent: false")]
+fn test_universal_model_rejects_absent_literal_for_present_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let _ = universal_solve_snapshot(provider, &[], &[&["cuda absent"]]);
+}
+
+/// An empty disjunction in the model makes the model unsatisfiable and is
+/// reported with a clear panic.
+#[test]
+#[should_panic(expected = "empty disjunction")]
+fn test_universal_model_rejects_empty_disjunction() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+
+    let _ = universal_solve_snapshot(provider, &[], &[&[]]);
+}
+
 /// Multiple constraints from different parents on the same package.
 #[test]
 fn test_constrains_multiple_parents() {
