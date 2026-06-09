@@ -41,6 +41,21 @@ impl DenseIndex for LearntClauseId {
     }
 }
 
+/// The id associated to an arena of [`crate::solver::clause::EnvConstrainsClause`]
+/// payloads. The payload is stored out-of-line to keep `Clause` small.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct EnvConstrainsId(u32);
+
+impl DenseIndex for EnvConstrainsId {
+    fn from_index(x: usize) -> Self {
+        Self(x as u32)
+    }
+
+    fn to_index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// The id associated to an arena of Candidates
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]

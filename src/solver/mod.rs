@@ -2,7 +2,7 @@ use std::{any::Any, fmt::Display, ops::ControlFlow};
 
 use ahash::{HashMap, HashSet};
 pub use cache::SolverCache;
-use clause::{Clause, Literal, WatchedLiterals};
+use clause::{Clause, EnvConstrainsClause, Literal, WatchedLiterals};
 use conditions::{Disjunction, DisjunctionId};
 use decision::Decision;
 use decision_tracker::DecisionTracker;
@@ -19,7 +19,7 @@ use crate::{
     conflict::Conflict,
     internal::{
         arena::Arena,
-        id::{ClauseId, LearntClauseId},
+        id::{ClauseId, EnvConstrainsId, LearntClauseId},
         solver_id::{SolvableIdOrRoot, WithRootSet},
     },
     requirement::RequirementMap,
@@ -200,13 +200,11 @@ type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
 
 /// Represents an `EnvConstrains` clause registered for `decide()`.
 ///
-/// `parent` is the solvable variable whose installation triggers the
-/// constraint. `absent_var` is the absent literal (if `can_be_absent`),
-/// `matches_var` is the `L_S` matches literal, and `clause_id` is the
-/// clause that encodes the constraint.
+/// The literals of the clause are stored in the
+/// [`SolverState::env_constrains`] arena under `env_constrains_id`;
+/// `clause_id` is the clause that encodes the constraint.
 pub(crate) struct EnvConstrainsEntry {
-    pub absent_var: Option<VariableId>,
-    pub matches_var: VariableId,
+    pub env_constrains_id: EnvConstrainsId,
     pub clause_id: ClauseId,
 }
 
@@ -217,6 +215,10 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// Per-parent `EnvConstrains` clauses, iterated in `decide()` to make
     /// progress on environment constraint satisfaction.
     env_constrains_clauses: IndexMap<VariableId, Vec<EnvConstrainsEntry>, ahash::RandomState>,
+
+    /// The payloads of `Clause::EnvConstrains` clauses, stored out-of-line
+    /// (like `learnt_clauses`) to keep the `Clause` enum small.
+    env_constrains: Arena<EnvConstrainsId, EnvConstrainsClause>,
 
     watches: WatchMap,
 
@@ -262,6 +264,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             clauses: Default::default(),
             requires_clauses: Default::default(),
             env_constrains_clauses: Default::default(),
+            env_constrains: Default::default(),
             watches: Default::default(),
             requirement_to_sorted_candidates: Default::default(),
             variable_map: Default::default(),
@@ -1060,10 +1063,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
 
             for entry in entries {
+                let EnvConstrainsClause {
+                    absent_var,
+                    matches_var,
+                    version_set,
+                    ..
+                } = self.state.env_constrains[entry.env_constrains_id];
+
                 // Ordered candidates: absent first, then matches.
-                let candidates: &[VariableId] = match entry.absent_var {
-                    Some(ab) => &[ab, entry.matches_var],
-                    None => &[entry.matches_var],
+                let candidates: &[VariableId] = match absent_var {
+                    Some(ab) => &[ab, matches_var],
+                    None => &[matches_var],
                 };
                 // Temporarily we work with a slice of VariableIds.
                 // Reuse the same ControlFlow logic as the requires loop.
@@ -1087,14 +1097,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             // Undecided -- first undecided candidate.
                             match candidate {
                                 ControlFlow::Continue(None) | ControlFlow::Break(()) => {
-                                    let package_name = self.provider().version_set_name(
-                                        // We need a VersionSetId for activity lookup.
-                                        // Use the version_set stored in the clause.
-                                        match self.state.clauses.kinds[entry.clause_id.to_index()] {
-                                            Clause::EnvConstrains(_, _, _, vs) => vs,
-                                            _ => unreachable!(),
-                                        },
-                                    );
+                                    let package_name =
+                                        self.provider().version_set_name(version_set);
                                     let package_activity =
                                         self.state.name_activity.get(package_name);
                                     ControlFlow::Continue(Some((c, 1u32, package_activity)))
@@ -1440,6 +1444,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         &self.state.learnt_clauses,
                         &self.state.requirement_to_sorted_candidates,
                         &self.state.disjunctions,
+                        &self.state.env_constrains,
                         self.state.decision_tracker.map(),
                         watch_index,
                     )
@@ -1617,6 +1622,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             &self.state.learnt_clauses,
             &self.state.requirement_to_sorted_candidates,
             &self.state.disjunctions,
+            &self.state.env_constrains,
             |literal| {
                 involved.insert(literal.variable());
             },
@@ -1656,6 +1662,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 &self.state.learnt_clauses,
                 &self.state.requirement_to_sorted_candidates,
                 &self.state.disjunctions,
+                &self.state.env_constrains,
                 |literal| {
                     if literal.eval(self.state.decision_tracker.map()) == Some(true) {
                         assert_eq!(literal.variable(), decision.variable);
@@ -1704,6 +1711,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 &self.state.learnt_clauses,
                 &self.state.requirement_to_sorted_candidates,
                 &self.state.disjunctions,
+                &self.state.env_constrains,
                 |literal| {
                     if !first_iteration && literal.variable() == conflicting_solvable {
                         // We are only interested in the causes of the conflict, so we ignore the

@@ -11,7 +11,7 @@ use crate::{
     DenseIndex, Interner, Requirement, SolverId, StringId, VariableId, VersionSetId,
     internal::{
         arena::Arena,
-        id::{ClauseId, LearntClauseId},
+        id::{ClauseId, EnvConstrainsId, LearntClauseId},
     },
     solver::{
         conditions::DisjunctionId, decision_map::DecisionMap, decision_tracker::DecisionTracker,
@@ -114,10 +114,9 @@ pub(crate) enum Clause<N> {
     /// In SAT terms (when absent is possible): `(¬A ∨ Ab_p ∨ L_S)`.
     /// In SAT terms (when absent is not possible): `(¬A ∨ L_S)`.
     ///
-    /// Fields: parent variable, optional absent variable (present iff
-    /// `can_be_absent` was true when the package was declared), matches
-    /// variable `L_S`, and the version set id (used for display).
-    EnvConstrains(VariableId, Option<VariableId>, VariableId, VersionSetId),
+    /// The payload ([`EnvConstrainsClause`]) is stored in a side arena, like
+    /// the literals of a [`Clause::Learnt`] clause, to keep [`Clause`] small.
+    EnvConstrains(EnvConstrainsId),
 
     /// A binary oracle-consistency clause between two environment literals.
     ///
@@ -129,6 +128,20 @@ pub(crate) enum Clause<N> {
     /// They participate in propagation and watching like any binary clause,
     /// but never appear in conflict chains (they are tautologies).
     EnvOracleConsistency(Literal, Literal),
+}
+
+/// The payload of a [`Clause::EnvConstrains`] clause, stored in a side arena
+/// indexed by [`EnvConstrainsId`].
+///
+/// `absent_var` is `Some` iff `can_be_absent` was true when the environment
+/// package was declared. `version_set` is the constraint's version set,
+/// retained for display and for package-activity lookups in `decide()`.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct EnvConstrainsClause {
+    pub parent: VariableId,
+    pub absent_var: Option<VariableId>,
+    pub matches_var: VariableId,
+    pub version_set: VersionSetId,
 }
 
 impl<N> Clause<N> {
@@ -143,8 +156,11 @@ impl<N> Clause<N> {
             | Clause::ForbidMultipleInstances(..)
             | Clause::Lock(..)
             | Clause::AnyOf(..) => true,
-            // EnvConstrains is binary only when there is no absent literal.
-            Clause::EnvConstrains(_, absent, _, _) => absent.is_none(),
+            // EnvConstrains is binary only when there is no absent literal,
+            // but determining that requires the side arena. Conservatively
+            // report false; the `next_unwatched_literal` scan handles the
+            // binary case correctly (it simply finds no unwatched literal).
+            Clause::EnvConstrains(_) => false,
             // Oracle consistency clauses are always binary.
             Clause::EnvOracleConsistency(..) => true,
             _ => false,
@@ -298,7 +314,8 @@ impl<N: SolverId> Clause<N> {
         (kind, Some([selected_var.positive(), other_var.negative()]))
     }
 
-    /// Build an `EnvConstrains` clause.
+    /// Build an `EnvConstrains` clause from a payload that has already been
+    /// allocated in the side arena.
     ///
     /// Returns `(clause, watched_literals, conflict)`.
     ///
@@ -307,15 +324,19 @@ impl<N: SolverId> Clause<N> {
     /// `(¬parent ∨ ab ∨ matches)` and behaves like a requires clause with
     /// ordered candidates `[ab, matches]`.
     fn env_constrains(
-        parent: VariableId,
-        absent_var: Option<VariableId>,
-        matches_var: VariableId,
-        version_set: VersionSetId,
+        env_constrains_id: EnvConstrainsId,
+        payload: &EnvConstrainsClause,
         decision_tracker: &DecisionTracker,
     ) -> (Self, Option<[Literal; 2]>, bool) {
+        let EnvConstrainsClause {
+            parent,
+            absent_var,
+            matches_var,
+            ..
+        } = *payload;
         assert_ne!(decision_tracker.assigned_value(parent), Some(false));
 
-        let kind = Clause::EnvConstrains(parent, absent_var, matches_var, version_set);
+        let kind = Clause::EnvConstrains(env_constrains_id);
 
         match absent_var {
             None => {
@@ -359,6 +380,7 @@ impl<N: SolverId> Clause<N> {
         learnt_clauses: &Arena<LearntClauseId, Vec<Literal>>,
         requirements_to_sorted_candidates: &RequirementMap<Vec<Vec<VariableId>>>,
         disjunction_to_candidates: &Arena<DisjunctionId, Disjunction>,
+        env_constrains_clauses: &Arena<EnvConstrainsId, EnvConstrainsClause>,
         init: C,
         mut visit: F,
     ) -> ControlFlow<B, C>
@@ -400,10 +422,11 @@ impl<N: SolverId> Clause<N> {
             Clause::AnyOf(selected, variable) => [selected.positive(), variable.negative()]
                 .into_iter()
                 .try_fold(init, visit),
-            Clause::EnvConstrains(parent, absent_var, matches_var, _version_set) => {
-                iter::once(parent.negative())
-                    .chain(absent_var.map(|ab| ab.positive()))
-                    .chain(iter::once(matches_var.positive()))
+            Clause::EnvConstrains(env_constrains_id) => {
+                let payload = &env_constrains_clauses[env_constrains_id];
+                iter::once(payload.parent.negative())
+                    .chain(payload.absent_var.map(|ab| ab.positive()))
+                    .chain(iter::once(payload.matches_var.positive()))
                     .try_fold(init, visit)
             }
             Clause::EnvOracleConsistency(lit_a, lit_b) => {
@@ -420,12 +443,14 @@ impl<N: SolverId> Clause<N> {
         learnt_clauses: &Arena<LearntClauseId, Vec<Literal>>,
         requirements_to_sorted_candidates: &RequirementMap<Vec<Vec<VariableId>>>,
         disjunction_to_candidates: &Arena<DisjunctionId, Disjunction>,
+        env_constrains_clauses: &Arena<EnvConstrainsId, EnvConstrainsClause>,
         mut visit: impl FnMut(Literal),
     ) {
         let _ = self.try_fold_literals(
             learnt_clauses,
             requirements_to_sorted_candidates,
             disjunction_to_candidates,
+            env_constrains_clauses,
             (),
             |_, lit| {
                 visit(lit);
@@ -583,22 +608,16 @@ impl WatchedLiterals {
         )
     }
 
-    /// Construct an `EnvConstrains` clause. The returned boolean is true when
+    /// Construct an `EnvConstrains` clause from a payload that has already
+    /// been allocated in the side arena. The returned boolean is true when
     /// the clause conflicts with existing decisions.
     pub fn env_constrains<N: SolverId>(
-        parent: VariableId,
-        absent_var: Option<VariableId>,
-        matches_var: VariableId,
-        version_set: VersionSetId,
+        env_constrains_id: EnvConstrainsId,
+        payload: &EnvConstrainsClause,
         decision_tracker: &DecisionTracker,
     ) -> (Option<Self>, bool, Clause<N>) {
-        let (kind, watched_literals, conflict) = Clause::env_constrains(
-            parent,
-            absent_var,
-            matches_var,
-            version_set,
-            decision_tracker,
-        );
+        let (kind, watched_literals, conflict) =
+            Clause::env_constrains(env_constrains_id, payload, decision_tracker);
         (
             Self::from_kind_and_initial_watches(watched_literals),
             conflict,
@@ -615,12 +634,14 @@ impl WatchedLiterals {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn next_unwatched_literal<N: SolverId>(
         &self,
         clause: &Clause<N>,
         learnt_clauses: &Arena<LearntClauseId, Vec<Literal>>,
         requirement_to_sorted_candidates: &RequirementMap<Vec<Vec<VariableId>>>,
         disjunction_to_candidates: &Arena<DisjunctionId, Disjunction>,
+        env_constrains_clauses: &Arena<EnvConstrainsId, EnvConstrainsClause>,
         decision_map: &DecisionMap,
         for_watch_index: usize,
     ) -> Option<Literal> {
@@ -635,6 +656,7 @@ impl WatchedLiterals {
                     learnt_clauses,
                     requirement_to_sorted_candidates,
                     disjunction_to_candidates,
+                    env_constrains_clauses,
                     (),
                     |_, lit| {
                         // The next unwatched variable (if available), is a variable that is:
@@ -811,30 +833,10 @@ impl<I: Interner> Display for ClauseDisplay<'_, I> {
                     other,
                 )
             }
-            Clause::EnvConstrains(parent, absent_var, matches_var, version_set_id) => {
-                if let Some(ab) = absent_var {
-                    write!(
-                        f,
-                        "EnvConstrains({}({:?}), absent={}({:?}), matches={}({:?}), {})",
-                        parent.display(self.variable_map, self.interner),
-                        parent,
-                        ab.display(self.variable_map, self.interner),
-                        ab,
-                        matches_var.display(self.variable_map, self.interner),
-                        matches_var,
-                        self.interner.display_version_set(version_set_id),
-                    )
-                } else {
-                    write!(
-                        f,
-                        "EnvConstrains({}({:?}), matches={}({:?}), {})",
-                        parent.display(self.variable_map, self.interner),
-                        parent,
-                        matches_var.display(self.variable_map, self.interner),
-                        matches_var,
-                        self.interner.display_version_set(version_set_id),
-                    )
-                }
+            // Like `Learnt`, the payload lives in a side arena that is not
+            // available here; display just the id.
+            Clause::EnvConstrains(env_constrains_id) => {
+                write!(f, "EnvConstrains({env_constrains_id:?})")
             }
             Clause::EnvOracleConsistency(lit_a, lit_b) => {
                 write!(
@@ -1074,10 +1076,11 @@ mod test {
         // The Clause enum should be kept small since we create thousands of instances.
         // Asserted exactly to catch both growth (worse cache) and silent shrinkage
         // (which would mean a variant got smaller and the bound is now loose).
-        // EnvConstrains(VariableId, Option<VariableId>, VariableId, VersionSetId)
-        // adds a 4th field, increasing the maximum payload from 12 to 16 bytes,
-        // which pushes the enum from 16 to 20 bytes.
-        assert_eq!(std::mem::size_of::<Clause<crate::NameId>>(), 20);
+        // The largest payload is Requires(VariableId, Option<DisjunctionId>,
+        // Requirement) at 12 bytes; with the discriminant that gives 16 bytes.
+        // Variants with larger payloads (Learnt, EnvConstrains) store their
+        // payload in a side arena and carry only the arena id.
+        assert_eq!(std::mem::size_of::<Clause<crate::NameId>>(), 16);
     }
 
     #[test]

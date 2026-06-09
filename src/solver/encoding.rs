@@ -1,6 +1,10 @@
 use std::{any::Any, collections::VecDeque};
 
-use super::{EnvConstrainsEntry, SolverState, clause::WatchedLiterals, conditions};
+use super::{
+    EnvConstrainsEntry, SolverState,
+    clause::{EnvConstrainsClause, WatchedLiterals},
+    conditions,
+};
 use crate::{
     ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
     EnvironmentPackage, PackageCandidates, SolverCache, StringId, VariableId, VersionSetId,
@@ -630,11 +634,17 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
 
         let parent_var = self.state.variable_map.intern_solvable_or_root(solvable_id);
 
-        let (watched_literals, conflict, kind) = WatchedLiterals::env_constrains::<D::NameId>(
-            parent_var,
+        // Allocate the clause payload in the side arena (keeps the `Clause`
+        // enum small) and build the clause from it.
+        let env_constrains_id = self.state.env_constrains.alloc(EnvConstrainsClause {
+            parent: parent_var,
             absent_var,
             matches_var,
-            constraint,
+            version_set: constraint,
+        });
+        let (watched_literals, conflict, kind) = WatchedLiterals::env_constrains::<D::NameId>(
+            env_constrains_id,
+            &self.state.env_constrains[env_constrains_id],
             &self.state.decision_tracker,
         );
         let clause_id = self.state.add_clause(watched_literals, kind);
@@ -644,8 +654,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             .entry(parent_var)
             .or_default()
             .push(EnvConstrainsEntry {
-                absent_var,
-                matches_var,
+                env_constrains_id,
                 clause_id,
             });
 
