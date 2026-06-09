@@ -345,6 +345,19 @@ Notes:
   cells (`decision_tracker.undo_until(0)`) while keeping clauses; verify
   this leaves watches in a valid state (it should; watches are
   backtrack-stable).
+- (Learned in M2, now implemented:) watching and propagation alone do NOT
+  guarantee that a solution's undecided-counts-as-false completion satisfies
+  a blocking clause whose literals are all positive and undecided, so the
+  enumerator would rediscover an already-blocked cell forever. `decide()`
+  therefore has a lowest-priority pass over blocking clauses only: when no
+  other decision exists and a blocking clause is unsatisfied under the
+  completion, its first undecided positive literal is decided true. This is
+  a no-op for plain solves (the blocking list is empty) and is what makes
+  the disjointness-repair precondition ("the earlier cell's blocking clause
+  is satisfied by the current assignment") actually hold. Model clauses are
+  deliberately NOT forced this way: leaving them unsatisfied-under-completion
+  is harmless (they bound coverage, not solution validity) and preserves the
+  baseline-first policy.
 - Soft requirements are not supported in universal mode in v1 (panic with a
   clear message if combined).
 - `Candidates::locked`/`favored` keep working unchanged for concrete
@@ -371,8 +384,14 @@ variables fixed:
   not installed, no support needed. If some `B` is installed, no support
   needed (the requirement is satisfied regardless of the environment). If
   `A` is installed and no `B` is installed, the clause is satisfied only by
-  `not L` being true, so add `not L` to the cell (note: `L` may be merely
-  undecided; undecided counts as false and must still be recorded).
+  a condition complement literal `not L` being true. Record exactly ONE
+  such literal: the first env literal in the disjunction's encoding-fixed
+  order whose assigned value is not true. One true `not L` keeps the clause
+  satisfied throughout the cell; recording more fragments cells, and
+  recording a complement whose literal is TRUE in the assignment (possible
+  for AND conditions where another clause forces one conjunct) is unsound.
+  `L` may be merely undecided; undecided counts as false and must still be
+  recorded. (Rule refined during M2 review.)
 - Requires on an environment package (`not A or L_S`): if `A` installed,
   add `L_S` (it was propagated true).
 - EnvConstrains (`not A or Ab or L_S`): if `A` installed, add whichever of
