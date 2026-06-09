@@ -2,7 +2,7 @@ use std::{any::Any, fmt::Display, ops::ControlFlow};
 
 use ahash::{HashMap, HashSet};
 pub use cache::SolverCache;
-use clause::{Clause, EnvConstrainsClause, Literal, WatchedLiterals};
+use clause::{Clause, EnvClause, EnvClauseKind, EnvConstrainsClause, Literal, WatchedLiterals};
 use conditions::{Disjunction, DisjunctionId};
 use decision::Decision;
 use decision_tracker::DecisionTracker;
@@ -19,7 +19,7 @@ use crate::{
     conflict::Conflict,
     internal::{
         arena::Arena,
-        id::{ClauseId, EnvConstrainsId, LearntClauseId},
+        id::{ClauseId, EnvClauseId, EnvConstrainsId, LearntClauseId},
         solver_id::{SolvableIdOrRoot, WithRootSet},
     },
     requirement::RequirementMap,
@@ -41,8 +41,11 @@ mod diagnostics;
 mod encoding;
 #[cfg(test)]
 pub(crate) mod env_test_provider;
+mod universal;
 pub(crate) mod variable_map;
 mod watch_map;
+
+pub use universal::{EnvironmentModel, UniversalFailure, UniversalProblem, UniversalSolution};
 
 /// Describes the problem that is to be solved by the solver.
 ///
@@ -222,6 +225,29 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// (like `learnt_clauses`) to keep the `Clause` enum small.
     env_constrains: Arena<EnvConstrainsId, EnvConstrainsClause>,
 
+    /// The payloads of `Clause::EnvClause` clauses (environment model and
+    /// blocking clauses), stored out-of-line to keep the `Clause` enum small.
+    /// Only populated by `solve_universal`.
+    env_clauses: Arena<EnvClauseId, EnvClause>,
+
+    /// The clause ids of all `Clause::EnvClause` clauses, iterated during
+    /// propagation to apply single-literal clauses as assertions (mirrors
+    /// `learnt_clause_ids`).
+    env_clause_ids: Vec<ClauseId>,
+
+    /// The subset of `env_clauses` that are blocking clauses, iterated in
+    /// `decide()` to make sure every solution's undecided-counts-as-false
+    /// completion satisfies them.
+    blocking_clauses: Vec<(EnvClauseId, ClauseId)>,
+
+    /// Index of clause ids that can contribute to a cell's support during
+    /// universal solving: `Requires` clauses whose requirement candidates are
+    /// environment literals or whose condition disjunction contains
+    /// environment literals, and `EnvConstrains` clauses. Populated at clause
+    /// creation in the encoder. Oracle consistency, model and blocking
+    /// clauses are never support.
+    env_support_clauses: Vec<ClauseId>,
+
     watches: WatchMap,
 
     /// A mapping from requirements to the variables that represent the
@@ -267,6 +293,10 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             requires_clauses: Default::default(),
             env_constrains_clauses: Default::default(),
             env_constrains: Default::default(),
+            env_clauses: Default::default(),
+            env_clause_ids: Default::default(),
+            blocking_clauses: Default::default(),
+            env_support_clauses: Default::default(),
             watches: Default::default(),
             requirement_to_sorted_candidates: Default::default(),
             variable_map: Default::default(),
@@ -1155,6 +1185,65 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
+        // Finally, make progress on blocking clauses (universal solving
+        // only; the list is empty in a plain solve). A blocking clause is a
+        // disjunction of signed environment literals. Watches alone do not
+        // guarantee that the undecided-counts-as-false completion of a
+        // solution satisfies a clause with two or more positive literals
+        // (all of them can simply stay undecided), which would let the
+        // enumeration loop rediscover an already-blocked cell and break the
+        // disjointness-repair invariant. Whenever nothing else is left to
+        // decide and a blocking clause is not yet satisfied under the
+        // completion, decide its first undecided positive literal to true.
+        if best_decision.is_none() {
+            'blocking: for &(env_clause_id, clause_id) in &self.state.blocking_clauses {
+                debug_assert_eq!(
+                    self.state.env_clauses[env_clause_id].kind,
+                    EnvClauseKind::Blocking,
+                    "only blocking clauses are registered for decide()"
+                );
+                let literals = &self.state.env_clauses[env_clause_id].literals;
+                if literals.len() <= 1 {
+                    // Single-literal blocking clauses are assertions, applied
+                    // during propagation.
+                    continue;
+                }
+
+                let mut first_undecided_positive = None;
+                for &literal in literals {
+                    let assigned = self
+                        .state
+                        .decision_tracker
+                        .assigned_value(literal.variable());
+                    // The literal's value under the undecided-counts-as-false
+                    // completion: an undecided variable evaluates positive
+                    // literals to false and negative literals to true.
+                    let completed =
+                        assigned.map_or(literal.negate(), |value| value != literal.negate());
+                    if completed {
+                        // The clause is already satisfied under completion.
+                        continue 'blocking;
+                    }
+                    if !literal.negate() && assigned.is_none() && first_undecided_positive.is_none()
+                    {
+                        first_undecided_positive = Some(literal.variable());
+                    }
+                }
+
+                let candidate = first_undecided_positive.expect(
+                    "an unsatisfied blocking clause must have an undecided positive literal; \
+                     a fully-false clause would have conflicted during propagation",
+                );
+                best_decision = Some(PossibleDecision {
+                    is_explicit_requirement: false,
+                    package_activity: 0.0,
+                    candidate_count: 1,
+                    decision: (candidate, VariableId::root(), clause_id),
+                });
+                break;
+            }
+        }
+
         if let Some(PossibleDecision {
             candidate_count,
             package_activity,
@@ -1367,6 +1456,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // conflict, we will return an error.
         self.decide_assertions(level)?;
         self.decide_learned(level)?;
+        self.decide_env_assertions(level)?;
 
         // For each decision that has not been propagated yet, we propagate the
         // decision.
@@ -1447,6 +1537,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         &self.state.requirement_to_sorted_candidates,
                         &self.state.disjunctions,
                         &self.state.env_constrains,
+                        &self.state.env_clauses,
                         self.state.decision_tracker.map(),
                         watch_index,
                     )
@@ -1579,6 +1670,51 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         Ok(())
     }
 
+    /// Add decisions derived from single-literal environment model/blocking
+    /// clauses. Such clauses have no watches (like single-literal learnt
+    /// clauses) so their assertions must be (re-)applied on every propagation
+    /// round.
+    fn decide_env_assertions(&mut self, level: u32) -> Result<(), PropagationError> {
+        for idx in 0..self.state.env_clause_ids.len() {
+            let clause_id = self.state.env_clause_ids[idx];
+            let clause = self.state.clauses.kinds[clause_id.to_index()];
+            let Clause::EnvClause(env_clause_id) = clause else {
+                unreachable!();
+            };
+
+            let literals = &self.state.env_clauses[env_clause_id].literals;
+            if literals.len() > 1 {
+                continue;
+            }
+
+            debug_assert!(!literals.is_empty());
+
+            let literal = literals[0];
+            let decision = literal.satisfying_value();
+
+            let decided = self
+                .state
+                .decision_tracker
+                .try_add_decision(
+                    Decision::new(literal.variable(), decision, clause_id),
+                    level,
+                )
+                .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
+
+            if decided {
+                tracing::trace!(
+                    "├─ Propagate env assertion {} = {}",
+                    literal
+                        .variable()
+                        .display(&self.state.variable_map, self.provider()),
+                    decision
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Adds the clause with `clause_id` to the current [`Conflict`]
     ///
     /// Because learnt clauses are not relevant for the user, they are not added
@@ -1625,6 +1761,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             &self.state.requirement_to_sorted_candidates,
             &self.state.disjunctions,
             &self.state.env_constrains,
+            &self.state.env_clauses,
             |literal| {
                 involved.insert(literal.variable());
             },
@@ -1665,6 +1802,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 &self.state.requirement_to_sorted_candidates,
                 &self.state.disjunctions,
                 &self.state.env_constrains,
+                &self.state.env_clauses,
                 |literal| {
                     if literal.eval(self.state.decision_tracker.map()) == Some(true) {
                         assert_eq!(literal.variable(), decision.variable);
@@ -1714,6 +1852,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 &self.state.requirement_to_sorted_candidates,
                 &self.state.disjunctions,
                 &self.state.env_constrains,
+                &self.state.env_clauses,
                 |literal| {
                     if !first_iteration && literal.variable() == conflicting_solvable {
                         // We are only interested in the causes of the conflict, so we ignore the
@@ -1839,6 +1978,53 @@ impl<D: DependencyProvider> SolverState<D> {
 
         self.watches.start_watching(wl, clause_id);
 
+        clause_id
+    }
+
+    /// Allocate an environment model or blocking clause (a plain disjunction
+    /// of signed environment literals) and register it for propagation.
+    ///
+    /// A clause with two or more literals participates in watching like any
+    /// other clause; the initial watches are the first and last literal, so
+    /// this must only be called when the decision tracker holds no decisions
+    /// on the involved variables (model clauses are added before the first
+    /// solve, blocking clauses after `undo_until(0)`). A single-literal
+    /// clause is an assertion that is (re-)applied on every propagation
+    /// round, mirroring single-literal learnt clauses.
+    pub(crate) fn add_env_clause(
+        &mut self,
+        mut literals: Vec<Literal>,
+        kind: EnvClauseKind,
+    ) -> ClauseId {
+        assert!(
+            !literals.is_empty(),
+            "an environment clause must contain at least one literal; an empty \
+             disjunction is unsatisfiable"
+        );
+
+        // Defensively drop exact duplicate literals (a caller-supplied model
+        // disjunction may repeat a literal) while preserving order; the watch
+        // initialization below assumes the first and last literal differ.
+        let mut deduped = Vec::with_capacity(literals.len());
+        for literal in literals.drain(..) {
+            if !deduped.contains(&literal) {
+                deduped.push(literal);
+            }
+        }
+
+        let env_clause_id = self.env_clauses.alloc(EnvClause {
+            literals: deduped,
+            kind,
+        });
+        let (watched_literals, clause_kind) = WatchedLiterals::env_clause::<D::NameId>(
+            env_clause_id,
+            &self.env_clauses[env_clause_id].literals,
+        );
+        let clause_id = self.add_clause(watched_literals, clause_kind);
+        self.env_clause_ids.push(clause_id);
+        if kind == EnvClauseKind::Blocking {
+            self.blocking_clauses.push((env_clause_id, clause_id));
+        }
         clause_id
     }
 

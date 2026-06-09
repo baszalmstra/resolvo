@@ -56,6 +56,22 @@ impl DenseIndex for EnvConstrainsId {
     }
 }
 
+/// The id associated to an arena of [`crate::solver::clause::EnvClause`]
+/// payloads (environment model and blocking clauses). The literals are stored
+/// out-of-line to keep `Clause` small, like learnt clauses.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct EnvClauseId(u32);
+
+impl DenseIndex for EnvClauseId {
+    fn from_index(x: usize) -> Self {
+        Self(x as u32)
+    }
+
+    fn to_index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// The id associated to an arena of Candidates
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]

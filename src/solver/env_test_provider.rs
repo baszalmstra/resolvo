@@ -221,6 +221,7 @@ pub(crate) fn dump_clauses(solver: &Solver<EnvTestProvider>) -> String {
             Clause::AnyOf(..) => "AnyOf",
             Clause::EnvConstrains(..) => "EnvConstrains",
             Clause::EnvOracleConsistency(..) => "EnvOracleConsistency",
+            Clause::EnvClause(..) => "EnvClause",
         };
         let mut literals = Vec::new();
         kind.visit_literals(
@@ -228,6 +229,7 @@ pub(crate) fn dump_clauses(solver: &Solver<EnvTestProvider>) -> String {
             &state.requirement_to_sorted_candidates,
             &state.disjunctions,
             &state.env_constrains,
+            &state.env_clauses,
             |literal| {
                 literals.push(format!(
                     "{}{}",

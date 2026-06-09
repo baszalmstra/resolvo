@@ -34,7 +34,10 @@ pub use id::{
 };
 use itertools::Itertools;
 pub use requirement::Requirement;
-pub use solver::{EmptySolvables, Problem, Solver, SolverCache, UnsolvableOrCancelled};
+pub use solver::{
+    EmptySolvables, EnvironmentModel, Problem, Solver, SolverCache, UniversalFailure,
+    UniversalProblem, UniversalSolution, UnsolvableOrCancelled,
+};
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
 
@@ -112,6 +115,59 @@ pub enum EnvLiteralKind {
 /// An empty conjunction means "all environments".
 #[derive(Clone, Debug, Default)]
 pub struct CellCondition<N>(pub Vec<(EnvLiteral<N>, bool)>);
+
+impl<N> CellCondition<N> {
+    /// Returns an object that formats the cell condition in a human readable
+    /// way, e.g. `cuda in >=11, <100 AND not (glibc in >=228, <1000)`. The
+    /// empty conjunction is formatted as `<all environments>`.
+    pub fn display<'a, I: Interner<NameId = N>>(
+        &'a self,
+        interner: &'a I,
+    ) -> CellConditionDisplay<'a, I> {
+        CellConditionDisplay {
+            condition: self,
+            interner,
+        }
+    }
+}
+
+/// A helper struct that implements [`Display`] for a [`CellCondition`]. See
+/// [`CellCondition::display`].
+pub struct CellConditionDisplay<'a, I: Interner> {
+    condition: &'a CellCondition<I::NameId>,
+    interner: &'a I,
+}
+
+impl<I: Interner> Display for CellConditionDisplay<'_, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.condition.0.is_empty() {
+            return write!(f, "<all environments>");
+        }
+        for (idx, (literal, positive)) in self.condition.0.iter().enumerate() {
+            if idx > 0 {
+                write!(f, " AND ")?;
+            }
+            if !positive {
+                write!(f, "not (")?;
+            }
+            match literal.kind {
+                EnvLiteralKind::Matches(version_set) => write!(
+                    f,
+                    "{} in {}",
+                    self.interner.display_name(literal.package),
+                    self.interner.display_version_set(version_set)
+                )?,
+                EnvLiteralKind::Absent => {
+                    write!(f, "{} absent", self.interner.display_name(literal.package))?
+                }
+            }
+            if !positive {
+                write!(f, ")")?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// An object that is used by the solver to query certain properties of
 /// different internalized objects.

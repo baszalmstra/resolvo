@@ -11,7 +11,7 @@ use crate::{
     DenseIndex, Interner, Requirement, SolverId, StringId, VariableId, VersionSetId,
     internal::{
         arena::Arena,
-        id::{ClauseId, EnvConstrainsId, LearntClauseId},
+        id::{ClauseId, EnvClauseId, EnvConstrainsId, LearntClauseId},
     },
     solver::{
         conditions::DisjunctionId, decision_map::DecisionMap, decision_tracker::DecisionTracker,
@@ -128,6 +128,45 @@ pub(crate) enum Clause<N> {
     /// They participate in propagation and watching like any binary clause,
     /// but never appear in conflict chains (they are tautologies).
     EnvOracleConsistency(Literal, Literal),
+
+    /// A disjunction of signed environment literals, used for the clauses of
+    /// the environment model supplied to `solve_universal` and for the
+    /// blocking clauses added after each enumerated cell.
+    ///
+    /// The literals (and whether the clause is a model or a blocking clause)
+    /// are stored in a side arena ([`EnvClause`]) to keep [`Clause`] small,
+    /// following the [`Clause::Learnt`] pattern. A clause with a single
+    /// literal is an assertion and is applied during propagation like a
+    /// single-literal learnt clause.
+    ///
+    /// Model clauses are tautologies over the modeled environment space and
+    /// blocking clauses are handled by the disjointness repair step, so
+    /// neither ever contributes to cell support.
+    //
+    // The name intentionally matches `EnvClauseId`/`EnvClause`.
+    #[allow(clippy::enum_variant_names)]
+    EnvClause(EnvClauseId),
+}
+
+/// The payload of a [`Clause::EnvClause`] clause, stored in a side arena
+/// indexed by [`EnvClauseId`].
+#[derive(Clone, Debug)]
+pub(crate) struct EnvClause {
+    /// The literals of the disjunction. Never empty.
+    pub literals: Vec<Literal>,
+    /// Whether this is an environment model clause or a blocking clause.
+    pub kind: EnvClauseKind,
+}
+
+/// Distinguishes the two kinds of [`EnvClause`] payloads.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EnvClauseKind {
+    /// A clause of the environment model CNF supplied by the caller.
+    Model,
+    /// A blocking clause excluding a previously enumerated cell. `decide()`
+    /// actively makes progress on these (see `Solver::decide`) so that the
+    /// undecided-counts-as-false completion of every solution satisfies them.
+    Blocking,
 }
 
 /// The payload of a [`Clause::EnvConstrains`] clause, stored in a side arena
@@ -163,6 +202,8 @@ impl<N> Clause<N> {
             Clause::EnvConstrains(_) => false,
             // Oracle consistency clauses are always binary.
             Clause::EnvOracleConsistency(..) => true,
+            // Env model/blocking clauses have a variable number of literals.
+            Clause::EnvClause(_) => false,
             _ => false,
         }
     }
@@ -314,6 +355,25 @@ impl<N: SolverId> Clause<N> {
         (kind, Some([selected_var.positive(), other_var.negative()]))
     }
 
+    /// Build an env model/blocking clause from a payload that has already
+    /// been allocated in the side arena. Mirrors [`Clause::learnt`]: a
+    /// single-literal clause is an assertion and gets no watches.
+    fn env_clause(
+        env_clause_id: EnvClauseId,
+        literals: &[Literal],
+    ) -> (Self, Option<[Literal; 2]>) {
+        debug_assert!(!literals.is_empty());
+        (
+            Clause::EnvClause(env_clause_id),
+            if literals.len() == 1 {
+                // No need for watches, this is an assertion.
+                None
+            } else {
+                Some([*literals.first().unwrap(), *literals.last().unwrap()])
+            },
+        )
+    }
+
     /// Build an `EnvConstrains` clause from a payload that has already been
     /// allocated in the side arena.
     ///
@@ -375,12 +435,14 @@ impl<N: SolverId> Clause<N> {
     ///
     /// This function is useful to iterate, find, or filter the literals in a
     /// clause.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_fold_literals<B, C, F>(
         &self,
         learnt_clauses: &Arena<LearntClauseId, Vec<Literal>>,
         requirements_to_sorted_candidates: &RequirementMap<Vec<Vec<VariableId>>>,
         disjunction_to_candidates: &Arena<DisjunctionId, Disjunction>,
         env_constrains_clauses: &Arena<EnvConstrainsId, EnvConstrainsClause>,
+        env_clauses: &Arena<EnvClauseId, EnvClause>,
         init: C,
         mut visit: F,
     ) -> ControlFlow<B, C>
@@ -432,6 +494,11 @@ impl<N: SolverId> Clause<N> {
             Clause::EnvOracleConsistency(lit_a, lit_b) => {
                 [lit_a, lit_b].into_iter().try_fold(init, visit)
             }
+            Clause::EnvClause(env_clause_id) => env_clauses[env_clause_id]
+                .literals
+                .iter()
+                .copied()
+                .try_fold(init, visit),
         }
     }
 
@@ -444,6 +511,7 @@ impl<N: SolverId> Clause<N> {
         requirements_to_sorted_candidates: &RequirementMap<Vec<Vec<VariableId>>>,
         disjunction_to_candidates: &Arena<DisjunctionId, Disjunction>,
         env_constrains_clauses: &Arena<EnvConstrainsId, EnvConstrainsClause>,
+        env_clauses: &Arena<EnvClauseId, EnvClause>,
         mut visit: impl FnMut(Literal),
     ) {
         let _ = self.try_fold_literals(
@@ -451,6 +519,7 @@ impl<N: SolverId> Clause<N> {
             requirements_to_sorted_candidates,
             disjunction_to_candidates,
             env_constrains_clauses,
+            env_clauses,
             (),
             |_, lit| {
                 visit(lit);
@@ -608,6 +677,20 @@ impl WatchedLiterals {
         )
     }
 
+    /// Construct an env model/blocking clause ([`Clause::EnvClause`]) from a
+    /// payload that has already been allocated in the side arena.
+    ///
+    /// A single-literal clause is an assertion: it gets no watches and must
+    /// be applied during propagation (see `Solver::decide_env_assertions`),
+    /// exactly like a single-literal learnt clause.
+    pub fn env_clause<N: SolverId>(
+        env_clause_id: EnvClauseId,
+        literals: &[Literal],
+    ) -> (Option<Self>, Clause<N>) {
+        let (kind, watched_literals) = Clause::env_clause(env_clause_id, literals);
+        (Self::from_kind_and_initial_watches(watched_literals), kind)
+    }
+
     /// Construct an `EnvConstrains` clause from a payload that has already
     /// been allocated in the side arena. The returned boolean is true when
     /// the clause conflicts with existing decisions.
@@ -642,6 +725,7 @@ impl WatchedLiterals {
         requirement_to_sorted_candidates: &RequirementMap<Vec<Vec<VariableId>>>,
         disjunction_to_candidates: &Arena<DisjunctionId, Disjunction>,
         env_constrains_clauses: &Arena<EnvConstrainsId, EnvConstrainsClause>,
+        env_clauses: &Arena<EnvClauseId, EnvClause>,
         decision_map: &DecisionMap,
         for_watch_index: usize,
     ) -> Option<Literal> {
@@ -657,6 +741,7 @@ impl WatchedLiterals {
                     requirement_to_sorted_candidates,
                     disjunction_to_candidates,
                     env_constrains_clauses,
+                    env_clauses,
                     (),
                     |_, lit| {
                         // The next unwatched variable (if available), is a variable that is:
@@ -847,6 +932,11 @@ impl<I: Interner> Display for ClauseDisplay<'_, I> {
                     if lit_b.negate() { "not " } else { "" },
                     lit_b.variable(),
                 )
+            }
+            // Like `Learnt`, the literals live in a side arena that is not
+            // available here; display just the id.
+            Clause::EnvClause(env_clause_id) => {
+                write!(f, "EnvClause({env_clause_id:?})")
             }
         }
     }

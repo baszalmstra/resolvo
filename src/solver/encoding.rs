@@ -439,11 +439,15 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             }
         }
 
-        // Determine the disjunctions of all the conditions for this requirement.
+        // Determine the disjunctions of all the conditions for this
+        // requirement. Each entry also records whether the disjunction
+        // contains environment literals, which makes the resulting clause
+        // support-relevant for universal cell extraction.
         let mut conditions = Vec::with_capacity(condition.as_ref().map_or(0, |(_, dnf)| dnf.len()));
         if let Some((condition, dnf)) = condition {
             for disjunctions in dnf {
                 let mut disjunction_literals = Vec::new();
+                let mut disjunction_has_env = false;
                 for disjunction_complement in disjunctions {
                     match disjunction_complement {
                         DisjunctionComplement::Solvables(version_set, solvables) => {
@@ -482,6 +486,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                                 package_name,
                             );
                             disjunction_literals.push(variable.negative());
+                            disjunction_has_env = true;
                         }
                     }
                 }
@@ -490,13 +495,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     literals: disjunction_literals,
                     _condition: condition,
                 });
-                conditions.push(Some(disjunction_id));
+                conditions.push((Some(disjunction_id), disjunction_has_env));
             }
         } else {
-            conditions.push(None);
+            conditions.push((None, false));
         }
 
-        for condition in conditions {
+        for (condition, disjunction_has_env) in conditions {
             // Add the requirements clause. Environment version sets always
             // contribute their literal as a candidate, so they are never
             // empty.
@@ -513,6 +518,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 &self.state.decision_tracker,
             );
             let clause_id = self.state.add_clause(watched_literals, kind);
+
+            // Index the clause for universal cell extraction when its
+            // requirement candidates are environment literals or its
+            // condition disjunction contains environment literals.
+            if has_env || disjunction_has_env {
+                self.state.env_support_clauses.push(clause_id);
+            }
 
             self.state
                 .requires_clauses
@@ -618,6 +630,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             &self.state.decision_tracker,
         );
         let clause_id = self.state.add_clause(watched_literals, kind);
+
+        // EnvConstrains clauses always contribute to cell support.
+        self.state.env_support_clauses.push(clause_id);
 
         self.state
             .env_constrains_clauses
