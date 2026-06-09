@@ -1414,6 +1414,85 @@ fn test_env_requirement_forces_literal_true() {
     assert_eq!(solved, vec![]);
 }
 
+/// A conditional dependency on an environment package becomes ACTIVE when
+/// the env literal is forced true by a requirement on the same version set:
+/// root requires `cuda 11..100`, so `L_{cuda 11..100}` is propagated true,
+/// which activates `a`'s conditional dependency on `b`.
+#[test]
+fn test_env_conditional_dep_active_when_literal_forced() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a", "cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    a=1
+    b=1
+    ");
+}
+
+/// Oracle Subset implication: root requires `cuda 12..100` (forcing
+/// `L_{12..100}` true) and `a` constrains `cuda 11..100`. Since every value
+/// in [12,100) is also in [11,100), the oracle emits
+/// `(not L_{12..100} or L_{11..100})` which forces `L_{11..100}` true and
+/// satisfies the constraint. With `can_be_absent = false` the EnvConstrains
+/// clause is the binary `(not a or L_{11..100})`, so a wrong-polarity or
+/// wrong-direction oracle clause would make this unsolvable.
+#[test]
+fn test_env_oracle_subset_satisfies_constraint() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+    provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
+
+    let requirements = provider.requirements(&["a", "cuda 12..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    a=1
+    ");
+}
+
+/// Oracle Disjoint exclusion: two root requirements on disjoint version sets
+/// of the same environment package force both literals true, which violates
+/// the oracle clause `(not L_{0..5} or not L_{11..100})`. The solve must
+/// fail. Without the disjoint oracle clause both literals could be true
+/// simultaneously and the solve would (incorrectly) succeed.
+#[test]
+fn test_env_oracle_disjoint_conflict() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let requirements = provider.requirements(&["cuda 0..5", "cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let result = solver.solve(problem);
+    // Conflict rendering for env literals is deferred to M5; only assert
+    // that the solve fails as unsolvable.
+    assert!(matches!(result, Err(UnsolvableOrCancelled::Unsolvable(_))));
+}
+
+/// `Requirement::Union` mixing an environment and a concrete version set is
+/// rejected in v1 with a clear panic.
+#[test]
+#[should_panic(expected = "mixing environment and concrete version sets")]
+fn test_env_union_mixing_concrete_panics() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["b 1..2 | cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let _ = solver.solve(problem);
+}
+
 /// Environment-package encoding must also work under a real async runtime
 /// (tokio with `sleep_before_return = true`): classification of environment
 /// packages happens inside the queued futures where awaiting is legal, not
