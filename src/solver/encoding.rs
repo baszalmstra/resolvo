@@ -8,7 +8,6 @@ use super::{
 use crate::{
     ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
     EnvironmentPackage, PackageCandidates, SolverCache, StringId, VariableId, VersionSetId,
-    VersionSetRelation,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     solver::{conditions::Disjunction, decision::Decision},
     solver_id::{IdMap, IdSet},
@@ -321,7 +320,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 // results arrive in arbitrary order) the helper emits the
                 // exclusion clauses for them here.
                 if env_pkg.can_be_absent {
-                    self.intern_env_absent_with_oracle_clauses(name_id);
+                    self.state.intern_env_absent_with_oracle_clauses(name_id);
                 }
                 return;
             }
@@ -388,7 +387,11 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     .collect::<Vec<_>>(),
                 &RequirementCandidates::Environment(version_set) => {
                     let package_name = self.cache.provider().version_set_name(version_set);
-                    vec![self.intern_env_matches_with_oracle_clauses(version_set, package_name)]
+                    vec![self.state.intern_env_matches_with_oracle_clauses(
+                        self.cache.provider(),
+                        version_set,
+                        package_name,
+                    )]
                 }
             })
             .collect::<Vec<_>>();
@@ -473,8 +476,11 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         DisjunctionComplement::EnvLiteral(version_set) => {
                             // The complement of an env literal L_S is `not L_S`.
                             let package_name = self.cache.provider().version_set_name(version_set);
-                            let variable = self
-                                .intern_env_matches_with_oracle_clauses(version_set, package_name);
+                            let variable = self.state.intern_env_matches_with_oracle_clauses(
+                                self.cache.provider(),
+                                version_set,
+                                package_name,
+                            );
                             disjunction_literals.push(variable.negative());
                         }
                     }
@@ -582,14 +588,19 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         env_pkg: EnvironmentPackage,
     ) {
         let package_name = self.cache.provider().version_set_name(constraint);
-        let matches_var = self.intern_env_matches_with_oracle_clauses(constraint, package_name);
+        let matches_var = self.state.intern_env_matches_with_oracle_clauses(
+            self.cache.provider(),
+            constraint,
+            package_name,
+        );
 
         // Intern the absent literal if the package can be absent. It usually
         // already exists (interned by `on_candidates_available`), but task
         // results can arrive in arbitrary order under an async runtime.
-        let absent_var = env_pkg
-            .can_be_absent
-            .then(|| self.intern_env_absent_with_oracle_clauses(package_name));
+        let absent_var = env_pkg.can_be_absent.then(|| {
+            self.state
+                .intern_env_absent_with_oracle_clauses(package_name)
+        });
 
         let parent_var = self.state.variable_map.intern_solvable_or_root(solvable_id);
 
@@ -620,135 +631,6 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         if conflict {
             self.conflicting_clauses.push(clause_id);
         }
-    }
-
-    /// Intern the "absent" literal `Ab_p` for the environment package named
-    /// `package_name`. On first interning, emits the absent-vs-matches
-    /// exclusion clause `(not Ab_p or not L_S)` for every matches literal of
-    /// the package that already exists. Idempotent: repeat calls return the
-    /// existing variable without emitting anything.
-    ///
-    /// This is the only place that interns absent literals, so each exclusion
-    /// clause is emitted exactly once: either here (matches literal interned
-    /// first) or in [`Self::intern_env_matches_with_oracle_clauses`] (absent
-    /// literal interned first).
-    fn intern_env_absent_with_oracle_clauses(&mut self, package_name: D::NameId) -> VariableId {
-        let (ab_var, is_new, prior_matches) =
-            self.state.variable_map.intern_env_absent(package_name);
-        if is_new {
-            for prior_vs in &prior_matches {
-                let matches_var = self
-                    .state
-                    .variable_map
-                    .get_env_matches(*prior_vs)
-                    .expect("variable for a previously interned version set must exist");
-                let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                    ab_var.negative(),
-                    matches_var.negative(),
-                );
-                self.state.add_clause(wl, kind);
-            }
-        }
-        ab_var
-    }
-
-    /// Intern an env-matches literal `L_S` for `version_set_id` (which belongs
-    /// to an environment package named `package_name`) and emit oracle
-    /// consistency clauses for all previously interned literals of the same
-    /// package.
-    ///
-    /// Returns the variable id of `L_S`.
-    fn intern_env_matches_with_oracle_clauses(
-        &mut self,
-        version_set_id: VersionSetId,
-        package_name: D::NameId,
-    ) -> VariableId {
-        let (new_var, prior_vsets, absent_var) = self
-            .state
-            .variable_map
-            .intern_env_matches(version_set_id, package_name);
-
-        // If the literal was already interned, nothing to do.
-        if prior_vsets.is_empty() && absent_var.is_none() {
-            // Either repeat call, or first literal for this package with no
-            // absent literal yet. Either way no consistency clauses to emit.
-            return new_var;
-        }
-
-        // Emit absent-vs-matches exclusion: `(not Ab_p or not L_new)`.
-        if let Some(ab_var) = absent_var {
-            let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                ab_var.negative(),
-                new_var.negative(),
-            );
-            self.state.add_clause(wl, kind);
-        }
-
-        // Emit consistency clauses against every previously interned matches
-        // literal of the same package.
-        for prior_vs in &prior_vsets {
-            let prior_var = self
-                .state
-                .variable_map
-                .get_env_matches(*prior_vs)
-                .expect("variable for prior version set must exist");
-
-            // Query the oracle with `a` = the literal being interned and
-            // `b` = the previously interned literal; the match arms below
-            // depend on this argument order.
-            let relation = self
-                .cache
-                .provider()
-                .environment_version_set_relation(version_set_id, *prior_vs);
-
-            match relation {
-                VersionSetRelation::Disjoint => {
-                    // (not L_new or not L_prior)
-                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                        new_var.negative(),
-                        prior_var.negative(),
-                    );
-                    self.state.add_clause(wl, kind);
-                }
-                VersionSetRelation::Subset => {
-                    // a is new, b is prior: every value matching a also matches b.
-                    // Clause: (not L_new or L_prior)
-                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                        new_var.negative(),
-                        prior_var.positive(),
-                    );
-                    self.state.add_clause(wl, kind);
-                }
-                VersionSetRelation::Superset => {
-                    // a is new, b is prior: every value matching b also matches a.
-                    // Clause: (not L_prior or L_new)
-                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                        prior_var.negative(),
-                        new_var.positive(),
-                    );
-                    self.state.add_clause(wl, kind);
-                }
-                VersionSetRelation::Equal => {
-                    // Both implications:
-                    // (not L_new or L_prior) and (not L_prior or L_new)
-                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                        new_var.negative(),
-                        prior_var.positive(),
-                    );
-                    self.state.add_clause(wl, kind);
-                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
-                        prior_var.negative(),
-                        new_var.positive(),
-                    );
-                    self.state.add_clause(wl, kind);
-                }
-                VersionSetRelation::Unknown => {
-                    // No consistency clause needed.
-                }
-            }
-        }
-
-        new_var
     }
 
     /// Adds clauses to forbid any other clauses than the locked solvable to be
@@ -1119,248 +1001,10 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
 
 #[cfg(test)]
 mod test {
-    use std::fmt::Display;
-
-    use ahash::HashMap;
-
     use crate::{
-        Candidates, Condition, ConditionalRequirement, Dependencies, DependencyProvider,
-        EnvironmentPackage, Interner, KnownDependencies, NameId, PackageCandidates, Problem,
-        SolvableId, Solver, SolverCache, StringId, VersionSetId, VersionSetRelation,
-        VersionSetUnionId, solver::clause::Clause, utils::Pool,
+        Condition, ConditionalRequirement, Problem, Solver,
+        solver::env_test_provider::{EnvTestProvider, dump_clauses},
     };
-
-    /// A simple half-open version range `[start, end)` used as the version
-    /// set of [`EnvTestProvider`].
-    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-    struct Range {
-        start: u32,
-        end: u32,
-    }
-
-    impl Range {
-        fn new(start: u32, end: u32) -> Self {
-            Self { start, end }
-        }
-
-        fn contains(&self, version: u32) -> bool {
-            version >= self.start && version < self.end
-        }
-    }
-
-    impl Display for Range {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}..{}", self.start, self.end)
-        }
-    }
-
-    impl crate::utils::VersionSet for Range {
-        type V = u32;
-    }
-
-    /// A minimal in-crate dependency provider for encoder unit tests. The
-    /// integration tests use the richer BundleBox provider; this one exists
-    /// so unit tests can inspect solver internals (generated clauses,
-    /// decisions on environment literals).
-    #[derive(Default)]
-    struct EnvTestProvider {
-        pool: Pool<Range>,
-        env_packages: HashMap<NameId, EnvironmentPackage>,
-        dependencies: HashMap<SolvableId, KnownDependencies>,
-    }
-
-    impl EnvTestProvider {
-        fn add_env_package(&mut self, name: &str, can_be_absent: bool) {
-            let name_id = self.pool.intern_package_name(name);
-            self.env_packages
-                .insert(name_id, EnvironmentPackage { can_be_absent });
-        }
-
-        fn version_set(&self, name: &str, start: u32, end: u32) -> VersionSetId {
-            let name_id = self.pool.intern_package_name(name);
-            self.pool
-                .intern_version_set(name_id, Range::new(start, end))
-        }
-
-        fn add_package(&mut self, name: &str, version: u32) -> SolvableId {
-            let name_id = self.pool.intern_package_name(name);
-            self.pool.intern_solvable(name_id, version)
-        }
-
-        fn set_dependencies(
-            &mut self,
-            solvable: SolvableId,
-            requirements: Vec<ConditionalRequirement>,
-            constrains: Vec<VersionSetId>,
-        ) {
-            self.dependencies.insert(
-                solvable,
-                KnownDependencies {
-                    requirements,
-                    constrains,
-                },
-            );
-        }
-    }
-
-    impl Interner for EnvTestProvider {
-        type NameId = NameId;
-        type SolvableId = SolvableId;
-
-        fn display_solvable(&self, solvable: SolvableId) -> impl Display + '_ {
-            let solvable = self.pool.resolve_solvable(solvable);
-            format!(
-                "{}={}",
-                self.pool.resolve_package_name(solvable.name),
-                solvable.record
-            )
-        }
-
-        fn display_name(&self, name: NameId) -> impl Display + '_ {
-            self.pool.resolve_package_name(name).clone()
-        }
-
-        fn display_version_set(&self, version_set: VersionSetId) -> impl Display + '_ {
-            *self.pool.resolve_version_set(version_set)
-        }
-
-        fn display_string(&self, string_id: StringId) -> impl Display + '_ {
-            self.pool.resolve_string(string_id).to_owned()
-        }
-
-        fn version_set_name(&self, version_set: VersionSetId) -> NameId {
-            self.pool.resolve_version_set_package_name(version_set)
-        }
-
-        fn solvable_name(&self, solvable: SolvableId) -> NameId {
-            self.pool.resolve_solvable(solvable).name
-        }
-
-        fn version_sets_in_union(
-            &self,
-            version_set_union: VersionSetUnionId,
-        ) -> impl Iterator<Item = VersionSetId> {
-            self.pool.resolve_version_set_union(version_set_union)
-        }
-
-        fn resolve_condition(&self, condition: crate::ConditionId) -> Condition {
-            self.pool.resolve_condition(condition).clone()
-        }
-    }
-
-    impl DependencyProvider for EnvTestProvider {
-        async fn filter_candidates(
-            &self,
-            candidates: &[SolvableId],
-            version_set: VersionSetId,
-            inverse: bool,
-        ) -> Vec<SolvableId> {
-            let range = self.pool.resolve_version_set(version_set);
-            candidates
-                .iter()
-                .copied()
-                .filter(|&s| range.contains(self.pool.resolve_solvable(s).record) != inverse)
-                .collect()
-        }
-
-        async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
-            if let Some(env_pkg) = self.env_packages.get(&name) {
-                return Some(PackageCandidates::Environment(*env_pkg));
-            }
-            let candidates = self
-                .pool
-                .iter_solvables()
-                .filter(|(_, solvable)| solvable.name == name)
-                .map(|(id, _)| id)
-                .collect();
-            Some(PackageCandidates::Candidates(Candidates {
-                candidates,
-                ..Candidates::default()
-            }))
-        }
-
-        async fn sort_candidates(&self, _cache: &SolverCache<Self>, solvables: &mut [SolvableId]) {
-            solvables.sort_by(|&a, &b| {
-                let a = self.pool.resolve_solvable(a).record;
-                let b = self.pool.resolve_solvable(b).record;
-                b.cmp(&a)
-            });
-        }
-
-        async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
-            Dependencies::Known(
-                self.dependencies
-                    .get(&solvable)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
-        }
-
-        fn environment_version_set_relation(
-            &self,
-            a: VersionSetId,
-            b: VersionSetId,
-        ) -> VersionSetRelation {
-            let a = self.pool.resolve_version_set(a);
-            let b = self.pool.resolve_version_set(b);
-            if a == b {
-                VersionSetRelation::Equal
-            } else if a.end <= b.start || b.end <= a.start {
-                VersionSetRelation::Disjoint
-            } else if b.start <= a.start && a.end <= b.end {
-                // Every value matching `a` also matches `b`.
-                VersionSetRelation::Subset
-            } else if a.start <= b.start && b.end <= a.end {
-                // Every value matching `b` also matches `a`.
-                VersionSetRelation::Superset
-            } else {
-                VersionSetRelation::Unknown
-            }
-        }
-    }
-
-    /// Formats every clause of the solver as `Kind: lit or lit or ...` (one
-    /// line per clause, in allocation order) by visiting the clause literals.
-    fn dump_clauses(solver: &Solver<EnvTestProvider>) -> String {
-        let state = &solver.state;
-        let mut out = String::new();
-        for kind in &state.clauses.kinds {
-            if matches!(kind, Clause::InstallRoot) {
-                out.push_str("InstallRoot\n");
-                continue;
-            }
-            let name = match kind {
-                Clause::InstallRoot => unreachable!(),
-                Clause::Requires(..) => "Requires",
-                Clause::Constrains(..) => "Constrains",
-                Clause::ForbidMultipleInstances(..) => "ForbidMultipleInstances",
-                Clause::Lock(..) => "Lock",
-                Clause::Learnt(..) => "Learnt",
-                Clause::Excluded(..) => "Excluded",
-                Clause::AnyOf(..) => "AnyOf",
-                Clause::EnvConstrains(..) => "EnvConstrains",
-                Clause::EnvOracleConsistency(..) => "EnvOracleConsistency",
-            };
-            let mut literals = Vec::new();
-            kind.visit_literals(
-                &state.learnt_clauses,
-                &state.requirement_to_sorted_candidates,
-                &state.disjunctions,
-                &state.env_constrains,
-                |literal| {
-                    literals.push(format!(
-                        "{}{}",
-                        if literal.negate() { "not " } else { "" },
-                        literal
-                            .variable()
-                            .display(&state.variable_map, solver.provider())
-                    ));
-                },
-            );
-            out.push_str(&format!("{}: {}\n", name, literals.join(" or ")));
-        }
-        out
-    }
 
     /// Requirement-on-env-package encoding (5.4 item 1): the candidate list
     /// of the requires clause is the single literal `L_S`, giving the binary

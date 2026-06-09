@@ -15,7 +15,7 @@ use watch_map::WatchMap;
 
 use crate::{
     ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider, EnvironmentPackage,
-    KnownDependencies, Requirement, SolvableId, VariableId, VersionSetId,
+    KnownDependencies, Requirement, SolvableId, VariableId, VersionSetId, VersionSetRelation,
     conflict::Conflict,
     internal::{
         arena::Arena,
@@ -39,6 +39,8 @@ mod decision_tracker;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 mod encoding;
+#[cfg(test)]
+pub(crate) mod env_test_provider;
 pub(crate) mod variable_map;
 mod watch_map;
 
@@ -1838,6 +1840,132 @@ impl<D: DependencyProvider> SolverState<D> {
         self.watches.start_watching(wl, clause_id);
 
         clause_id
+    }
+
+    /// Intern the "absent" literal `Ab_p` for the environment package named
+    /// `package_name`. On first interning, emits the absent-vs-matches
+    /// exclusion clause `(not Ab_p or not L_S)` for every matches literal of
+    /// the package that already exists. Idempotent: repeat calls return the
+    /// existing variable without emitting anything.
+    ///
+    /// This is the only place that interns absent literals, so each exclusion
+    /// clause is emitted exactly once: either here (matches literal interned
+    /// first) or in [`Self::intern_env_matches_with_oracle_clauses`] (absent
+    /// literal interned first).
+    pub(crate) fn intern_env_absent_with_oracle_clauses(
+        &mut self,
+        package_name: D::NameId,
+    ) -> VariableId {
+        let (ab_var, is_new, prior_matches) = self.variable_map.intern_env_absent(package_name);
+        if is_new {
+            for prior_vs in &prior_matches {
+                let matches_var = self
+                    .variable_map
+                    .get_env_matches(*prior_vs)
+                    .expect("variable for a previously interned version set must exist");
+                let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                    ab_var.negative(),
+                    matches_var.negative(),
+                );
+                self.add_clause(wl, kind);
+            }
+        }
+        ab_var
+    }
+
+    /// Intern an env-matches literal `L_S` for `version_set_id` (which belongs
+    /// to an environment package named `package_name`) and emit oracle
+    /// consistency clauses for all previously interned literals of the same
+    /// package.
+    ///
+    /// Returns the variable id of `L_S`.
+    pub(crate) fn intern_env_matches_with_oracle_clauses(
+        &mut self,
+        provider: &D,
+        version_set_id: VersionSetId,
+        package_name: D::NameId,
+    ) -> VariableId {
+        let (new_var, prior_vsets, absent_var) = self
+            .variable_map
+            .intern_env_matches(version_set_id, package_name);
+
+        // If the literal was already interned, nothing to do.
+        if prior_vsets.is_empty() && absent_var.is_none() {
+            // Either repeat call, or first literal for this package with no
+            // absent literal yet. Either way no consistency clauses to emit.
+            return new_var;
+        }
+
+        // Emit absent-vs-matches exclusion: `(not Ab_p or not L_new)`.
+        if let Some(ab_var) = absent_var {
+            let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                ab_var.negative(),
+                new_var.negative(),
+            );
+            self.add_clause(wl, kind);
+        }
+
+        // Emit consistency clauses against every previously interned matches
+        // literal of the same package.
+        for prior_vs in &prior_vsets {
+            let prior_var = self
+                .variable_map
+                .get_env_matches(*prior_vs)
+                .expect("variable for prior version set must exist");
+
+            // Query the oracle with `a` = the literal being interned and
+            // `b` = the previously interned literal; the match arms below
+            // depend on this argument order.
+            let relation = provider.environment_version_set_relation(version_set_id, *prior_vs);
+
+            match relation {
+                VersionSetRelation::Disjoint => {
+                    // (not L_new or not L_prior)
+                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                        new_var.negative(),
+                        prior_var.negative(),
+                    );
+                    self.add_clause(wl, kind);
+                }
+                VersionSetRelation::Subset => {
+                    // a is new, b is prior: every value matching a also matches b.
+                    // Clause: (not L_new or L_prior)
+                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                        new_var.negative(),
+                        prior_var.positive(),
+                    );
+                    self.add_clause(wl, kind);
+                }
+                VersionSetRelation::Superset => {
+                    // a is new, b is prior: every value matching b also matches a.
+                    // Clause: (not L_prior or L_new)
+                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                        prior_var.negative(),
+                        new_var.positive(),
+                    );
+                    self.add_clause(wl, kind);
+                }
+                VersionSetRelation::Equal => {
+                    // Both implications:
+                    // (not L_new or L_prior) and (not L_prior or L_new)
+                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                        new_var.negative(),
+                        prior_var.positive(),
+                    );
+                    self.add_clause(wl, kind);
+                    let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(
+                        prior_var.negative(),
+                        new_var.positive(),
+                    );
+                    self.add_clause(wl, kind);
+                }
+                VersionSetRelation::Unknown => {
+                    // No consistency clause needed.
+                }
+            }
+        }
+
+        new_var
     }
 
     /// Returns the solvables that the solver has chosen to include in the
