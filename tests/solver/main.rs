@@ -1344,6 +1344,76 @@ fn test_constrains_transitive() {
     "###);
 }
 
+// ===========================================================================
+// M1: Environment literals in the encoder -- scenario tests
+// ===========================================================================
+//
+// These tests exercise the three env-package encoding paths through a plain
+// `solve()` call which gives the "baseline" solution: all environment literals
+// default to false / undecided. None of these tests need `solve_universal`.
+
+/// Conditional dependency on an environment package stays inactive in the
+/// baseline solve (environment literal is undecided = false, so the condition
+/// disjunction is not satisfied and the requirement is inactive).
+#[test]
+fn test_env_conditional_dep_inactive_in_baseline() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    // `a 1` has a conditional dep: requires `b 1..2` if `cuda 11..100`
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    // Baseline: cuda is undecided (false), so b is NOT pulled in.
+    assert_snapshot!(result, @r"
+    a=1
+    ");
+}
+
+/// A constraint on an env package that can be absent: in the baseline solve
+/// the absent literal is false/undecided so the EnvConstrains clause is
+/// satisfied by the absent literal (absent is undecided, counts as false, and
+/// propagation does nothing), and the solve completes without a conflict.
+#[test]
+fn test_env_constrains_absent_branch_baseline() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    // `a 1` constrains `cuda 11..100` (meaning: if a is installed the env
+    // must lack cuda or have cuda >=11).
+    provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    // Baseline: cuda absent/undecided; solve succeeds, only a is installed.
+    assert_snapshot!(result, @r"
+    a=1
+    ");
+}
+
+/// A requirement on an environment package forces that env literal to be true
+/// and the solve still succeeds (no concrete solvable is produced, but the
+/// solve does not fail).
+#[test]
+fn test_env_requirement_forces_literal_true() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+    // Root requires `cuda 11..100`. This should force L_{cuda>=11} = true.
+    let requirements = provider.requirements(&["cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    // No concrete solvables -- the env literal variable is true but not a
+    // solvable. The solution set of concrete solvables is empty.
+    assert_eq!(solved, vec![]);
+}
+
 /// Multiple constraints from different parents on the same package.
 #[test]
 fn test_constrains_multiple_parents() {

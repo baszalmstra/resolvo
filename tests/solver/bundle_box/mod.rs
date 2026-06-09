@@ -357,7 +357,7 @@ impl DependencyProvider for BundleBoxProvider {
         // Check environment packages before the regular packages map.
         if let Some(env_pkg) = self.environment_packages.get(package_name) {
             return self
-                .maybe_delay(Some(PackageCandidates::Environment(env_pkg.clone())))
+                .maybe_delay(Some(PackageCandidates::Environment(*env_pkg)))
                 .await;
         }
 

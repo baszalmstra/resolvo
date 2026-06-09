@@ -62,7 +62,7 @@ pub enum VersionSetRelation {
 /// Describes an environment package: a package whose value is unknown at solve
 /// time. Returned by [`DependencyProvider::get_candidates`] via
 /// [`PackageCandidates::Environment`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct EnvironmentPackage {
     /// Whether the environment may lack this package entirely. Controls
     /// creation of the absent literal.

@@ -166,6 +166,9 @@ impl Conflict {
                     let decision_map = solver.state.decision_tracker.map();
                     debug_assert_ne!(selected.positive().eval(decision_map), Some(false));
                 }
+                // Environment-related clauses: proper rendering is deferred to M5.
+                // For now we skip them so conflict reporting does not panic.
+                Clause::EnvConstrains(..) | Clause::EnvOracleConsistency(..) => {}
             }
         }
 

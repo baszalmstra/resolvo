@@ -105,6 +105,30 @@ pub(crate) enum Clause<N> {
     /// A clause that indicates that any version of a package C is selected.
     /// In SAT terms: (C_selected v ¬Cj)
     AnyOf(VariableId, VariableId),
+
+    /// A clause encoding a constraint on an environment package.
+    ///
+    /// Semantics: if the parent solvable `A` is installed, the environment
+    /// must either be absent (if `Ab_p` is given) or match the version set.
+    ///
+    /// In SAT terms (when absent is possible): `(¬A ∨ Ab_p ∨ L_S)`.
+    /// In SAT terms (when absent is not possible): `(¬A ∨ L_S)`.
+    ///
+    /// Fields: parent variable, optional absent variable (present iff
+    /// `can_be_absent` was true when the package was declared), matches
+    /// variable `L_S`, and the version set id (used for display).
+    EnvConstrains(VariableId, Option<VariableId>, VariableId, VersionSetId),
+
+    /// A binary oracle-consistency clause between two environment literals.
+    ///
+    /// These clauses are tautologies within the modeled environment space.
+    /// They are emitted when a new env-matches literal is interned for a
+    /// package that already has other interned literals, based on the answer
+    /// from `DependencyProvider::environment_version_set_relation`.
+    ///
+    /// They participate in propagation and watching like any binary clause,
+    /// but never appear in conflict chains (they are tautologies).
+    EnvOracleConsistency(Literal, Literal),
 }
 
 impl<N> Clause<N> {
@@ -114,13 +138,17 @@ impl<N> Clause<N> {
     /// clauses.
     #[inline]
     pub fn is_binary(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Clause::Constrains(..)
-                | Clause::ForbidMultipleInstances(..)
-                | Clause::Lock(..)
-                | Clause::AnyOf(..)
-        )
+            | Clause::ForbidMultipleInstances(..)
+            | Clause::Lock(..)
+            | Clause::AnyOf(..) => true,
+            // EnvConstrains is binary only when there is no absent literal.
+            Clause::EnvConstrains(_, absent, _, _) => absent.is_none(),
+            // Oracle consistency clauses are always binary.
+            Clause::EnvOracleConsistency(..) => true,
+            _ => false,
+        }
     }
 }
 
@@ -270,6 +298,58 @@ impl<N: SolverId> Clause<N> {
         (kind, Some([selected_var.positive(), other_var.negative()]))
     }
 
+    /// Build an `EnvConstrains` clause.
+    ///
+    /// Returns `(clause, watched_literals, conflict)`.
+    ///
+    /// When `absent_var` is `None` the clause is binary `(¬parent ∨ matches)`.
+    /// When `absent_var` is `Some(ab)` the clause is ternary
+    /// `(¬parent ∨ ab ∨ matches)` and behaves like a requires clause with
+    /// ordered candidates `[ab, matches]`.
+    fn env_constrains(
+        parent: VariableId,
+        absent_var: Option<VariableId>,
+        matches_var: VariableId,
+        version_set: VersionSetId,
+        decision_tracker: &DecisionTracker,
+    ) -> (Self, Option<[Literal; 2]>, bool) {
+        assert_ne!(decision_tracker.assigned_value(parent), Some(false));
+
+        let kind = Clause::EnvConstrains(parent, absent_var, matches_var, version_set);
+
+        match absent_var {
+            None => {
+                // Binary clause: (not parent or matches)
+                let conflict = decision_tracker.assigned_value(matches_var) == Some(false);
+                (
+                    kind,
+                    Some([parent.negative(), matches_var.positive()]),
+                    conflict,
+                )
+            }
+            Some(ab) => {
+                // Ternary clause: (not parent or ab or matches).
+                // Ordered candidates: absent first (per split policy), then matches.
+                // Watch parent.negative() and the first non-false candidate.
+                let ab_val = decision_tracker.assigned_value(ab);
+                let matches_val = decision_tracker.assigned_value(matches_var);
+
+                // Find a candidate that is not assigned false.
+                let watched_candidate = if ab_val != Some(false) {
+                    ab.positive()
+                } else if matches_val != Some(false) {
+                    matches_var.positive()
+                } else {
+                    // Both false -- conflict.
+                    return (kind, Some([parent.negative(), ab.positive()]), true);
+                };
+
+                let conflict = ab_val == Some(false) && matches_val == Some(false);
+                (kind, Some([parent.negative(), watched_candidate]), conflict)
+            }
+        }
+    }
+
     /// Tries to fold over all the literals in the clause.
     ///
     /// This function is useful to iterate, find, or filter the literals in a
@@ -320,6 +400,15 @@ impl<N: SolverId> Clause<N> {
             Clause::AnyOf(selected, variable) => [selected.positive(), variable.negative()]
                 .into_iter()
                 .try_fold(init, visit),
+            Clause::EnvConstrains(parent, absent_var, matches_var, _version_set) => {
+                iter::once(parent.negative())
+                    .chain(absent_var.map(|ab| ab.positive()))
+                    .chain(iter::once(matches_var.positive()))
+                    .try_fold(init, visit)
+            }
+            Clause::EnvOracleConsistency(lit_a, lit_b) => {
+                [lit_a, lit_b].into_iter().try_fold(init, visit)
+            }
         }
     }
 
@@ -476,6 +565,45 @@ impl WatchedLiterals {
     ) -> (Option<Self>, Clause<N>) {
         let (kind, watched_literals) = Clause::any_of(selected_var, other_var);
         (Self::from_kind_and_initial_watches(watched_literals), kind)
+    }
+
+    /// Construct an `EnvOracleConsistency` binary clause from two arbitrary
+    /// literals `(lit_a ∨ lit_b)`.
+    pub fn oracle_consistency<N: SolverId>(
+        lit_a: Literal,
+        lit_b: Literal,
+    ) -> (Option<Self>, Clause<N>) {
+        let kind = Clause::EnvOracleConsistency(lit_a, lit_b);
+        (
+            Some(WatchedLiterals {
+                watched_literals: [lit_a, lit_b],
+                next_watches: [None, None],
+            }),
+            kind,
+        )
+    }
+
+    /// Construct an `EnvConstrains` clause. The returned boolean is true when
+    /// the clause conflicts with existing decisions.
+    pub fn env_constrains<N: SolverId>(
+        parent: VariableId,
+        absent_var: Option<VariableId>,
+        matches_var: VariableId,
+        version_set: VersionSetId,
+        decision_tracker: &DecisionTracker,
+    ) -> (Option<Self>, bool, Clause<N>) {
+        let (kind, watched_literals, conflict) = Clause::env_constrains(
+            parent,
+            absent_var,
+            matches_var,
+            version_set,
+            decision_tracker,
+        );
+        (
+            Self::from_kind_and_initial_watches(watched_literals),
+            conflict,
+            kind,
+        )
     }
 
     fn from_kind_and_initial_watches(watched_literals: Option<[Literal; 2]>) -> Option<Self> {
@@ -681,6 +809,41 @@ impl<I: Interner> Display for ClauseDisplay<'_, I> {
                     variable,
                     other.display(self.variable_map, self.interner),
                     other,
+                )
+            }
+            Clause::EnvConstrains(parent, absent_var, matches_var, version_set_id) => {
+                if let Some(ab) = absent_var {
+                    write!(
+                        f,
+                        "EnvConstrains({}({:?}), absent={}({:?}), matches={}({:?}), {})",
+                        parent.display(self.variable_map, self.interner),
+                        parent,
+                        ab.display(self.variable_map, self.interner),
+                        ab,
+                        matches_var.display(self.variable_map, self.interner),
+                        matches_var,
+                        self.interner.display_version_set(version_set_id),
+                    )
+                } else {
+                    write!(
+                        f,
+                        "EnvConstrains({}({:?}), matches={}({:?}), {})",
+                        parent.display(self.variable_map, self.interner),
+                        parent,
+                        matches_var.display(self.variable_map, self.interner),
+                        matches_var,
+                        self.interner.display_version_set(version_set_id),
+                    )
+                }
+            }
+            Clause::EnvOracleConsistency(lit_a, lit_b) => {
+                write!(
+                    f,
+                    "EnvOracleConsistency({}{:?}, {}{:?})",
+                    if lit_a.negate() { "not " } else { "" },
+                    lit_a.variable(),
+                    if lit_b.negate() { "not " } else { "" },
+                    lit_b.variable(),
                 )
             }
         }
@@ -911,7 +1074,10 @@ mod test {
         // The Clause enum should be kept small since we create thousands of instances.
         // Asserted exactly to catch both growth (worse cache) and silent shrinkage
         // (which would mean a variant got smaller and the bound is now loose).
-        assert_eq!(std::mem::size_of::<Clause<crate::NameId>>(), 16);
+        // EnvConstrains(VariableId, Option<VariableId>, VariableId, VersionSetId)
+        // adds a 4th field, increasing the maximum payload from 12 to 16 bytes,
+        // which pushes the enum from 16 to 20 bytes.
+        assert_eq!(std::mem::size_of::<Clause<crate::NameId>>(), 20);
     }
 
     #[test]

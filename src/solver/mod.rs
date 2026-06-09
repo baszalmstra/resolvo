@@ -14,8 +14,8 @@ use variable_map::VariableMap;
 use watch_map::WatchMap;
 
 use crate::{
-    ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider, KnownDependencies,
-    Requirement, SolvableId, VariableId, VersionSetId,
+    ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider, EnvironmentPackage,
+    KnownDependencies, Requirement, SolvableId, VariableId, VersionSetId,
     conflict::Conflict,
     internal::{
         arena::Arena,
@@ -198,9 +198,26 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
 
 type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
 
+/// Represents an `EnvConstrains` clause registered for `decide()`.
+///
+/// `parent` is the solvable variable whose installation triggers the
+/// constraint. `absent_var` is the absent literal (if `can_be_absent`),
+/// `matches_var` is the `L_S` matches literal, and `clause_id` is the
+/// clause that encodes the constraint.
+pub(crate) struct EnvConstrainsEntry {
+    pub absent_var: Option<VariableId>,
+    pub matches_var: VariableId,
+    pub clause_id: ClauseId,
+}
+
 pub(crate) struct SolverState<D: DependencyProvider> {
     pub(crate) clauses: Clauses<D::NameId>,
     requires_clauses: IndexMap<VariableId, Vec<RequiresClause>, ahash::RandomState>,
+
+    /// Per-parent `EnvConstrains` clauses, iterated in `decide()` to make
+    /// progress on environment constraint satisfaction.
+    env_constrains_clauses: IndexMap<VariableId, Vec<EnvConstrainsEntry>, ahash::RandomState>,
+
     watches: WatchMap,
 
     /// A mapping from requirements to the variables that represent the
@@ -225,6 +242,11 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// solvable for a package.
     at_least_one_tracker: <D::NameId as SolverId>::Map<Option<VariableId>>,
 
+    /// Records environment package metadata (particularly `can_be_absent`)
+    /// for packages declared via `PackageCandidates::Environment`. Populated
+    /// in `on_candidates_available`.
+    pub(crate) env_packages: <D::NameId as SolverId>::Map<Option<EnvironmentPackage>>,
+
     pub(crate) decision_tracker: DecisionTracker,
 
     /// Activity score per package.
@@ -239,6 +261,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
         Self {
             clauses: Default::default(),
             requires_clauses: Default::default(),
+            env_constrains_clauses: Default::default(),
             watches: Default::default(),
             requirement_to_sorted_candidates: Default::default(),
             variable_map: Default::default(),
@@ -251,6 +274,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             clauses_added_for_solvable: Default::default(),
             at_most_one_trackers: Default::default(),
             at_least_one_tracker: Default::default(),
+            env_packages: Default::default(),
             decision_tracker: Default::default(),
             name_activity: Default::default(),
             #[cfg(feature = "diagnostics")]
@@ -1012,6 +1036,114 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                                 }
                             }
                         })
+                    }
+                }
+            }
+        }
+
+        // Also check EnvConstrains clauses. These encode `(not parent or ab or
+        // matches)` and need `decide()` to pick the absent or matches literal.
+        // We model them like requires clauses with the ordered candidate list
+        // `[absent, matches]` (absent first per split policy: absent branch
+        // explored before the matches branch).
+        for (&parent_var, entries) in self.state.env_constrains_clauses.iter() {
+            let is_explicit_requirement = parent_var == VariableId::root();
+            if let Some(best_decision) = &best_decision {
+                if best_decision.is_explicit_requirement && !is_explicit_requirement {
+                    continue;
+                }
+            }
+
+            // Only act when the parent solvable is actually installed.
+            if self.state.decision_tracker.assigned_value(parent_var) != Some(true) {
+                continue;
+            }
+
+            for entry in entries {
+                // Ordered candidates: absent first, then matches.
+                let candidates: &[VariableId] = match entry.absent_var {
+                    Some(ab) => &[ab, entry.matches_var],
+                    None => &[entry.matches_var],
+                };
+                // Temporarily we work with a slice of VariableIds.
+                // Reuse the same ControlFlow logic as the requires loop.
+                let mut candidate = ControlFlow::Break(());
+                for &c in candidates {
+                    let assigned = self.state.decision_tracker.assigned_value(c);
+                    candidate = match assigned {
+                        Some(true) => {
+                            // Clause already satisfied.
+                            candidate = ControlFlow::Break(());
+                            break;
+                        }
+                        Some(false) => {
+                            // This candidate was ruled out, continue.
+                            match candidate {
+                                ControlFlow::Continue(x) => ControlFlow::Continue(x),
+                                _ => ControlFlow::Continue(None),
+                            }
+                        }
+                        None => {
+                            // Undecided -- first undecided candidate.
+                            match candidate {
+                                ControlFlow::Continue(None) | ControlFlow::Break(()) => {
+                                    let package_name = self.provider().version_set_name(
+                                        // We need a VersionSetId for activity lookup.
+                                        // Use the version_set stored in the clause.
+                                        match self.state.clauses.kinds[entry.clause_id.to_index()] {
+                                            Clause::EnvConstrains(_, _, _, vs) => vs,
+                                            _ => unreachable!(),
+                                        },
+                                    );
+                                    let package_activity =
+                                        self.state.name_activity.get(package_name);
+                                    ControlFlow::Continue(Some((c, 1u32, package_activity)))
+                                }
+                                ControlFlow::Continue(Some((fc, count, act))) => {
+                                    ControlFlow::Continue(Some((fc, count + 1, act)))
+                                }
+                            }
+                        }
+                    };
+                }
+
+                match candidate {
+                    ControlFlow::Break(_) => continue, // already satisfied
+                    ControlFlow::Continue(None) => {
+                        // All candidates false -- propagation should have
+                        // handled this.
+                        unreachable!(
+                            "all env_constrains candidates assigned false; \
+                             propagation should have caught this"
+                        )
+                    }
+                    ControlFlow::Continue(Some((c, candidate_count, package_activity))) => {
+                        let decision = (c, parent_var, entry.clause_id);
+                        best_decision = Some(match &best_decision {
+                            None => PossibleDecision {
+                                is_explicit_requirement,
+                                package_activity,
+                                candidate_count,
+                                decision,
+                            },
+                            Some(best) => {
+                                if best.is_explicit_requirement && !is_explicit_requirement {
+                                    continue;
+                                }
+                                if best.package_activity >= package_activity {
+                                    continue;
+                                }
+                                if best.candidate_count <= candidate_count {
+                                    continue;
+                                }
+                                PossibleDecision {
+                                    is_explicit_requirement,
+                                    package_activity,
+                                    candidate_count,
+                                    decision,
+                                }
+                            }
+                        });
                     }
                 }
             }
