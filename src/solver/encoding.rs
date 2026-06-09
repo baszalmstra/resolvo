@@ -2,8 +2,8 @@ use std::{any::Any, collections::VecDeque, future::ready};
 
 use super::{SolverState, clause::WatchedLiterals, conditions};
 use crate::{
-    Candidates, ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
-    SolverCache, StringId, VariableId, VersionSetId,
+    ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
+    PackageCandidates, SolverCache, StringId, VariableId, VersionSetId,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     solver::{conditions::Disjunction, decision::Decision},
     solver_id::{IdMap, IdSet},
@@ -78,7 +78,7 @@ struct DependenciesAvailable<'a, S> {
 /// Results of requesting the candidates for a certain package.
 struct CandidatesAvailable<'a, D: DependencyProvider> {
     name_id: D::NameId,
-    package_candidates: &'a Candidates<D::SolvableId>,
+    package_candidates: &'a PackageCandidates<D::SolvableId>,
 }
 
 /// Result of querying candidates for a particular requirement.
@@ -258,13 +258,27 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             self.cache.provider().display_name(name_id)
         );
 
+        let candidates = match package_candidates {
+            PackageCandidates::Candidates(c) => c,
+            PackageCandidates::Environment(_) => {
+                // Environment packages are not encoded in the non-universal solve path.
+                // Encountering one here means the caller returned an environment package
+                // for a non-universal solve, which is not supported.
+                panic!(
+                    "encountered environment package '{}' in a non-universal solve; \
+                     concrete solves must inject concrete virtual packages",
+                    self.cache.provider().display_name(name_id)
+                )
+            }
+        };
+
         // If there is a locked solvable, forbid all other candidates
-        if let Some(locked_solvable_id) = package_candidates.locked {
-            self.add_locked_package_clauses(locked_solvable_id, &package_candidates.candidates);
+        if let Some(locked_solvable_id) = candidates.locked {
+            self.add_locked_package_clauses(locked_solvable_id, &candidates.candidates);
         }
 
         // Add clauses for externally excluded candidates.
-        for &(solvable, reason) in &package_candidates.excluded {
+        for &(solvable, reason) in &candidates.excluded {
             let variable = self.add_exclusion_clause(solvable.into(), reason);
             debug_assert!(
                 self.state.decision_tracker.assigned_value(variable) != Some(true),

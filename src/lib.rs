@@ -38,6 +38,81 @@ pub use solver::{EmptySolvables, Problem, Solver, SolverCache, UnsolvableOrCance
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
 
+/// The relation between two version sets that refer to the same environment
+/// package.
+///
+/// Soundness contract: answers other than `Unknown` must be correct. When in
+/// doubt return `Unknown`. A wrong `Disjoint` or `Subset` produces broken
+/// lockfiles; `Unknown` merely risks describing environment regions no real
+/// machine has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionSetRelation {
+    /// No value matches both version sets.
+    Disjoint,
+    /// Every value matching `a` also matches `b`.
+    Subset,
+    /// Every value matching `b` also matches `a`.
+    Superset,
+    /// `a` and `b` match exactly the same values.
+    Equal,
+    /// Overlapping, or the relation cannot be determined.
+    Unknown,
+}
+
+/// Describes an environment package: a package whose value is unknown at solve
+/// time. Returned by [`DependencyProvider::get_candidates`] via
+/// [`PackageCandidates::Environment`].
+#[derive(Clone, Debug)]
+pub struct EnvironmentPackage {
+    /// Whether the environment may lack this package entirely. Controls
+    /// creation of the absent literal.
+    pub can_be_absent: bool,
+}
+
+/// The return type of [`DependencyProvider::get_candidates`].
+///
+/// A package is either a normal package with concrete candidate solvables, or
+/// an environment package whose value is unknown at solve time.
+#[derive(Clone, Debug)]
+pub enum PackageCandidates<S = SolvableId> {
+    /// A normal package with concrete candidate solvables.
+    Candidates(Candidates<S>),
+    /// An environment package whose value is unknown at solve time.
+    Environment(EnvironmentPackage),
+}
+
+impl<S> From<Candidates<S>> for PackageCandidates<S> {
+    fn from(candidates: Candidates<S>) -> Self {
+        PackageCandidates::Candidates(candidates)
+    }
+}
+
+/// A signed environment literal: a reference to a version set (or the absent
+/// sentinel) for a specific environment package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvLiteral<N> {
+    /// The environment package this literal refers to.
+    pub package: N,
+    /// Whether this literal is a version-set match or the absent sentinel.
+    pub kind: EnvLiteralKind,
+}
+
+/// The kind of an [`EnvLiteral`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvLiteralKind {
+    /// The environment's value for this package exists and matches the given
+    /// version set.
+    Matches(VersionSetId),
+    /// The package is absent from the environment.
+    Absent,
+}
+
+/// A conjunction of signed environment literals.
+///
+/// An empty conjunction means "all environments".
+#[derive(Clone, Debug, Default)]
+pub struct CellCondition<N>(pub Vec<(EnvLiteral<N>, bool)>);
+
 /// An object that is used by the solver to query certain properties of
 /// different internalized objects.
 pub trait Interner {
@@ -137,7 +212,34 @@ pub trait DependencyProvider: Sized + Interner {
 
     /// Obtains a list of solvables that should be considered when a package
     /// with the given name is requested.
-    async fn get_candidates(&self, name: Self::NameId) -> Option<Candidates<Self::SolvableId>>;
+    ///
+    /// Return `None` to indicate that the package name is unknown.
+    /// Return `Some(PackageCandidates::Candidates(...))` for a normal package.
+    /// Return `Some(PackageCandidates::Environment(...))` to declare this name
+    /// as an environment package whose value is unknown at solve time.
+    async fn get_candidates(
+        &self,
+        name: Self::NameId,
+    ) -> Option<PackageCandidates<Self::SolvableId>>;
+
+    /// Returns the relation between two version sets that refer to the same
+    /// environment package.
+    ///
+    /// Only called for version sets whose `version_set_name` is an environment
+    /// package. The default implementation panics because providers that
+    /// declare no environment packages should never have this called.
+    ///
+    /// Soundness contract: answers other than `Unknown` must be correct; when
+    /// in doubt return `Unknown`. A wrong `Disjoint` or `Subset` answer
+    /// produces broken lockfiles; `Unknown` merely risks describing environment
+    /// regions no real machine has.
+    fn environment_version_set_relation(
+        &self,
+        _a: VersionSetId,
+        _b: VersionSetId,
+    ) -> VersionSetRelation {
+        unreachable!("provider declared no environment packages")
+    }
 
     /// Sort the specified solvables based on which solvable to try first. The
     /// solver will iteratively try to select the highest version. If a

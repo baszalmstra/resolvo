@@ -4,8 +4,8 @@ use event_listener::Event;
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use crate::{
-    Candidates, Dependencies, DependencyProvider, HintDependenciesAvailable, Requirement,
-    VersionSetId,
+    Candidates, Dependencies, DependencyProvider, HintDependenciesAvailable, PackageCandidates,
+    Requirement, VersionSetId,
     internal::{
         arena::Arena,
         id::{CandidatesId, DependenciesId},
@@ -19,8 +19,8 @@ use crate::{
 pub struct SolverCache<D: DependencyProvider> {
     provider: D,
 
-    /// A mapping from package name to a list of candidates.
-    candidates: Arena<CandidatesId, Candidates<D::SolvableId>>,
+    /// A mapping from package name to a list of candidates (or environment package info).
+    candidates: Arena<CandidatesId, PackageCandidates<D::SolvableId>>,
     package_name_to_candidates: Frozen<<D::NameId as SolverId>::Map<Option<CandidatesId>>>,
     package_name_to_candidates_in_flight: RefCell<HashMap<D::NameId, Rc<Event>>>,
 
@@ -79,7 +79,7 @@ impl<D: DependencyProvider> SolverCache<D> {
     pub async fn get_or_cache_candidates(
         &self,
         package_name: D::NameId,
-    ) -> Result<&Candidates<D::SolvableId>, Box<dyn Any>> {
+    ) -> Result<&PackageCandidates<D::SolvableId>, Box<dyn Any>> {
         // If we already have the candidates for this package cached we can simply
         // return
         let candidates_id = match self.package_name_to_candidates.get(package_name) {
@@ -114,15 +114,17 @@ impl<D: DependencyProvider> SolverCache<D> {
                             .insert(package_name, Rc::new(Event::new()));
 
                         // Otherwise we have to get them from the DependencyProvider
-                        let candidates = self
+                        let package_candidates = self
                             .provider
                             .get_candidates(package_name)
                             .await
-                            .unwrap_or_default();
+                            .unwrap_or_else(
+                                || PackageCandidates::Candidates(Candidates::default()),
+                            );
 
-                        // Store information about which solvables dependency information is easy to
-                        // retrieve.
-                        {
+                        // Store information about which solvables dependency information is
+                        // easy to retrieve.
+                        if let PackageCandidates::Candidates(ref candidates) = package_candidates {
                             let mut hint_dependencies_available =
                                 self.hint_dependencies_available.borrow_mut();
                             let dependencies_available_candidates =
@@ -137,7 +139,7 @@ impl<D: DependencyProvider> SolverCache<D> {
                         }
 
                         // Allocate an ID so we can refer to the candidates from everywhere
-                        let candidates_id = self.candidates.alloc(candidates);
+                        let candidates_id = self.candidates.alloc(package_candidates);
                         self.package_name_to_candidates
                             .set(package_name, Some(candidates_id));
 
@@ -179,7 +181,17 @@ impl<D: DependencyProvider> SolverCache<D> {
                     self.provider.display_name(package_name_id)
                 );
 
-                let candidates = self.get_or_cache_candidates(package_name_id).await?;
+                let package_candidates = self.get_or_cache_candidates(package_name_id).await?;
+                let candidates = match package_candidates {
+                    PackageCandidates::Candidates(c) => c,
+                    PackageCandidates::Environment(_) => {
+                        panic!(
+                            "encountered environment package '{}' in a non-universal solve; \
+                             concrete solves must inject concrete virtual packages",
+                            self.provider.display_name(package_name_id)
+                        )
+                    }
+                };
                 tracing::trace!("Got {:?} matching candidates", candidates.candidates.len());
 
                 let matching_candidates = self
@@ -217,7 +229,17 @@ impl<D: DependencyProvider> SolverCache<D> {
                     self.provider.display_name(package_name_id).to_string()
                 );
 
-                let candidates = self.get_or_cache_candidates(package_name_id).await?;
+                let package_candidates = self.get_or_cache_candidates(package_name_id).await?;
+                let candidates = match package_candidates {
+                    PackageCandidates::Candidates(c) => c,
+                    PackageCandidates::Environment(_) => {
+                        panic!(
+                            "encountered environment package '{}' in a non-universal solve; \
+                             concrete solves must inject concrete virtual packages",
+                            self.provider.display_name(package_name_id)
+                        )
+                    }
+                };
                 tracing::trace!(
                     "Got {:?} NON-matching candidates",
                     candidates.candidates.len()
@@ -305,7 +327,17 @@ impl<D: DependencyProvider> SolverCache<D> {
         let matching_candidates = self
             .get_or_cache_matching_candidates(version_set_id)
             .await?;
-        let candidates = self.get_or_cache_candidates(package_name_id).await?;
+        let package_candidates = self.get_or_cache_candidates(package_name_id).await?;
+        let candidates = match package_candidates {
+            PackageCandidates::Candidates(c) => c,
+            PackageCandidates::Environment(_) => {
+                panic!(
+                    "encountered environment package '{}' in a non-universal solve; \
+                     concrete solves must inject concrete virtual packages",
+                    self.provider.display_name(package_name_id)
+                )
+            }
+        };
 
         // Sort all the candidates in order in which they should be tried by the solver.
         let mut sorted_candidates = Vec::with_capacity(matching_candidates.len());

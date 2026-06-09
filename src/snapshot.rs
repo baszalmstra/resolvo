@@ -16,8 +16,8 @@ use futures::FutureExt;
 
 use crate::{
     Candidates, Condition, ConditionId, DenseIndex, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, Mapping, NameId, Requirement, SolvableId, SolverCache,
-    StringId, VersionSetId, VersionSetUnionId,
+    HintDependenciesAvailable, Interner, Mapping, NameId, PackageCandidates, Requirement,
+    SolvableId, SolverCache, StringId, VersionSetId, VersionSetUnionId,
 };
 
 /// A single solvable in a [`DependencySnapshot`].
@@ -186,7 +186,17 @@ impl DependencySnapshot {
             match element {
                 Element::Package(name) => {
                     let display = cache.provider().display_name(name).to_string();
-                    let candidates = cache.get_or_cache_candidates(name).await?;
+                    let package_candidates = cache.get_or_cache_candidates(name).await?;
+                    let candidates = match package_candidates {
+                        PackageCandidates::Candidates(c) => c,
+                        PackageCandidates::Environment(_) => {
+                            return Err(Box::new(format!(
+                                "cannot snapshot environment package '{}'; \
+                                 snapshotting environment packages is not supported",
+                                display
+                            )));
+                        }
+                    };
                     for solvable in candidates.candidates.iter() {
                         if seen.insert(Element::Solvable(*solvable)) {
                             queue.push_back(Element::Solvable(*solvable));
@@ -516,9 +526,9 @@ impl DependencyProvider for SnapshotProvider<'_> {
             .collect()
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
         let package = self.package(name);
-        Some(Candidates {
+        Some(PackageCandidates::Candidates(Candidates {
             candidates: package.solvables.clone(),
             favored: None,
             locked: None,
@@ -531,7 +541,7 @@ impl DependencyProvider for SnapshotProvider<'_> {
                     .filter(|&s| self.solvable(s).hint_dependencies_available)
                     .collect(),
             ),
-        })
+        }))
     }
 
     async fn sort_candidates(&self, _solver: &SolverCache<Self>, solvables: &mut [SolvableId]) {
