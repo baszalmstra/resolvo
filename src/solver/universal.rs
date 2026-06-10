@@ -694,6 +694,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // the seeds run out the loop continues as free enumeration.
         let mut pending_seeds = problem.seed_partition.into_iter();
 
+        // Accumulated cost of the per-round coverage pre-checks, reported
+        // when the pre-check terminates the enumeration.
+        let mut witness_precheck_total = std::time::Duration::ZERO;
+
         loop {
             // Set up the assumptions of the next viable seed, if any remain.
             // Seeds that contribute no assumptions are skipped: an empty
@@ -706,6 +710,29 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     break;
                 };
                 seeded = self.push_seed_assumptions(&seed)?;
+            }
+
+            // Coverage check before a free solve: when the environment-only
+            // clauses (model, oracle, blocking) admit no assignment, the
+            // recorded cells already cover the entire model and the solve
+            // below could only confirm that through a full (and potentially
+            // expensive) unsatisfiability proof over the whole formula.
+            // Growing the clause set never turns an unsatisfiable environment
+            // formula satisfiable, so a negative witness search is final.
+            // Seeded iterations skip the check: their assumptions target a
+            // specific region regardless of coverage.
+            if !seeded {
+                let precheck_start = std::time::Instant::now();
+                let covered = self.find_environment_witness().is_none();
+                witness_precheck_total += precheck_start.elapsed();
+                if covered {
+                    tracing::info!(
+                        "universal: coverage pre-checks took {:?} over {} rounds",
+                        witness_precheck_total,
+                        cells.len() + 1,
+                    );
+                    break;
+                }
             }
 
             let sat_start = std::time::Instant::now();
@@ -1465,15 +1492,39 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// variables that occur in no environment-only clause are unconstrained
     /// and left out of the witness, mirroring how cells record only
     /// load-bearing literals.
+    ///
+    /// The environment-only clauses are collected from the dedicated indices
+    /// instead of a scan over the whole clause database, so the search is
+    /// cheap enough to run once per enumeration round. The two index lists
+    /// are merged by clause id to reproduce the database order exactly: the
+    /// witness search derives its variable order from the clause order, and
+    /// a different order could select a different (equally valid) witness.
     fn find_environment_witness(&self) -> Option<Vec<(VariableId, bool)>> {
-        let mut clauses: Vec<Vec<Literal>> = Vec::new();
-        for kind in &self.state.clauses.kinds {
-            match *kind {
-                Clause::EnvOracleConsistency(lit_a, lit_b) => clauses.push(vec![lit_a, lit_b]),
-                Clause::EnvClause(env_clause_id) => {
-                    clauses.push(self.state.env_clauses[env_clause_id].literals.clone());
-                }
-                _ => {}
+        let oracle_ids = &self.state.env_oracle_clause_ids;
+        let env_ids = &self.state.env_clause_ids;
+        let mut clauses: Vec<Vec<Literal>> = Vec::with_capacity(oracle_ids.len() + env_ids.len());
+        let clause_for = |clause_id: ClauseId| match self.state.clauses.kinds[clause_id.to_index()]
+        {
+            Clause::EnvOracleConsistency(lit_a, lit_b) => vec![lit_a, lit_b],
+            Clause::EnvClause(env_clause_id) => {
+                self.state.env_clauses[env_clause_id].literals.clone()
+            }
+            _ => unreachable!("the environment clause indices only hold environment clauses"),
+        };
+        // Both index lists are ascending by construction; merge by id.
+        let (mut oracle_index, mut env_index) = (0, 0);
+        while oracle_index < oracle_ids.len() || env_index < env_ids.len() {
+            let take_oracle = match (oracle_ids.get(oracle_index), env_ids.get(env_index)) {
+                (Some(oracle), Some(env)) => oracle.to_index() < env.to_index(),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if take_oracle {
+                clauses.push(clause_for(oracle_ids[oracle_index]));
+                oracle_index += 1;
+            } else {
+                clauses.push(clause_for(env_ids[env_index]));
+                env_index += 1;
             }
         }
         find_witness(&clauses)

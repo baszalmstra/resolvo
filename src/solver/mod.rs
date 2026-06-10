@@ -244,6 +244,11 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// `learnt_clause_ids`).
     env_clause_ids: Vec<ClauseId>,
 
+    /// The clause ids of all [`Clause::EnvOracleConsistency`] clauses, so the
+    /// environment witness search can collect the environment-only clause
+    /// set without scanning the whole clause database.
+    env_oracle_clause_ids: Vec<ClauseId>,
+
     /// The subset of `env_clauses` that are blocking clauses, iterated in
     /// `decide()` to make sure every solution's undecided-counts-as-false
     /// completion satisfies them.
@@ -313,6 +318,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_constrains: Default::default(),
             env_clauses: Default::default(),
             env_clause_ids: Default::default(),
+            env_oracle_clause_ids: Default::default(),
             blocking_clauses: Default::default(),
             env_support_clauses: Default::default(),
             watches: Default::default(),
@@ -2133,7 +2139,14 @@ impl<D: DependencyProvider> SolverState<D> {
         watched_literals: Option<WatchedLiterals>,
         kind: Clause<D::NameId>,
     ) -> ClauseId {
+        let is_oracle_clause = matches!(kind, Clause::EnvOracleConsistency(..));
         let clause_id = self.clauses.alloc(watched_literals, kind);
+        // Index oracle consistency clauses so the environment witness search
+        // can collect the environment-only clause set without scanning the
+        // whole clause database.
+        if is_oracle_clause {
+            self.env_oracle_clause_ids.push(clause_id);
+        }
         let Some(wl) = self.clauses.watched_literals[clause_id.to_index()].as_mut() else {
             return clause_id;
         };
