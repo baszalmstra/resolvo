@@ -2736,6 +2736,6 @@ fn test_m5_conflict_display_env_constrains_scoped() {
     The following packages are incompatible
     └─ a * cannot be installed because there are no viable options:
        └─ a 1 would constrain
-          └─ environment cuda >=11, <100, which conflicts with any installable versions previously reported
+          └─ the environment to lack cuda or provide cuda >=11, <100, but this environment region provides cuda outside that range
     ");
 }

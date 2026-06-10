@@ -220,7 +220,10 @@ impl Conflict {
                     graph.add_edge(
                         package_node,
                         target_node,
-                        ConflictEdge::Conflict(ConflictCause::EnvConstrains(payload.version_set)),
+                        ConflictEdge::Conflict(ConflictCause::EnvConstrains {
+                            version_set: payload.version_set,
+                            may_be_absent: payload.absent_var.is_some(),
+                        }),
                     );
                 }
                 Clause::EnvOracleConsistency(lit_a, lit_b) => {
@@ -420,9 +423,16 @@ pub enum ConflictCause<S = SolvableId> {
     ForbidMultipleInstances,
     /// The node was excluded
     Excluded,
-    /// A solvable constrains an environment package to match the given version
-    /// set, but the environment cannot satisfy it.
-    EnvConstrains(VersionSetId),
+    /// A solvable constrains an environment package: if the solvable is
+    /// installed the environment must lack the package (when `may_be_absent`)
+    /// or match the version set, but the environment cannot satisfy either.
+    EnvConstrains {
+        /// The version set the environment package must match.
+        version_set: VersionSetId,
+        /// Whether the constraint is also satisfied by the package being
+        /// absent from the environment.
+        may_be_absent: bool,
+    },
     /// Two environment literals are mutually exclusive (oracle consistency
     /// clause asserts they cannot both hold).
     EnvMutuallyExclusive,
@@ -507,9 +517,10 @@ impl<S: SolverId, N: SolverId> ConflictGraph<S, N> {
                         requirement.display(interner).to_string()
                     }
                     ConflictEdge::Conflict(ConflictCause::Constrains(version_set_id))
-                    | ConflictEdge::Conflict(ConflictCause::EnvConstrains(version_set_id)) => {
-                        interner.display_version_set(*version_set_id).to_string()
-                    }
+                    | ConflictEdge::Conflict(ConflictCause::EnvConstrains {
+                        version_set: version_set_id,
+                        ..
+                    }) => interner.display_version_set(*version_set_id).to_string(),
                     ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances)
                     | ConflictEdge::Conflict(ConflictCause::Locked(_)) => {
                         "already installed".to_string()
@@ -1114,7 +1125,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                         matches!(
                             e.weight(),
                             ConflictEdge::Conflict(ConflictCause::Constrains(_))
-                                | ConflictEdge::Conflict(ConflictCause::EnvConstrains(_))
+                                | ConflictEdge::Conflict(ConflictCause::EnvConstrains { .. })
                         )
                     });
                     let is_leaf = graph.edges(candidate).next().is_none();
@@ -1133,13 +1144,18 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                             "{indent}{version}, which conflicts with the versions reported above."
                         )?;
                     } else if constrains_conflict {
-                        // Collect both regular Constrains and EnvConstrains edges,
-                        // distinguishing the two so env constraints can be prefixed
-                        // with "environment".
+                        // Collect both regular Constrains and EnvConstrains
+                        // edges, distinguishing the two: a regular constraint
+                        // conflicts with installable versions reported above,
+                        // while an environment constraint conflicts with the
+                        // environment itself.
                         #[derive(PartialEq, Eq)]
                         enum ConstraintEntry {
                             Regular(VersionSetId),
-                            Env(VersionSetId),
+                            Env {
+                                version_set: VersionSetId,
+                                may_be_absent: bool,
+                            },
                         }
                         let mut version_sets_vec: Vec<ConstraintEntry> = graph
                             .edges(candidate)
@@ -1147,9 +1163,13 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                                 ConflictEdge::Conflict(ConflictCause::Constrains(
                                     version_set_id,
                                 )) => Some(ConstraintEntry::Regular(*version_set_id)),
-                                ConflictEdge::Conflict(ConflictCause::EnvConstrains(
-                                    version_set_id,
-                                )) => Some(ConstraintEntry::Env(*version_set_id)),
+                                &ConflictEdge::Conflict(ConflictCause::EnvConstrains {
+                                    version_set,
+                                    may_be_absent,
+                                }) => Some(ConstraintEntry::Env {
+                                    version_set,
+                                    may_be_absent,
+                                }),
                                 _ => None,
                             })
                             .collect();
@@ -1160,23 +1180,44 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
 
                         let mut indenter = indenter.push_level();
                         while let Some(entry) = version_sets.next() {
-                            let (prefix, version_set_id) = match entry {
-                                ConstraintEntry::Regular(vs) => ("", vs),
-                                ConstraintEntry::Env(vs) => ("environment ", vs),
-                            };
-                            let name = self
-                                .interner
-                                .display_name(self.interner.version_set_name(version_set_id));
-                            let version_set = self.interner.display_version_set(version_set_id);
-
                             if version_sets.peek().is_none() {
                                 indenter.set_last();
                             }
                             let indent = indenter.get_indent();
-                            writeln!(
-                                f,
-                                "{indent}{prefix}{name} {version_set}, which conflicts with any installable versions previously reported",
-                            )?;
+                            match entry {
+                                ConstraintEntry::Regular(version_set_id) => {
+                                    let name = self.interner.display_name(
+                                        self.interner.version_set_name(version_set_id),
+                                    );
+                                    let version_set =
+                                        self.interner.display_version_set(version_set_id);
+                                    writeln!(
+                                        f,
+                                        "{indent}{name} {version_set}, which conflicts with any installable versions previously reported",
+                                    )?;
+                                }
+                                ConstraintEntry::Env {
+                                    version_set: version_set_id,
+                                    may_be_absent,
+                                } => {
+                                    let name = self.interner.display_name(
+                                        self.interner.version_set_name(version_set_id),
+                                    );
+                                    let version_set =
+                                        self.interner.display_version_set(version_set_id);
+                                    if may_be_absent {
+                                        writeln!(
+                                            f,
+                                            "{indent}the environment to lack {name} or provide {name} {version_set}, but this environment region provides {name} outside that range",
+                                        )?;
+                                    } else {
+                                        writeln!(
+                                            f,
+                                            "{indent}the environment to provide {name} {version_set}, but this environment region provides {name} outside that range",
+                                        )?;
+                                    }
+                                }
+                            }
                         }
                     } else {
                         writeln!(f, "{indent}{version} would require",)?;
@@ -1273,7 +1314,7 @@ impl<I: Interner> fmt::Display for DisplayUnsat<'_, I> {
                     // Env literal conflicts at root level are already handled by
                     // fmt_graph traversal (via solvable -> env literal edges) or
                     // are not meaningful to display directly at the top level.
-                    ConflictCause::EnvConstrains(_) | ConflictCause::EnvMutuallyExclusive => {
+                    ConflictCause::EnvConstrains { .. } | ConflictCause::EnvMutuallyExclusive => {
                         continue;
                     }
                 };
