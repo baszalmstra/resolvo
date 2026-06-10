@@ -2457,6 +2457,123 @@ fn test_universal_seed_order_changes_generalization() {
     ");
 }
 
+/// A seed invalidated by a changed universe is dropped and its region is
+/// re-enumerated; full coverage is still achieved (M4 stability test). The
+/// "previous" universe split at cuda 11 and produced the (now stale) cells
+/// `cuda absent` and `cuda >=11 AND not (cuda >=12)`; the "new" universe
+/// constrains cuda to `>=12` and its model no longer admits cuda versions
+/// below 12. Seed 1 (`cuda absent`) still solves and is reproduced. Seed 2
+/// describes a region outside the new model: propagating its assumptions
+/// against the model clause `(absent OR matches >=12)` conflicts at level
+/// n+1 (the absent literal is excluded by the oracle, the matches literal
+/// by assumption), so the seed is dropped. Free enumeration then covers the
+/// remaining `cuda >=12` region, and the final partition passes the
+/// independent verifier.
+#[test]
+fn test_universal_invalidated_seed_dropped_region_reenumerated() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &[], &["cuda 12..100"]);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 12..100"),
+    ]];
+    let seeds = vec![
+        CellCondition(vec![parse_env_literal(&mut provider, "cuda absent")]),
+        CellCondition(vec![
+            parse_env_literal(&mut provider, "cuda 11..100"),
+            parse_env_literal(&mut provider, "not cuda 12..100"),
+        ]),
+    ];
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(seeds),
+        )
+        .expect("solvable");
+
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_snapshot!(format_universal_result(&solver, &Ok(solution)), @r"
+    cell: cuda absent
+      a=1
+    cell: cuda in >=12, <100
+      a=1
+    ");
+}
+
+/// An assumption-level conflict does not corrupt later cells (M4 stability
+/// test): a seed whose two assumptions contradict each other through an
+/// oracle consistency clause (`cuda 11..100` AND `cuda absent`) conflicts
+/// during its first propagation at level n+1 and is dropped. The full free
+/// enumeration that follows must be byte-identical to the unseeded solve of
+/// the same problem: no leftover decision, level, or assumption state may
+/// leak out of the dropped seed.
+#[test]
+fn test_universal_dropped_seed_then_free_enumeration_matches_unseeded() {
+    let mut provider = cross_product_provider();
+    let requirements = provider.requirements(&["a"]);
+    let bogus_seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "cuda 11..100"),
+        parse_env_literal(&mut provider, "cuda absent"),
+    ]);
+
+    let mut solver = Solver::new(provider);
+    let unseeded = solver
+        .solve_universal(UniversalProblem::new().requirements(requirements.clone()))
+        .expect("solvable");
+    let seeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .seed_partition(vec![bogus_seed]),
+        )
+        .expect("solvable");
+
+    assert_eq!(format!("{unseeded:?}"), format!("{seeded:?}"));
+}
+
+/// A stale over-specific seed heals (design doc 5.7): the recorded cell is
+/// the load-bearing support of the NEW solution, which may be more general
+/// than the seed. The seed pins both `cuda >=12` and `rocm 5..10`, but in
+/// the current universe the solution only depends on cuda; the recorded
+/// cell drops the rocm literal entirely and covers the whole model in one
+/// cell, instead of perpetuating the stale fragmentation.
+#[test]
+fn test_universal_stale_seed_heals_to_general_cell() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package("a", Pack::new(1), &["cuda 12..100"], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = vec![vec![parse_env_literal(&mut provider, "cuda 12..100")]];
+    let seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "cuda 12..100"),
+        parse_env_literal(&mut provider, "rocm 5..10"),
+    ]);
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(vec![seed]),
+        )
+        .expect("solvable");
+
+    assert_snapshot!(format_universal_result(&solver, &Ok(solution)), @r"
+    cell: cuda in >=12, <100
+      a=1
+    ");
+}
+
 /// A seed that contradicts itself on the same literal (`cuda 11..100` both
 /// positive and negative) describes no environment at all: it is dropped at
 /// assumption setup (the second decision on the same variable fails) and the
