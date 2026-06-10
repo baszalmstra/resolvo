@@ -12,6 +12,15 @@
 //!   constraint violated, at most one solvable per package name). The merged
 //!   presence view and the conditional edges are cross-checked against the
 //!   projection.
+//! - On success, additionally (milestone M4): re-solving the same universe
+//!   with the solution's cells as the seed partition yields a verified
+//!   disjoint cover with valid projections, usually byte-identical to the
+//!   original (a minority of partitions instead HEALS: see the inline
+//!   comment); reseeding the reseeded partition is a byte-identical fixed
+//!   point; and re-solving with the seeds in REVERSE order still yields a
+//!   verified disjoint cover (the content may legitimately differ, because
+//!   generalization and disjointness repair depend on which cells were
+//!   recorded earlier).
 //! - On failure ([`UniversalFailure::Unsolvable`]): for a sample of concrete
 //!   environments inside the witness cell, brute-force enumeration over all
 //!   install sets (at most one solvable per package) confirms that no valid
@@ -21,8 +30,8 @@
 //! [`EnvTestProvider`], which is deliberately `cfg(test)`-private.
 
 use crate::{
-    Condition, ConditionId, ConditionalRequirement, EnvLiteral, EnvLiteralKind, LogicalOperator,
-    NameId, Solver, UniversalFailure, UniversalProblem, Violation,
+    CellCondition, Condition, ConditionId, ConditionalRequirement, EnvLiteral, EnvLiteralKind,
+    LogicalOperator, NameId, Solver, UniversalFailure, UniversalProblem, Violation,
     solver::env_test_provider::EnvTestProvider,
 };
 
@@ -647,6 +656,9 @@ struct Stats {
     samples_checked: usize,
     unsolvable_samples_checked: usize,
     cells_total: usize,
+    reseeded_identical: usize,
+    fixed_point_identical: usize,
+    reordered_verified: usize,
 }
 
 fn run_seed(seed: u64, stats: &mut Stats) {
@@ -670,8 +682,8 @@ fn run_seed(seed: u64, stats: &mut Stats) {
 
     let mut solver = Solver::new(provider);
     let problem = UniversalProblem::new()
-        .requirements(root_requirements)
-        .environment_model(environment_model);
+        .requirements(root_requirements.clone())
+        .environment_model(environment_model.clone());
 
     match solver.solve_universal(problem) {
         Ok(solution) => {
@@ -797,6 +809,154 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                     }
                 }
             }
+
+            // (c) Seed stability (M4): re-solve the same universe with this
+            // solution's cells as the seed partition, on the same solver
+            // (the real flow: the provider and all interned ids persist;
+            // the solver state is reset per call).
+            //
+            // The reseeded partition is NOT always byte-identical to the
+            // original: a cell's original solution can be steered by
+            // transient search state (learnt clauses from conflicts in
+            // earlier cells of the SAME run can exclude a candidate that is
+            // perfectly valid in the cell's region), while the seeded
+            // replay, which assumes the cell's condition up front and so
+            // avoids those conflicts, legitimately finds a better solution
+            // whose load-bearing support can also be more general, absorbing
+            // later seeds. This is the healing behavior of design doc 5.7;
+            // generator seed 18 is a concrete counterexample to identity.
+            // Byte-identical reproduction of conflict-free re-solves is
+            // pinned by the scenario tests in tests/solver. What must hold
+            // here unconditionally:
+            //   - the reseeded partition is a verified disjoint cover, and
+            //     its projections are valid solutions (checked on samples);
+            //   - one more reseed round is a fixed point: each cell of the
+            //     reseeded partition was just produced under exactly its own
+            //     condition as assumptions, so replaying it changes nothing.
+            let seeds: Vec<CellCondition<NameId>> = solution
+                .cells
+                .iter()
+                .map(|(condition, _)| condition.clone())
+                .collect();
+            let reseeded = match solver.solve_universal(
+                UniversalProblem::new()
+                    .requirements(root_requirements.clone())
+                    .environment_model(environment_model.clone())
+                    .seed_partition(seeds.clone()),
+            ) {
+                Ok(reseeded) => reseeded,
+                Err(failure) => panic!(
+                    "seed {seed}: seeded re-solve failed where the unseeded solve succeeded: \
+                     {failure:?}"
+                ),
+            };
+            if let Err(violations) = reseeded.verify(solver.provider()) {
+                let violations: Vec<Violation<NameId>> = violations;
+                panic!("seed {seed}: reseeded solve failed verify(): {violations:?}");
+            }
+            let mut reseeded_samples = 0;
+            for _ in 0..SAMPLE_ATTEMPTS {
+                if reseeded_samples >= 5 {
+                    break;
+                }
+                let env = sample_env(&mut rng, &universe);
+                if !model_satisfied(&universe, &env) {
+                    continue;
+                }
+                reseeded_samples += 1;
+                let provider = solver.provider();
+                let projected = reseeded
+                    .project(|literal| eval_env_literal(provider, &env_name_ids, literal, &env))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "seed {seed}: reseeded project() returned None for environment \
+                             {env:?}"
+                        )
+                    });
+                let mut installed: InstallSet = vec![None; universe.packages.len()];
+                for &solvable in projected {
+                    let resolved = provider.pool.resolve_solvable(solvable);
+                    let index = pkg_name_ids
+                        .iter()
+                        .position(|&name| name == resolved.name)
+                        .expect("solvable belongs to a generated package");
+                    installed[index] = Some(resolved.record);
+                }
+                assert!(
+                    is_valid_solution(&universe, &installed, &env),
+                    "seed {seed}: reseeded projection {installed:?} is not a valid solution \
+                     for environment {env:?}"
+                );
+            }
+            if format!("{:?}", (&solution.cells, &solution.cell_edges))
+                == format!("{:?}", (&reseeded.cells, &reseeded.cell_edges))
+            {
+                stats.reseeded_identical += 1;
+            }
+
+            // The fixed-point round: reseeding the RESEEDED partition must
+            // reproduce it byte-identically, cells and edges.
+            let reseeded_seeds: Vec<CellCondition<NameId>> = reseeded
+                .cells
+                .iter()
+                .map(|(condition, _)| condition.clone())
+                .collect();
+            let fixed_point = match solver.solve_universal(
+                UniversalProblem::new()
+                    .requirements(root_requirements.clone())
+                    .environment_model(environment_model.clone())
+                    .seed_partition(reseeded_seeds),
+            ) {
+                Ok(fixed_point) => fixed_point,
+                Err(failure) => panic!(
+                    "seed {seed}: fixed-point re-solve failed where the seeded solve \
+                     succeeded: {failure:?}"
+                ),
+            };
+            assert_eq!(
+                format!("{:?}", reseeded.cells),
+                format!("{:?}", fixed_point.cells),
+                "seed {seed}: reseeding the reseeded partition produced different cells"
+            );
+            assert_eq!(
+                format!("{:?}", reseeded.cell_edges),
+                format!("{:?}", fixed_point.cell_edges),
+                "seed {seed}: reseeding the reseeded partition produced different edges"
+            );
+            stats.fixed_point_identical += 1;
+
+            // (d) Seed order independence of VALIDITY: with the seeds in
+            // reverse order the partition may legitimately differ in
+            // CONTENT, not just order. Cell generalization records only the
+            // load-bearing literals of the solution found under the seed's
+            // assumptions, and the disjointness repair then re-specializes
+            // against whatever cells were recorded EARLIER, so a cell seeded
+            // first can absorb regions that the original enumeration split
+            // off (see the seed-order scenario test in tests/solver). The
+            // contract that does hold regardless of order: the result is a
+            // disjoint cover of the model, checked by the independent
+            // verifier.
+            if seeds.len() > 1 {
+                let mut reversed = seeds;
+                reversed.reverse();
+                let reordered = match solver.solve_universal(
+                    UniversalProblem::new()
+                        .requirements(root_requirements.clone())
+                        .environment_model(environment_model.clone())
+                        .seed_partition(reversed),
+                ) {
+                    Ok(reordered) => reordered,
+                    Err(failure) => panic!(
+                        "seed {seed}: reversed-seed solve failed where the unseeded solve \
+                         succeeded: {failure:?}"
+                    ),
+                };
+                if let Err(violations) = reordered.verify(solver.provider()) {
+                    let violations: Vec<Violation<NameId>> = violations;
+                    panic!("seed {seed}: reversed-seed solve failed verify(): {violations:?}");
+                }
+                stats.reordered_verified += 1;
+            }
         }
         Err(UniversalFailure::Unsolvable { cell, .. }) => {
             stats.unsolvable += 1;
@@ -841,13 +1001,19 @@ fn test_universal_solve_property() {
     }
     eprintln!(
         "universal property test: {} seeds ({} solved with {} cells total, {} unsolvable), \
-         {} solution samples checked, {} unsolvable samples brute-forced",
+         {} solution samples checked, {} unsolvable samples brute-forced, \
+         {}/{} seeded re-solves byte-identical, {} fixed-point rounds identical, \
+         {} reversed-seed solves verified",
         SEED_COUNT,
         stats.solved,
         stats.cells_total,
         stats.unsolvable,
         stats.samples_checked,
         stats.unsolvable_samples_checked,
+        stats.reseeded_identical,
+        stats.solved,
+        stats.fixed_point_identical,
+        stats.reordered_verified,
     );
     assert!(
         stats.solved > 0 && stats.unsolvable > 0,
@@ -856,5 +1022,21 @@ fn test_universal_solve_property() {
     assert!(
         stats.samples_checked > 0,
         "at least some environment samples must have been checked"
+    );
+    // Regression floor for the stabilizing effect of seeding. The generator
+    // is deliberately conflict-heavy, so a sizable share of partitions heals
+    // on the first reseed (about 21% at the time of writing: the original
+    // cell's solution was steered by transient learnt state, the seeded
+    // replay finds a better one); a drop below half would mean seeding lost
+    // its stabilizing effect entirely.
+    assert!(
+        stats.reseeded_identical * 2 >= stats.solved,
+        "most seeded re-solves should reproduce the partition byte-identically (got {}/{})",
+        stats.reseeded_identical,
+        stats.solved,
+    );
+    assert!(
+        stats.reordered_verified > 0,
+        "at least some multi-cell partitions must have been re-solved in reverse seed order"
     );
 }
