@@ -15,8 +15,9 @@ use std::{any::Any, marker::PhantomData};
 
 use crate::{
     CellCondition, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
-    EnvLiteral, EnvLiteralKind, EnvironmentPackage, KnownDependencies, NameId, PackageCandidates,
-    Presence, Requirement, SolvableId, VariableId, VersionSetId, VersionSetRelation,
+    EnvLiteral, EnvLiteralKind, EnvironmentPackage, Interner, KnownDependencies, NameId,
+    PackageCandidates, Presence, Requirement, SolvableId, VariableId, VersionSetId,
+    VersionSetRelation,
     conflict::Conflict,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     runtime::AsyncRuntime,
@@ -250,6 +251,168 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
                 (edge, presence)
             })
             .collect()
+    }
+
+    /// Independently re-checks the solution invariants. Uses only the
+    /// relation oracle of `provider` and the data stored in the solution (no
+    /// solver state), so it can also validate a solution reconstructed from a
+    /// serialized lockfile.
+    ///
+    /// Two invariants are checked, both in [`EnvLiteral`] space:
+    ///
+    /// - **Pairwise disjointness**: every pair of cells whose solvable sets
+    ///   differ must have provably disjoint conditions (complementary signs
+    ///   of the same literal, two positive matches literals the oracle calls
+    ///   [`VersionSetRelation::Disjoint`], or a positive absent and a
+    ///   positive matches literal of the same package). Overlap between
+    ///   cells with identical solvable sets is harmless and not reported.
+    /// - **Model coverage**: a backtracking search looks for an assignment of
+    ///   the environment literals that satisfies the environment model and
+    ///   the oracle consistency constraints but the condition of no cell;
+    ///   such an assignment describes an uncovered region.
+    ///
+    /// Note the asymmetry: `verify` *proves* violations, but it cannot
+    /// always prove their absence. When the oracle answers
+    /// [`VersionSetRelation::Unknown`], disjointness may be unprovable
+    /// without being false (reported as
+    /// [`Violation::UnprovenDisjointness`], which callers may treat as a
+    /// warning), and a reported uncovered region may be vacuous (describing
+    /// environments no real machine has). With a complete oracle both checks
+    /// are exact.
+    pub fn verify<D>(&self, provider: &D) -> Result<(), Vec<Violation<N>>>
+    where
+        D: DependencyProvider + Interner<SolvableId = Id, NameId = N>,
+    {
+        let mut violations = Vec::new();
+
+        // Pairwise disjointness for cells whose solvable sets differ.
+        for first in 0..self.cells.len() {
+            for second in first + 1..self.cells.len() {
+                if same_solvable_set(&self.cells[first].1, &self.cells[second].1) {
+                    continue;
+                }
+                match prove_env_disjoint(provider, &self.cells[first].0, &self.cells[second].0) {
+                    Disjointness::Disjoint => {}
+                    Disjointness::Overlapping => {
+                        violations.push(Violation::OverlappingCells { first, second });
+                    }
+                    Disjointness::Unproven => {
+                        violations.push(Violation::UnprovenDisjointness { first, second });
+                    }
+                }
+            }
+        }
+
+        // Model coverage.
+        if let Some(region) = self.find_uncovered_region(provider) {
+            violations.push(Violation::UncoveredRegion(region));
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
+    /// Searches for a region of the environment model that no cell covers:
+    /// an assignment of the environment literals satisfying the model
+    /// clauses, the oracle consistency constraints (derived exactly like
+    /// `SolverState::intern_env_matches_with_oracle_clauses` derives its
+    /// clauses) and the negation of every cell condition. Returns `None`
+    /// when the cells cover the entire model.
+    fn find_uncovered_region<D>(&self, provider: &D) -> Option<CellCondition<N>>
+    where
+        D: DependencyProvider + Interner<NameId = N>,
+    {
+        // Collect the distinct environment literals of the model and the
+        // cells, in deterministic first-occurrence order. Every collected
+        // literal occurs in at least one clause below.
+        let mut literals: Vec<EnvLiteral<N>> = Vec::new();
+        let cell_literals = self
+            .cells
+            .iter()
+            .flat_map(|(condition, _)| condition.0.iter());
+        for (literal, _) in self.environment_model.iter().flatten().chain(cell_literals) {
+            if !literals.contains(literal) {
+                literals.push(literal.clone());
+            }
+        }
+        let index_of = |literal: &EnvLiteral<N>| {
+            literals
+                .iter()
+                .position(|known| known == literal)
+                .expect("every model and cell literal was collected")
+        };
+
+        let mut clauses: Vec<Vec<IndexedLiteral>> = Vec::new();
+
+        // Consistency constraints between same-package literals, mirroring
+        // the clauses the solver emits on literal interning (5.2): Disjoint
+        // is mutual exclusion, Subset/Superset/Equal are implications, and
+        // an absent literal excludes every matches literal of its package.
+        for i in 0..literals.len() {
+            for j in i + 1..literals.len() {
+                if literals[i].package != literals[j].package {
+                    continue;
+                }
+                match (&literals[i].kind, &literals[j].kind) {
+                    (EnvLiteralKind::Matches(vs_i), EnvLiteralKind::Matches(vs_j)) => {
+                        match provider.environment_version_set_relation(*vs_i, *vs_j) {
+                            VersionSetRelation::Disjoint => {
+                                clauses.push(vec![(i, true), (j, true)]);
+                            }
+                            VersionSetRelation::Subset => {
+                                clauses.push(vec![(i, true), (j, false)]);
+                            }
+                            VersionSetRelation::Superset => {
+                                clauses.push(vec![(j, true), (i, false)]);
+                            }
+                            VersionSetRelation::Equal => {
+                                clauses.push(vec![(i, true), (j, false)]);
+                                clauses.push(vec![(j, true), (i, false)]);
+                            }
+                            VersionSetRelation::Unknown => {}
+                        }
+                    }
+                    (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent)
+                    | (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => {
+                        clauses.push(vec![(i, true), (j, true)]);
+                    }
+                    (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => {
+                        unreachable!("two absent literals of the same package are equal")
+                    }
+                }
+            }
+        }
+
+        // The model clauses.
+        for disjunction in &self.environment_model {
+            clauses.push(
+                disjunction
+                    .iter()
+                    .map(|(literal, positive)| (index_of(literal), !positive))
+                    .collect(),
+            );
+        }
+
+        // The negation of every cell condition: at least one of the cell's
+        // literals must evaluate opposite. A cell with the empty condition
+        // yields the empty (unsatisfiable) clause: it covers everything.
+        for (condition, _) in &self.cells {
+            clauses.push(
+                condition
+                    .0
+                    .iter()
+                    .map(|(literal, sign)| (index_of(literal), *sign))
+                    .collect(),
+            );
+        }
+
+        let assignment = find_witness_indexed(literals.len(), &clauses)?;
+        Some(CellCondition(
+            literals.into_iter().zip(assignment).collect(),
+        ))
     }
 
     /// Computes the presence condition for the cells selected by `member`:
@@ -883,6 +1046,81 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     }
 }
 
+/// Whether two cell conditions are provably disjoint, and when they are not,
+/// whether the lack of a proof involved an Unknown oracle answer.
+enum Disjointness {
+    /// The conditions are provably disjoint: no environment satisfies both.
+    Disjoint,
+    /// No disjointness proof exists and every relevant oracle answer was
+    /// definite: the conditions describe overlapping regions.
+    Overlapping,
+    /// No disjointness proof exists, but the oracle answered
+    /// [`VersionSetRelation::Unknown`] for at least one pair of positive
+    /// matches literals; the conditions may still be disjoint in reality.
+    Unproven,
+}
+
+/// Returns true when `a` and `b` contain the same solvables (as sets).
+fn same_solvable_set<Id: Eq>(a: &[Id], b: &[Id]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|solvable| b.contains(solvable))
+        && b.iter().all(|solvable| a.contains(solvable))
+}
+
+/// Decides whether two cell conditions are provably disjoint. This mirrors
+/// the solver-side `Solver::provably_disjoint` but works over public
+/// [`EnvLiteral`]s via the relation oracle: two conditions are provably
+/// disjoint when they contain complementary signs of the same literal, two
+/// positive matches literals of the same package whose version sets the
+/// oracle calls [`VersionSetRelation::Disjoint`], or a positive absent and a
+/// positive matches literal of the same package.
+fn prove_env_disjoint<N: Copy + Eq, D>(
+    provider: &D,
+    a: &CellCondition<N>,
+    b: &CellCondition<N>,
+) -> Disjointness
+where
+    D: DependencyProvider + Interner<NameId = N>,
+{
+    let mut unknown_involved = false;
+    for (lit_a, sign_a) in &a.0 {
+        for (lit_b, sign_b) in &b.0 {
+            if lit_a == lit_b {
+                if sign_a != sign_b {
+                    return Disjointness::Disjoint;
+                }
+                continue;
+            }
+            if !(*sign_a && *sign_b) || lit_a.package != lit_b.package {
+                continue;
+            }
+            match (&lit_a.kind, &lit_b.kind) {
+                (EnvLiteralKind::Matches(vs_a), EnvLiteralKind::Matches(vs_b)) => {
+                    match provider.environment_version_set_relation(*vs_a, *vs_b) {
+                        VersionSetRelation::Disjoint => return Disjointness::Disjoint,
+                        VersionSetRelation::Unknown => unknown_involved = true,
+                        VersionSetRelation::Subset
+                        | VersionSetRelation::Superset
+                        | VersionSetRelation::Equal => {}
+                    }
+                }
+                (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent)
+                | (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => {
+                    return Disjointness::Disjoint;
+                }
+                (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => {
+                    unreachable!("two absent literals of the same package are equal")
+                }
+            }
+        }
+    }
+    if unknown_involved {
+        Disjointness::Unproven
+    } else {
+        Disjointness::Overlapping
+    }
+}
+
 /// Simplifies a disjunction of conjunctions (the disjuncts of a
 /// [`Presence`]): repeatedly merges any two disjuncts that contain exactly
 /// the same literals and differ in the sign of exactly one (dropping that
@@ -1171,6 +1409,222 @@ mod test {
         cuda absent -> [a=1]
         cuda in 11..100 -> [a=1]
         ");
+    }
+
+    /// The enumerated solution of a real solve passes the independent
+    /// verifier: the cells are provably disjoint (the repair step appended a
+    /// distinguishing literal) and together cover the model.
+    #[test]
+    fn test_verify_accepts_enumerated_solution() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("glibc", false);
+        let glibc_217 = provider.version_set("glibc", 217, 1000);
+        let glibc_228 = provider.version_set("glibc", 228, 1000);
+        let glibc_name = provider.pool.intern_package_name("glibc");
+        let pkg_2 = provider.add_package("pkg", 2);
+        let pkg_1 = provider.add_package("pkg", 1);
+        provider.set_dependencies(pkg_2, vec![glibc_228.into()], vec![]);
+        provider.set_dependencies(pkg_1, vec![glibc_217.into()], vec![]);
+        let pkg_any = provider.version_set("pkg", 0, 3);
+
+        let mut solver = Solver::new(provider);
+        let problem = UniversalProblem::new()
+            .requirements(vec![pkg_any.into()])
+            .environment_model(vec![vec![(
+                EnvLiteral {
+                    package: glibc_name,
+                    kind: EnvLiteralKind::Matches(glibc_217),
+                },
+                true,
+            )]]);
+        let solution = solver.solve_universal(problem).expect("solvable");
+
+        assert_eq!(solution.verify(solver.provider()), Ok(()));
+    }
+
+    /// A hand-built solution that covers only the `absent` half of an
+    /// `absent OR matches` model: the verifier reports the uncovered
+    /// region. The region assignment is deterministic (literals in
+    /// model-then-cells order, false tried first): `matches` must be true
+    /// (the model and the missing cell leave only that region) and `absent`
+    /// false (oracle exclusion).
+    #[test]
+    fn test_verify_reports_uncovered_region() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("cuda", true);
+        let cuda_11 = provider.version_set("cuda", 11, 100);
+        let cuda_name = provider.pool.intern_package_name("cuda");
+        let a = provider.add_package("a", 1);
+        let matches_lit = EnvLiteral {
+            package: cuda_name,
+            kind: EnvLiteralKind::Matches(cuda_11),
+        };
+        let absent_lit = EnvLiteral {
+            package: cuda_name,
+            kind: EnvLiteralKind::Absent,
+        };
+
+        let solution: UniversalSolution = UniversalSolution {
+            cells: vec![(CellCondition(vec![(absent_lit.clone(), true)]), vec![a])],
+            environment_model: vec![vec![
+                (matches_lit.clone(), true),
+                (absent_lit.clone(), true),
+            ]],
+            cell_edges: vec![vec![]],
+        };
+
+        assert_eq!(
+            solution.verify(&provider),
+            Err(vec![Violation::UncoveredRegion(CellCondition(vec![
+                (matches_lit, true),
+                (absent_lit, false),
+            ]))])
+        );
+    }
+
+    /// Two cells with different solvable sets whose conditions genuinely
+    /// overlap (an empty condition overlaps everything) and involve no
+    /// Unknown oracle answer: OverlappingCells. Coverage is fine because the
+    /// empty cell condition covers every environment.
+    #[test]
+    fn test_verify_reports_overlapping_cells() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("cuda", true);
+        let cuda_11 = provider.version_set("cuda", 11, 100);
+        let cuda_name = provider.pool.intern_package_name("cuda");
+        let a1 = provider.add_package("a", 1);
+        let a2 = provider.add_package("a", 2);
+
+        let solution: UniversalSolution = UniversalSolution {
+            cells: vec![
+                (CellCondition(vec![]), vec![a1]),
+                (
+                    CellCondition(vec![(
+                        EnvLiteral {
+                            package: cuda_name,
+                            kind: EnvLiteralKind::Matches(cuda_11),
+                        },
+                        true,
+                    )]),
+                    vec![a2],
+                ),
+            ],
+            environment_model: vec![],
+            cell_edges: vec![vec![], vec![]],
+        };
+
+        assert_eq!(
+            solution.verify(&provider),
+            Err(vec![Violation::OverlappingCells {
+                first: 0,
+                second: 1
+            }])
+        );
+    }
+
+    /// Two cells with different solvable sets whose only same-package literal
+    /// pair gets an Unknown oracle answer (partially overlapping ranges):
+    /// UnprovenDisjointness, which callers may treat as a warning. The model
+    /// makes coverage pass so the unproven pair is the only violation.
+    #[test]
+    fn test_verify_reports_unproven_disjointness() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("cuda", true);
+        let cuda_0_5 = provider.version_set("cuda", 0, 5);
+        let cuda_3_8 = provider.version_set("cuda", 3, 8);
+        let cuda_name = provider.pool.intern_package_name("cuda");
+        let a1 = provider.add_package("a", 1);
+        let a2 = provider.add_package("a", 2);
+        let lit_0_5 = EnvLiteral {
+            package: cuda_name,
+            kind: EnvLiteralKind::Matches(cuda_0_5),
+        };
+        let lit_3_8 = EnvLiteral {
+            package: cuda_name,
+            kind: EnvLiteralKind::Matches(cuda_3_8),
+        };
+
+        let solution: UniversalSolution = UniversalSolution {
+            cells: vec![
+                (CellCondition(vec![(lit_0_5.clone(), true)]), vec![a1]),
+                (CellCondition(vec![(lit_3_8.clone(), true)]), vec![a2]),
+            ],
+            environment_model: vec![vec![(lit_0_5, true), (lit_3_8, true)]],
+            cell_edges: vec![vec![], vec![]],
+        };
+
+        assert_eq!(
+            solution.verify(&provider),
+            Err(vec![Violation::UnprovenDisjointness {
+                first: 0,
+                second: 1
+            }])
+        );
+    }
+
+    /// Overlapping cells with IDENTICAL solvable sets are harmless (the
+    /// merge step ORs them) and not reported.
+    #[test]
+    fn test_verify_accepts_identical_solvable_overlap() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("cuda", true);
+        let cuda_11 = provider.version_set("cuda", 11, 100);
+        let cuda_name = provider.pool.intern_package_name("cuda");
+        let a = provider.add_package("a", 1);
+
+        let solution: UniversalSolution = UniversalSolution {
+            cells: vec![
+                (CellCondition(vec![]), vec![a]),
+                (
+                    CellCondition(vec![(
+                        EnvLiteral {
+                            package: cuda_name,
+                            kind: EnvLiteralKind::Matches(cuda_11),
+                        },
+                        true,
+                    )]),
+                    vec![a],
+                ),
+            ],
+            environment_model: vec![],
+            cell_edges: vec![vec![], vec![]],
+        };
+
+        assert_eq!(solution.verify(&provider), Ok(()));
+    }
+
+    /// Cells distinguished only by two different positive matches literals
+    /// are accepted when the oracle proves the version sets disjoint, and
+    /// coverage holds because the model restricts the space to the union of
+    /// the two ranges.
+    #[test]
+    fn test_verify_accepts_oracle_disjoint_cells() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("cuda", true);
+        let cuda_0_2 = provider.version_set("cuda", 0, 2);
+        let cuda_5_9 = provider.version_set("cuda", 5, 9);
+        let cuda_name = provider.pool.intern_package_name("cuda");
+        let a1 = provider.add_package("a", 1);
+        let a2 = provider.add_package("a", 2);
+        let lit_0_2 = EnvLiteral {
+            package: cuda_name,
+            kind: EnvLiteralKind::Matches(cuda_0_2),
+        };
+        let lit_5_9 = EnvLiteral {
+            package: cuda_name,
+            kind: EnvLiteralKind::Matches(cuda_5_9),
+        };
+
+        let solution: UniversalSolution = UniversalSolution {
+            cells: vec![
+                (CellCondition(vec![(lit_0_2.clone(), true)]), vec![a1]),
+                (CellCondition(vec![(lit_5_9.clone(), true)]), vec![a2]),
+            ],
+            environment_model: vec![vec![(lit_0_2, true), (lit_5_9, true)]],
+            cell_edges: vec![vec![], vec![]],
+        };
+
+        assert_eq!(solution.verify(&provider), Ok(()));
     }
 
     /// Helper for the simplification unit tests: a matches literal for
