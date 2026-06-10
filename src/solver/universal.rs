@@ -955,15 +955,90 @@ fn merge_disjunct_pair<N: Copy + Eq>(
     Some(CellCondition(merged))
 }
 
+/// A signed literal over a dense witness-search variable index: `(index,
+/// negate)`. The literal evaluates to true when the variable at `index` is
+/// assigned the opposite of `negate`.
+type IndexedLiteral = (usize, bool);
+
 /// A dedicated backtracking search for an assignment satisfying all the
-/// given clauses. The number of environment literals is small, so a simple
-/// exhaustive search with clause-violation pruning is sufficient; the main
-/// CDCL machinery is deliberately not reused here (design doc 5.5).
+/// given clauses, generic over a dense variable index so that it is reusable
+/// both over solver `VariableId`s (the coverage-termination check of the
+/// enumeration loop, see [`find_witness`]) and over public [`EnvLiteral`]s
+/// (the post-hoc verifier, see [`UniversalSolution::verify`]).
 ///
-/// Variables are assigned in ascending variable-id order and `false` is
-/// tried first, matching the split policy (environment literals default to
-/// false), so the witness stays as close to the baseline machine as
-/// possible and the search is deterministic.
+/// The number of environment literals is small, so a simple exhaustive
+/// search with clause-violation pruning is sufficient; the main CDCL
+/// machinery is deliberately not reused here (design doc 5.5).
+///
+/// Variables are assigned in ascending index order and `false` is tried
+/// first, matching the split policy (environment literals default to false),
+/// so the witness stays as close to the baseline machine as possible and the
+/// search is deterministic. Returns one value per variable index, or `None`
+/// when no assignment satisfies all clauses.
+fn find_witness_indexed(
+    variable_count: usize,
+    clauses: &[Vec<IndexedLiteral>],
+) -> Option<Vec<bool>> {
+    debug_assert!(
+        clauses
+            .iter()
+            .flatten()
+            .all(|&(index, _)| index < variable_count),
+        "every clause literal must reference a variable below `variable_count`"
+    );
+    let mut assignment: Vec<Option<bool>> = vec![None; variable_count];
+    if search_indexed(clauses, &mut assignment, 0) {
+        Some(
+            assignment
+                .into_iter()
+                .map(|value| value.expect("the search assigns every variable"))
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Recursive helper of [`find_witness_indexed`]: tries to extend the partial
+/// `assignment` from `depth` onwards. Returns true when a satisfying total
+/// assignment was found (left in `assignment`).
+fn search_indexed(
+    clauses: &[Vec<IndexedLiteral>],
+    assignment: &mut [Option<bool>],
+    depth: usize,
+) -> bool {
+    // Prune: a clause whose literals are all assigned and false can never
+    // be satisfied by extending the assignment.
+    let violated = clauses.iter().any(|clause| {
+        clause
+            .iter()
+            .all(|&(index, negate)| assignment[index] == Some(negate))
+    });
+    if violated {
+        return false;
+    }
+
+    if depth == assignment.len() {
+        return true;
+    }
+
+    for value in [false, true] {
+        assignment[depth] = Some(value);
+        if search_indexed(clauses, assignment, depth + 1) {
+            return true;
+        }
+    }
+    assignment[depth] = None;
+    false
+}
+
+/// Searches for an assignment of solver variables satisfying all the given
+/// clauses by mapping the variables onto a dense index for
+/// [`find_witness_indexed`].
+///
+/// The search scope is exactly the variables that occur in the clauses;
+/// unconstrained variables are left out of the witness, mirroring how cells
+/// record only load-bearing literals.
 fn find_witness(clauses: &[Vec<Literal>]) -> Option<Vec<(VariableId, bool)>> {
     let mut variables: Vec<VariableId> = clauses
         .iter()
@@ -973,65 +1048,23 @@ fn find_witness(clauses: &[Vec<Literal>]) -> Option<Vec<(VariableId, bool)>> {
     variables.sort_by_key(|variable| variable.to_index());
     variables.dedup();
 
-    let mut assignment: Vec<Option<bool>> = vec![None; variables.len()];
-    if search(clauses, &variables, &mut assignment, 0) {
-        Some(
-            variables
-                .iter()
-                .zip(assignment)
-                .map(|(&variable, value)| {
-                    (variable, value.expect("the search assigns every variable"))
-                })
-                .collect(),
-        )
-    } else {
-        None
-    }
-}
-
-/// Recursive helper of [`find_witness`]: tries to extend the partial
-/// `assignment` from `depth` onwards. Returns true when a satisfying total
-/// assignment was found (left in `assignment`).
-fn search(
-    clauses: &[Vec<Literal>],
-    variables: &[VariableId],
-    assignment: &mut [Option<bool>],
-    depth: usize,
-) -> bool {
-    // Prune: a clause whose literals are all assigned and false can never
-    // be satisfied by extending the assignment.
-    let value_of = |variable: VariableId, assignment: &[Option<bool>]| {
-        let index = variables
+    let index_of = |variable: VariableId| {
+        variables
             .binary_search_by_key(&variable.to_index(), |v| v.to_index())
-            .expect("every clause variable is in `variables`");
-        assignment[index]
+            .expect("every clause variable is in `variables`")
     };
-    let violated = clauses.iter().any(|clause| {
-        clause.iter().all(|literal| {
-            match value_of(literal.variable(), assignment) {
-                // The literal evaluates to false.
-                Some(value) => value == literal.negate(),
-                // Unassigned: the clause is not yet violated.
-                None => false,
-            }
+    let indexed_clauses: Vec<Vec<IndexedLiteral>> = clauses
+        .iter()
+        .map(|clause| {
+            clause
+                .iter()
+                .map(|literal| (index_of(literal.variable()), literal.negate()))
+                .collect()
         })
-    });
-    if violated {
-        return false;
-    }
+        .collect();
 
-    if depth == variables.len() {
-        return true;
-    }
-
-    for value in [false, true] {
-        assignment[depth] = Some(value);
-        if search(clauses, variables, assignment, depth + 1) {
-            return true;
-        }
-    }
-    assignment[depth] = None;
-    false
+    let assignment = find_witness_indexed(variables.len(), &indexed_clauses)?;
+    Some(variables.into_iter().zip(assignment).collect())
 }
 
 #[cfg(test)]
@@ -1275,5 +1308,27 @@ mod test {
             find_witness(&clauses),
             Some(vec![(VariableId::from_index(3), true)])
         );
+    }
+
+    /// The indexed search tries `false` first: for `(x0 or x1)` the witness
+    /// is `x0 = false, x1 = true`.
+    #[test]
+    fn test_find_witness_indexed_false_first() {
+        let clauses = vec![vec![(0, false), (1, false)]];
+        assert_eq!(find_witness_indexed(2, &clauses), Some(vec![false, true]));
+    }
+
+    /// The indexed search assigns every variable, including ones that occur
+    /// in no clause (they default to false).
+    #[test]
+    fn test_find_witness_indexed_assigns_unconstrained_variables() {
+        let clauses = vec![vec![(1, true)]];
+        assert_eq!(find_witness_indexed(2, &clauses), Some(vec![false, false]));
+    }
+
+    /// An empty clause is unsatisfiable: no witness.
+    #[test]
+    fn test_find_witness_indexed_empty_clause() {
+        assert_eq!(find_witness_indexed(2, &[vec![]]), None);
     }
 }
