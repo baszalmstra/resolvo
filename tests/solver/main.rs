@@ -1679,6 +1679,28 @@ fn test_universal_candidate_split_generalization() {
     ");
 }
 
+/// Implied literals are dropped from cell conditions. Three packages with
+/// nested glibc floors (>=217, >=228, >=234, same upper bound) are all
+/// load bearing, but `glibc >=234` implies the other two (the oracle proves
+/// the subset relations), so the condition is just the strongest literal
+/// instead of the three-way conjunction.
+#[test]
+fn test_universal_condition_drops_implied_literals() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("a", Pack::new(1), &["glibc 217..1000"], &[]);
+    provider.add_package("b", Pack::new(1), &["glibc 228..1000"], &[]);
+    provider.add_package("c", Pack::new(1), &["glibc 234..1000"], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a", "b", "c"], &[&["glibc 234..1000"]]);
+    assert_snapshot!(result, @r"
+    cell: glibc in >=234, <1000
+      a=1
+      b=1
+      c=1
+    ");
+}
+
 /// Scenario (c): constrains split with an uncovered unsolvable gap. `a`
 /// constrains `cuda >=11` and the model allows `cuda absent OR cuda >=10`.
 /// The cells for `cuda absent` and `cuda >=11` are solvable, but the region
@@ -1692,7 +1714,7 @@ fn test_universal_constrains_split_unsolvable_gap() {
     provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
 
     let result = universal_solve_snapshot(provider, &["a"], &[&["cuda absent", "cuda 10..100"]]);
-    assert_snapshot!(result, @"unsolvable in cell: not (cuda absent) AND cuda in >=10, <100 AND not (cuda in >=11, <100)");
+    assert_snapshot!(result, @"unsolvable in cell: cuda in >=10, <100 AND not (cuda in >=11, <100)");
 }
 
 /// Scenario (d): non-fragmentation. An environment package that is declared
@@ -1722,7 +1744,7 @@ fn test_universal_unsolvable_region() {
     provider.add_package("a", Pack::new(1), &["glibc 228..1000"], &[]);
 
     let result = universal_solve_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
-    assert_snapshot!(result, @"unsolvable in cell: glibc in >=217, <228 AND not (glibc in >=228, <1000)");
+    assert_snapshot!(result, @"unsolvable in cell: glibc in >=217, <228");
 }
 
 /// Two independent conditional dependencies on different environment
@@ -2684,7 +2706,7 @@ fn test_m5_conflict_display_requires_env_package() {
 
     let result = universal_failure_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
     assert_snapshot!(result, @r"
-    cell: glibc in >=217, <228 AND not (glibc in >=228, <1000)
+    cell: glibc in >=217, <228
     The following packages are incompatible
     └─ a * cannot be installed because there are no viable options:
        └─ a 1 would require
@@ -2732,7 +2754,7 @@ fn test_m5_conflict_display_env_constrains_scoped() {
 
     let result = universal_failure_snapshot(provider, &["a"], &[&["cuda absent", "cuda 10..100"]]);
     assert_snapshot!(result, @r"
-    cell: not (cuda absent) AND cuda in >=10, <100 AND not (cuda in >=11, <100)
+    cell: cuda in >=10, <100 AND not (cuda in >=11, <100)
     The following packages are incompatible
     └─ a * cannot be installed because there are no viable options:
        └─ a 1 would constrain

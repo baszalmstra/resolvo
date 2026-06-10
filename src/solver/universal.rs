@@ -1413,24 +1413,24 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Converts a cell in solver variable space to the public
     /// [`CellCondition`] representation via the variable origins.
     fn cell_to_condition(&self, cell: &[(VariableId, bool)]) -> CellCondition<D::NameId> {
-        CellCondition(
-            cell.iter()
-                .map(|&(variable, value)| {
-                    let literal = match self.state.variable_map.origin(variable) {
-                        VariableOrigin::EnvMatches(version_set) => EnvLiteral {
-                            package: self.provider().version_set_name(version_set),
-                            kind: EnvLiteralKind::Matches(version_set),
-                        },
-                        VariableOrigin::EnvAbsent(package) => EnvLiteral {
-                            package,
-                            kind: EnvLiteralKind::Absent,
-                        },
-                        _ => unreachable!("cell literals are always environment literal variables"),
-                    };
-                    (literal, value)
-                })
-                .collect(),
-        )
+        let literals = cell
+            .iter()
+            .map(|&(variable, value)| {
+                let literal = match self.state.variable_map.origin(variable) {
+                    VariableOrigin::EnvMatches(version_set) => EnvLiteral {
+                        package: self.provider().version_set_name(version_set),
+                        kind: EnvLiteralKind::Matches(version_set),
+                    },
+                    VariableOrigin::EnvAbsent(package) => EnvLiteral {
+                        package,
+                        kind: EnvLiteralKind::Absent,
+                    },
+                    _ => unreachable!("cell literals are always environment literal variables"),
+                };
+                (literal, value)
+            })
+            .collect();
+        CellCondition(simplify_condition_literals(self.provider(), literals))
     }
 
     /// Searches for an assignment of the environment literal variables that
@@ -1467,8 +1467,8 @@ enum Disjointness {
     /// definite: the conditions describe overlapping regions.
     Overlapping,
     /// No disjointness proof exists, but the oracle answered
-    /// [`VersionSetRelation::Unknown`] for at least one pair of positive
-    /// matches literals; the conditions may still be disjoint in reality.
+    /// [`VersionSetRelation::Unknown`] for at least one pair of matches
+    /// literals; the conditions may still be disjoint in reality.
     Unproven,
 }
 
@@ -1479,13 +1479,81 @@ fn same_solvable_set<Id: Eq>(a: &[Id], b: &[Id]) -> bool {
         && b.iter().all(|solvable| a.contains(solvable))
 }
 
+/// Removes every literal of a conjunction that is implied by another literal
+/// of the same conjunction, e.g. `glibc >=2.17 AND glibc >=2.34` simplifies
+/// to `glibc >=2.34`. Dropping an implied literal preserves the described
+/// region exactly, so conditions stay interchangeable with their unsimplified
+/// form for seeding, projection and verification.
+///
+/// Implications come from the relation oracle and the absent semantics; only
+/// definitive answers are used ([`VersionSetRelation::Unknown`] never drops a
+/// literal):
+/// - positive `A` implies positive `B` when `A` is a subset of (or equal to)
+///   `B`,
+/// - positive `A` implies `not B` when `A` and `B` are disjoint, which also
+///   covers the built-in disjointness of matches and absent literals,
+/// - `not A` implies `not B` when `B` is a subset of (or equal to) `A`.
+///
+/// When two literals mutually imply each other (equal version sets), the
+/// first occurrence wins, keeping the output deterministic. A literal that
+/// implies an earlier kept literal replaces it, so the strongest literal of
+/// a chain is kept regardless of input order.
+fn simplify_condition_literals<N: Copy + Eq, D>(
+    provider: &D,
+    literals: Vec<(EnvLiteral<N>, bool)>,
+) -> Vec<(EnvLiteral<N>, bool)>
+where
+    D: DependencyProvider + Interner<NameId = N>,
+{
+    let implies = |a: &(EnvLiteral<N>, bool), b: &(EnvLiteral<N>, bool)| -> bool {
+        if a.0.package != b.0.package {
+            return false;
+        }
+        match ((&a.0.kind, a.1), (&b.0.kind, b.1)) {
+            ((&EnvLiteralKind::Matches(va), true), (&EnvLiteralKind::Matches(vb), true)) => {
+                matches!(
+                    provider.environment_version_set_relation(va, vb),
+                    VersionSetRelation::Subset | VersionSetRelation::Equal
+                )
+            }
+            ((&EnvLiteralKind::Matches(va), true), (&EnvLiteralKind::Matches(vb), false)) => {
+                matches!(
+                    provider.environment_version_set_relation(va, vb),
+                    VersionSetRelation::Disjoint
+                )
+            }
+            ((EnvLiteralKind::Matches(_), true), (EnvLiteralKind::Absent, false))
+            | ((EnvLiteralKind::Absent, true), (EnvLiteralKind::Matches(_), false)) => true,
+            ((&EnvLiteralKind::Matches(va), false), (&EnvLiteralKind::Matches(vb), false)) => {
+                matches!(
+                    provider.environment_version_set_relation(vb, va),
+                    VersionSetRelation::Subset | VersionSetRelation::Equal
+                )
+            }
+            _ => false,
+        }
+    };
+
+    let mut kept: Vec<(EnvLiteral<N>, bool)> = Vec::with_capacity(literals.len());
+    for literal in literals {
+        if kept.iter().any(|k| implies(k, &literal)) {
+            continue;
+        }
+        kept.retain(|k| !implies(&literal, k));
+        kept.push(literal);
+    }
+    kept
+}
+
 /// Decides whether two cell conditions are provably disjoint. This mirrors
 /// the solver-side `Solver::provably_disjoint` but works over public
 /// [`EnvLiteral`]s via the relation oracle: two conditions are provably
 /// disjoint when they contain complementary signs of the same literal, two
 /// positive matches literals of the same package whose version sets the
-/// oracle calls [`VersionSetRelation::Disjoint`], or a positive absent and a
-/// positive matches literal of the same package.
+/// oracle calls [`VersionSetRelation::Disjoint`], a positive absent and a
+/// positive matches literal of the same package, or a positive matches
+/// literal in one and a negated superset (or equal) matches literal of the
+/// same package in the other.
 fn prove_env_disjoint<N: Copy + Eq, D>(
     provider: &D,
     a: &CellCondition<N>,
@@ -1503,26 +1571,58 @@ where
                 }
                 continue;
             }
-            if !(*sign_a && *sign_b) || lit_a.package != lit_b.package {
+            if lit_a.package != lit_b.package {
                 continue;
             }
-            match (&lit_a.kind, &lit_b.kind) {
-                (EnvLiteralKind::Matches(vs_a), EnvLiteralKind::Matches(vs_b)) => {
-                    match provider.environment_version_set_relation(*vs_a, *vs_b) {
-                        VersionSetRelation::Disjoint => return Disjointness::Disjoint,
+            match (sign_a, sign_b) {
+                (true, true) => match (&lit_a.kind, &lit_b.kind) {
+                    (EnvLiteralKind::Matches(vs_a), EnvLiteralKind::Matches(vs_b)) => {
+                        match provider.environment_version_set_relation(*vs_a, *vs_b) {
+                            VersionSetRelation::Disjoint => return Disjointness::Disjoint,
+                            VersionSetRelation::Unknown => unknown_involved = true,
+                            VersionSetRelation::Subset
+                            | VersionSetRelation::Superset
+                            | VersionSetRelation::Equal => {}
+                        }
+                    }
+                    (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent)
+                    | (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => {
+                        return Disjointness::Disjoint;
+                    }
+                    (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => {
+                        unreachable!("two absent literals of the same package are equal")
+                    }
+                },
+                // One condition requires a region the other excludes:
+                // `A` and `not B` are disjoint when `A` is a subset of (or
+                // equal to) `B`. This rule keeps the prover complete for
+                // simplified conditions, where the same-literal complement
+                // pair may have been dropped as implied (e.g. one cell kept
+                // `glibc >=2.34` while the other kept `not (glibc >=2.28)`).
+                // Mixed-sign pairs involving an absent literal prove
+                // nothing: `A` implies `not absent`, and `absent` implies
+                // `not A`, so the regions are compatible.
+                (true, false) | (false, true) => {
+                    let (positive, negative) = if *sign_a {
+                        (&lit_a.kind, &lit_b.kind)
+                    } else {
+                        (&lit_b.kind, &lit_a.kind)
+                    };
+                    let (EnvLiteralKind::Matches(vs_pos), EnvLiteralKind::Matches(vs_neg)) =
+                        (positive, negative)
+                    else {
+                        continue;
+                    };
+                    match provider.environment_version_set_relation(*vs_pos, *vs_neg) {
+                        VersionSetRelation::Subset | VersionSetRelation::Equal => {
+                            return Disjointness::Disjoint;
+                        }
                         VersionSetRelation::Unknown => unknown_involved = true,
-                        VersionSetRelation::Subset
-                        | VersionSetRelation::Superset
-                        | VersionSetRelation::Equal => {}
+                        VersionSetRelation::Disjoint | VersionSetRelation::Superset => {}
                     }
                 }
-                (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent)
-                | (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => {
-                    return Disjointness::Disjoint;
-                }
-                (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => {
-                    unreachable!("two absent literals of the same package are equal")
-                }
+                // Two excluded regions never prove disjointness.
+                (false, false) => {}
             }
         }
     }
