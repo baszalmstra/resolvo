@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ConflictGraph` and `ConflictNode` now carry a second generic parameter `N`
+  (the name-id type) and expose two new node variants: `EnvMatches(VersionSetId)`
+  and `EnvAbsent(N)` for environment-literal nodes. `ConflictCause` gains
+  `EnvConstrains(VersionSetId)` and `EnvMutuallyExclusive` variants.
+- `UniversalFailure::Unsolvable` now reports a conflict that is scoped to the
+  failing witness region via a targeted re-solve, rather than the unscoped
+  conflict produced by the initial free enumeration.
+
+### Fixed
+
+- `Conflict::graph()` no longer panics when the conflict involves requirements
+  on environment packages (`PackageCandidates::Environment`). Those requirements
+  are now routed to the `UnresolvedDependency` node, and `EnvConstrains` /
+  `EnvOracleConsistency` clauses are rendered as conflict edges in the graph.
+- `Conflict::display_user_friendly()` no longer panics for universal-solve
+  failures that involve environment-package requirements or constraints.
+
 ## [0.10.4](https://github.com/prefix-dev/resolvo/compare/resolvo-v0.10.3...resolvo-v0.10.4) - 2026-06-02
 
 ### Other

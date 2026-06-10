@@ -232,12 +232,12 @@ pub(crate) struct SolverState<D: DependencyProvider> {
 
     /// The payloads of `Clause::EnvConstrains` clauses, stored out-of-line
     /// (like `learnt_clauses`) to keep the `Clause` enum small.
-    env_constrains: Arena<EnvConstrainsId, EnvConstrainsClause>,
+    pub(crate) env_constrains: Arena<EnvConstrainsId, EnvConstrainsClause>,
 
     /// The payloads of `Clause::EnvClause` clauses (environment model and
     /// blocking clauses), stored out-of-line to keep the `Clause` enum small.
     /// Only populated by `solve_universal`.
-    env_clauses: Arena<EnvClauseId, EnvClause>,
+    pub(crate) env_clauses: Arena<EnvClauseId, EnvClause>,
 
     /// The clause ids of all `Clause::EnvClause` clauses, iterated during
     /// propagation to apply single-literal clauses as assertions (mirrors

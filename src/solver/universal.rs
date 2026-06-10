@@ -10,6 +10,26 @@
 //! dedicated witness search over the environment-only clauses decides whether
 //! the environment model is fully covered (success) or an uncovered region
 //! remains that is unsolvable (failure).
+//!
+//! # Conflict reporting
+//!
+//! When [`Solver::solve_universal`] returns
+//! [`UniversalFailure::Unsolvable`], the embedded [`Conflict`] has been
+//! scoped to the failing witness region by a targeted re-solve. This means
+//! the conflict graph returned by [`Conflict::graph`] and the human-readable
+//! message returned by [`Conflict::display_user_friendly`] only reference
+//! clauses that are relevant within the specific cell where the formula is
+//! unsatisfiable.
+//!
+//! Environment-package requirements (packages declared via
+//! [`PackageCandidates::Environment`]) are handled without panicking:
+//! they appear as "no candidates" edges in the conflict graph rather than
+//! attempting to enumerate concrete solvables (which would panic because no
+//! such solvables exist for environment packages). Constraints placed on
+//! environment packages by solvables appear as conflict edges pointing to
+//! [`ConflictNode::EnvMatches`](crate::conflict::ConflictNode::EnvMatches) or
+//! [`ConflictNode::EnvAbsent`](crate::conflict::ConflictNode::EnvAbsent) nodes
+//! in the graph.
 
 use std::{any::Any, marker::PhantomData};
 
@@ -497,11 +517,9 @@ pub enum UniversalFailure<N = NameId> {
     Unsolvable {
         /// A witness region of the environment model that is unsolvable.
         cell: CellCondition<N>,
-        /// The conflict produced by the failing solve.
-        ///
-        /// Note: in M2 the conflict is not yet scoped to the witness region;
-        /// it is the conflict of the unconstrained re-solve. Precisely
-        /// scoping it requires solving under assumptions (M4).
+        /// The conflict produced by the scoped re-solve, tightly bound to
+        /// the witness region. This conflict's display only references
+        /// clauses that are relevant within the identified cell.
         conflict: Conflict,
     },
     /// The solving process was cancelled.
@@ -659,9 +677,18 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             // An uncovered region exists and is unsolvable:
                             // the whole universal solve fails (the model is
                             // total).
+                            //
+                            // Scope the conflict to the witness region by
+                            // re-solving with unit Model clauses that pin each
+                            // witness literal to its value. The scoped re-solve
+                            // must also be UNSAT (the region is unsolvable),
+                            // and its conflict is scoped to exactly the clauses
+                            // that fire in that region.
+                            let scoped_conflict =
+                                self.run_scoped_conflict(&witness, conflict, &root_dependencies);
                             return Err(UniversalFailure::Unsolvable {
                                 cell: self.cell_to_condition(&witness),
-                                conflict,
+                                conflict: scoped_conflict,
                             });
                         }
                     }
@@ -674,6 +701,51 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             environment_model,
             cell_edges,
         })
+    }
+
+    /// Performs a scoped re-solve to produce a conflict that is tightly
+    /// bound to the witness region identified by `witness`.
+    ///
+    /// The formula is already UNSAT (the `fallback` conflict was just
+    /// produced). Adding unit [`EnvClauseKind::Model`] clauses that pin each
+    /// witness literal to its witnessed value keeps it UNSAT while scoping
+    /// the CDCL to the specific region. The resulting conflict graph will
+    /// only reference clauses that matter in that region.
+    ///
+    /// If for any reason the re-solve produces `Ok` (which should not happen
+    /// for a well-formed witness), the `fallback` conflict is returned
+    /// unchanged.
+    fn run_scoped_conflict(
+        &mut self,
+        witness: &[(VariableId, bool)],
+        fallback: Conflict,
+        root_dependencies: &Dependencies,
+    ) -> Conflict {
+        // Undo all decisions so that add_env_clause can initialize its
+        // watch lists on a clean decision stack.
+        self.state.assumption_levels = 0;
+        self.state.decision_tracker.undo_until(0);
+
+        // Add each witness literal as a unit Model clause. Unit clauses are
+        // re-asserted on every propagation pass (mirroring single-literal
+        // learnt clauses), so they will immediately force the variable.
+        for &(variable, value) in witness {
+            // A unit clause [L] forces L to be true. For a positive literal
+            // (value = true) L is satisfied iff variable = true, so
+            // negate = false. For a negative literal (value = false) L is
+            // satisfied iff variable = false, so negate = true.
+            let literal = Literal::new(variable, !value);
+            self.state
+                .add_env_clause(vec![literal], EnvClauseKind::Model);
+        }
+
+        // Re-solve. The formula is UNSAT in this region, so we expect an
+        // Unsolvable result.
+        match self.run_sat(SolvableIdOrRoot::root(), root_dependencies) {
+            Err(UnsolvableOrCancelled::Unsolvable(scoped)) => scoped,
+            // Unexpected: fall back to the unscoped conflict.
+            _ => fallback,
+        }
     }
 
     /// Returns the solvables chosen by the current solution in canonical

@@ -2630,3 +2630,105 @@ fn test_constrains_multiple_parents() {
     x=1
     "###);
 }
+
+// ===========================================================================
+// M5: Conflict reporting for environment literals
+// ===========================================================================
+
+/// Formats a universal failure for inline snapshot assertions: shows the
+/// witness cell and the full conflict display. Used by M5 tests.
+fn universal_failure_snapshot(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> String {
+    use std::fmt::Write;
+
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model);
+    match solver.solve_universal(problem) {
+        Ok(_) => panic!("expected UniversalFailure::Unsolvable, but solve succeeded"),
+        Err(UniversalFailure::Unsolvable { cell, conflict }) => {
+            let mut buf = String::new();
+            writeln!(buf, "cell: {}", cell.display(solver.provider())).unwrap();
+            writeln!(buf, "{}", conflict.display_user_friendly(&solver)).unwrap();
+            buf
+        }
+        Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+    }
+}
+
+/// (M5-a) Scoped conflict for `test_universal_unsolvable_region`: `a=1`
+/// requires `glibc >=228`, but the only modeled region has `glibc in
+/// [217, 228)`.  After the scoped re-solve the conflict display must mention
+/// the requirement on the environment literal without panicking.
+#[test]
+fn test_m5_conflict_display_requires_env_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("a", Pack::new(1), &["glibc 228..1000"], &[]);
+
+    let result = universal_failure_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
+    assert_snapshot!(result, @r"
+    cell: glibc in >=217, <228 AND not (glibc in >=228, <1000)
+    a * cannot be installed because there are no viable options:
+    └─ a 1 would require
+       └─ glibc >=228, <1000, for which no candidates were found.
+    ");
+}
+
+/// (M5-b) Plain solve with two disjoint requirements on the same env package:
+/// the oracle consistency clause is in the conflict but the display must not
+/// panic. Both requirements appear as missing (no concrete solvables).
+#[test]
+fn test_m5_conflict_display_oracle_disjoint() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let requirements = provider.requirements(&["cuda 0..5", "cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    match solver.solve(problem) {
+        Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
+            let display = conflict.display_user_friendly(&solver).to_string();
+            // Must not panic, and must mention both environment requirements.
+            assert_snapshot!(display, @r"
+            No candidates were found for cuda >=0, <5.
+            No candidates were found for cuda >=11, <100.
+            ");
+        }
+        other => panic!("expected Unsolvable, got {other:?}"),
+    }
+}
+
+/// (M5-c) Scoped conflict for the constrains-split unsolvable-gap scenario:
+/// the conflict in the scoped re-solve mentions the env constraint on `cuda`,
+/// not a generic unscoped conflict.
+#[test]
+fn test_m5_conflict_display_env_constrains_scoped() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
+
+    let result = universal_failure_snapshot(provider, &["a"], &[&["cuda absent", "cuda 10..100"]]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda absent) AND cuda in >=10, <100 AND not (cuda in >=11, <100)
+    The following packages are incompatible
+    └─ a * cannot be installed because there are no viable options:
+       └─ a 1 would constrain
+          └─ environment cuda >=11, <100, which conflicts with any installable versions previously reported
+    ");
+}

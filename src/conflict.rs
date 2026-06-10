@@ -12,8 +12,8 @@ use petgraph::{
 };
 
 use crate::{
-    DenseIndex, DependencyProvider, Interner, Requirement, SolvableId, SolverId, StringId,
-    VersionSetId,
+    DenseIndex, DependencyProvider, IdMap, Interner, NameId, Requirement, SolvableId, SolverId,
+    StringId, VersionSetId,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     runtime::AsyncRuntime,
     solver::{Solver, clause::Clause, variable_map::VariableOrigin},
@@ -44,13 +44,19 @@ impl Conflict {
     pub fn graph<D: DependencyProvider, RT: AsyncRuntime>(
         &self,
         solver: &Solver<D, RT>,
-    ) -> ConflictGraph<D::SolvableId> {
+    ) -> ConflictGraph<D::SolvableId, D::NameId> {
         let state = &solver.state;
 
-        let mut graph =
-            DiGraph::<ConflictNode<D::SolvableId>, ConflictEdge<D::SolvableId>>::default();
+        let mut graph = DiGraph::<
+            ConflictNode<D::SolvableId, D::NameId>,
+            ConflictEdge<D::SolvableId>,
+        >::default();
         let mut nodes: HashMap<SolvableIdOrRoot<D::SolvableId>, NodeIndex> = HashMap::default();
         let mut excluded_nodes: HashMap<StringId, NodeIndex> = HashMap::default();
+        // Maps a VersionSetId (env-matches literal) to the corresponding node.
+        let mut env_matches_nodes: HashMap<VersionSetId, NodeIndex> = HashMap::default();
+        // Maps a package NameId (env-absent literal) to the corresponding node.
+        let env_absent_nodes: HashMap<D::NameId, NodeIndex> = HashMap::default();
 
         let root_node = Self::add_node(&mut graph, &mut nodes, SolvableIdOrRoot::root());
         let unresolved_node = graph.add_node(ConflictNode::UnresolvedDependency);
@@ -83,6 +89,30 @@ impl Conflict {
                         .as_solvable_or_root(&state.variable_map)
                         .expect("only solvables can be excluded");
                     let package_node = Self::add_node(&mut graph, &mut nodes, solvable);
+
+                    // If the requirement is on an environment package, represent
+                    // it as an edge to the unresolved-dependency node (no
+                    // concrete solvable candidates exist for env packages).
+                    // Env-package requirements are always Single; a Union
+                    // requirement would span multiple package names and cannot
+                    // target a single env package.
+                    let is_env_package = if let Requirement::Single(vs) = version_set_id {
+                        let pkg_name = solver.provider().version_set_name(vs);
+                        state.env_packages.get(pkg_name).is_some()
+                    } else {
+                        false
+                    };
+                    if is_env_package {
+                        tracing::trace!(
+                            "{package_id:?} requires env package {version_set_id:?} (no solvable candidates)"
+                        );
+                        graph.add_edge(
+                            package_node,
+                            unresolved_node,
+                            ConflictEdge::Requires(version_set_id),
+                        );
+                        continue;
+                    }
 
                     let candidates = solver.async_runtime.block_on(solver.cache.get_or_cache_sorted_candidates(version_set_id)).unwrap_or_else(|_| {
                         unreachable!("The version set was used in the solver, so it must have been cached. Therefore cancellation is impossible here and we cannot get an `Err(...)`")
@@ -166,13 +196,62 @@ impl Conflict {
                     let decision_map = solver.state.decision_tracker.map();
                     debug_assert_ne!(selected.positive().eval(decision_map), Some(false));
                 }
-                // Environment-related clauses (constraints, oracle
-                // consistency, model and blocking clauses): proper rendering
-                // is deferred to M5. For now we skip them so conflict
-                // reporting does not panic.
-                Clause::EnvConstrains(..)
-                | Clause::EnvOracleConsistency(..)
-                | Clause::EnvClause(..) => {}
+                Clause::EnvConstrains(env_constrains_id) => {
+                    // `a` constrains the environment package: if `a` is
+                    // installed the env must be absent or match the version
+                    // set. Render like `Constrains` but with an env literal
+                    // as the "constrained" node.
+                    let payload = state.env_constrains[*env_constrains_id];
+                    let parent_solvable = payload
+                        .parent
+                        .as_solvable_or_root(&state.variable_map)
+                        .expect("EnvConstrains parent must be a solvable or root");
+                    let package_node = Self::add_node(&mut graph, &mut nodes, parent_solvable);
+                    let target_node =
+                        *env_matches_nodes
+                            .entry(payload.version_set)
+                            .or_insert_with(|| {
+                                graph.add_node(ConflictNode::EnvMatches(payload.version_set))
+                            });
+                    graph.add_edge(
+                        package_node,
+                        target_node,
+                        ConflictEdge::Conflict(ConflictCause::EnvConstrains(payload.version_set)),
+                    );
+                }
+                Clause::EnvOracleConsistency(lit_a, lit_b) => {
+                    // Oracle consistency: two environment literals are
+                    // mutually exclusive. Only add a conflict edge if both
+                    // literal nodes are already present in the graph (i.e.
+                    // already reachable via other clauses). Creating new
+                    // orphan nodes here would break the reachability invariant.
+                    let node_a = Self::get_env_literal_node(
+                        &env_matches_nodes,
+                        &env_absent_nodes,
+                        &state.variable_map,
+                        lit_a.variable(),
+                    );
+                    let node_b = Self::get_env_literal_node(
+                        &env_matches_nodes,
+                        &env_absent_nodes,
+                        &state.variable_map,
+                        lit_b.variable(),
+                    );
+                    if let (Some(node_a), Some(node_b)) = (node_a, node_b) {
+                        graph.add_edge(
+                            node_a,
+                            node_b,
+                            ConflictEdge::Conflict(ConflictCause::EnvMutuallyExclusive),
+                        );
+                    }
+                }
+                Clause::EnvClause(_env_clause_id) => {
+                    // Model and blocking clauses encode the environment region
+                    // that was being explored. They do not directly contribute
+                    // to the user-visible conflict message (the cell identity
+                    // is shown separately by the caller), so we skip them here.
+                    continue;
+                }
             }
         }
 
@@ -202,8 +281,24 @@ impl Conflict {
         }
     }
 
-    fn add_node<S: SolverId>(
-        graph: &mut DiGraph<ConflictNode<S>, ConflictEdge<S>>,
+    /// Looks up (without creating) the conflict graph node for an environment
+    /// literal variable. Returns `None` when the variable is not an env
+    /// literal, or when no node has been created yet for it.
+    fn get_env_literal_node<N: SolverId, S: SolverId>(
+        env_matches_nodes: &HashMap<VersionSetId, NodeIndex>,
+        env_absent_nodes: &HashMap<N, NodeIndex>,
+        variable_map: &crate::solver::variable_map::VariableMap<N, S>,
+        variable: crate::VariableId,
+    ) -> Option<NodeIndex> {
+        match variable_map.origin(variable) {
+            VariableOrigin::EnvMatches(version_set) => env_matches_nodes.get(&version_set).copied(),
+            VariableOrigin::EnvAbsent(name) => env_absent_nodes.get(&name).copied(),
+            _ => None,
+        }
+    }
+
+    fn add_node<S: SolverId, N: SolverId>(
+        graph: &mut DiGraph<ConflictNode<S, N>, ConflictEdge<S>>,
         nodes: &mut HashMap<SolvableIdOrRoot<S>, NodeIndex>,
         solvable_id: SolvableIdOrRoot<S>,
     ) -> NodeIndex {
@@ -224,7 +319,7 @@ impl Conflict {
 
 /// A node in the graph representation of a [`Conflict`]
 #[derive(Copy, Clone, Eq, PartialEq)]
-pub enum ConflictNode<S = SolvableId> {
+pub enum ConflictNode<S = SolvableId, N = NameId> {
     /// Node corresponding to the synthetic solver root
     Root,
     /// Node corresponding to a solvable
@@ -233,9 +328,15 @@ pub enum ConflictNode<S = SolvableId> {
     UnresolvedDependency,
     /// Node representing an exclude reason
     Excluded(StringId),
+    /// Node representing an environment literal: "env package matches version
+    /// set". Added when a conflict involves `EnvConstrains` or oracle
+    /// consistency clauses.
+    EnvMatches(VersionSetId),
+    /// Node representing an environment literal: "env package is absent".
+    EnvAbsent(N),
 }
 
-impl<S> ConflictNode<S> {
+impl<S, N> ConflictNode<S, N> {
     fn from_solvable_or_root(solvable_id: SolvableIdOrRoot<S>) -> Self {
         match solvable_id {
             SolvableIdOrRoot::Root => Self::Root,
@@ -253,15 +354,20 @@ impl<S> ConflictNode<S> {
             ConflictNode::Excluded(_) => {
                 panic!("expected solvable node, found excluded node")
             }
+            ConflictNode::EnvMatches(_) | ConflictNode::EnvAbsent(_) => {
+                panic!("expected solvable node, found environment literal node")
+            }
         }
     }
 
     fn solvable(self) -> Option<S> {
         match self {
             ConflictNode::Solvable(solvable_id) => Some(solvable_id),
-            ConflictNode::Root | ConflictNode::UnresolvedDependency | ConflictNode::Excluded(_) => {
-                None
-            }
+            ConflictNode::Root
+            | ConflictNode::UnresolvedDependency
+            | ConflictNode::Excluded(_)
+            | ConflictNode::EnvMatches(_)
+            | ConflictNode::EnvAbsent(_) => None,
         }
     }
 }
@@ -303,6 +409,12 @@ pub enum ConflictCause<S = SolvableId> {
     ForbidMultipleInstances,
     /// The node was excluded
     Excluded,
+    /// A solvable constrains an environment package to match the given version
+    /// set, but the environment cannot satisfy it.
+    EnvConstrains(VersionSetId),
+    /// Two environment literals are mutually exclusive (oracle consistency
+    /// clause asserts they cannot both hold).
+    EnvMutuallyExclusive,
 }
 
 /// Represents a node that has been merged with others
@@ -324,16 +436,16 @@ pub struct MergedConflictNode<S = SolvableId> {
 /// solvable's requirements are included in the graph, only those that are
 /// directly or indirectly involved in the conflict.
 #[derive(Clone)]
-pub struct ConflictGraph<S = SolvableId> {
+pub struct ConflictGraph<S = SolvableId, N = NameId> {
     /// The conflict graph as a directed petgraph.
-    pub graph: DiGraph<ConflictNode<S>, ConflictEdge<S>>,
+    pub graph: DiGraph<ConflictNode<S, N>, ConflictEdge<S>>,
     /// The single source node for root constraints introduced to the solver.
     pub root_node: NodeIndex,
     /// A single sink node that consumes all unresolvable constraints.
     pub unresolved_node: Option<NodeIndex>,
 }
 
-impl<S: SolverId> ConflictGraph<S> {
+impl<S: SolverId, N: SolverId> ConflictGraph<S, N> {
     /// Writes a graphviz graph that represents this instance to the specified
     /// output.
     pub fn graphviz(
@@ -383,7 +495,8 @@ impl<S: SolverId> ConflictGraph<S> {
                     ConflictEdge::Requires(requirement) => {
                         requirement.display(interner).to_string()
                     }
-                    ConflictEdge::Conflict(ConflictCause::Constrains(version_set_id)) => {
+                    ConflictEdge::Conflict(ConflictCause::Constrains(version_set_id))
+                    | ConflictEdge::Conflict(ConflictCause::EnvConstrains(version_set_id)) => {
                         interner.display_version_set(*version_set_id).to_string()
                     }
                     ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances)
@@ -391,6 +504,9 @@ impl<S: SolverId> ConflictGraph<S> {
                         "already installed".to_string()
                     }
                     ConflictEdge::Conflict(ConflictCause::Excluded) => "excluded".to_string(),
+                    ConflictEdge::Conflict(ConflictCause::EnvMutuallyExclusive) => {
+                        "mutually exclusive".to_string()
+                    }
                 };
 
                 let target = match target {
@@ -416,6 +532,10 @@ impl<S: SolverId> ConflictGraph<S> {
                     ConflictNode::Excluded(reason) => {
                         format!("reason: {}", interner.display_string(reason))
                     }
+                    ConflictNode::EnvMatches(version_set_id) => {
+                        format!("env:{}", interner.display_version_set(version_set_id))
+                    }
+                    ConflictNode::EnvAbsent(_) => "env:absent".to_string(),
                 };
 
                 write!(
@@ -444,7 +564,9 @@ impl<S: SolverId> ConflictGraph<S> {
                 ConflictNode::Solvable(solvable_id) => solvable_id,
                 ConflictNode::Root
                 | ConflictNode::UnresolvedDependency
-                | ConflictNode::Excluded(_) => continue,
+                | ConflictNode::Excluded(_)
+                | ConflictNode::EnvMatches(_)
+                | ConflictNode::EnvAbsent(_) => continue,
             };
 
             // Candidates that require different version sets stay separate so each
@@ -665,7 +787,7 @@ impl Indenter {
 /// A struct implementing [`fmt::Display`] that generates a user-friendly
 /// representation of a conflict graph
 pub struct DisplayUnsat<'i, I: Interner> {
-    graph: ConflictGraph<I::SolvableId>,
+    graph: ConflictGraph<I::SolvableId, I::NameId>,
     merged_candidates: HashMap<I::SolvableId, Rc<MergedConflictNode<I::SolvableId>>>,
     installable_set: HashSet<NodeIndex>,
     missing_set: HashSet<NodeIndex>,
@@ -673,7 +795,7 @@ pub struct DisplayUnsat<'i, I: Interner> {
 }
 
 impl<'i, I: Interner> DisplayUnsat<'i, I> {
-    pub(crate) fn new(graph: ConflictGraph<I::SolvableId>, interner: &'i I) -> Self {
+    pub(crate) fn new(graph: ConflictGraph<I::SolvableId, I::NameId>, interner: &'i I) -> Self {
         let merged_candidates = graph.simplify(interner);
         let installable_set = graph.get_installable_set();
         let missing_set = graph.get_missing_set();
@@ -912,6 +1034,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                         matches!(
                             e.weight(),
                             ConflictEdge::Conflict(ConflictCause::Constrains(_))
+                                | ConflictEdge::Conflict(ConflictCause::EnvConstrains(_))
                         )
                     });
                     let is_leaf = graph.edges(candidate).next().is_none();
@@ -930,21 +1053,37 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                             "{indent}{version}, which conflicts with the versions reported above."
                         )?;
                     } else if constrains_conflict {
-                        let mut version_sets = graph
+                        // Collect both regular Constrains and EnvConstrains edges,
+                        // distinguishing the two so env constraints can be prefixed
+                        // with "environment".
+                        #[derive(PartialEq, Eq)]
+                        enum ConstraintEntry {
+                            Regular(VersionSetId),
+                            Env(VersionSetId),
+                        }
+                        let mut version_sets_vec: Vec<ConstraintEntry> = graph
                             .edges(candidate)
                             .flat_map(|e| match e.weight() {
                                 ConflictEdge::Conflict(ConflictCause::Constrains(
                                     version_set_id,
-                                )) => Some(version_set_id),
+                                )) => Some(ConstraintEntry::Regular(*version_set_id)),
+                                ConflictEdge::Conflict(ConflictCause::EnvConstrains(
+                                    version_set_id,
+                                )) => Some(ConstraintEntry::Env(*version_set_id)),
                                 _ => None,
                             })
-                            .dedup()
-                            .peekable();
+                            .collect();
+                        version_sets_vec.dedup();
+                        let mut version_sets = version_sets_vec.into_iter().peekable();
 
                         writeln!(f, "{indent}{version} would constrain",)?;
 
                         let mut indenter = indenter.push_level();
-                        while let Some(&version_set_id) = version_sets.next() {
+                        while let Some(entry) = version_sets.next() {
+                            let (prefix, version_set_id) = match entry {
+                                ConstraintEntry::Regular(vs) => ("", vs),
+                                ConstraintEntry::Env(vs) => ("environment ", vs),
+                            };
                             let name = self
                                 .interner
                                 .display_name(self.interner.version_set_name(version_set_id));
@@ -956,7 +1095,7 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                             let indent = indenter.get_indent();
                             writeln!(
                                 f,
-                                "{indent}{name} {version_set}, which conflicts with any installable versions previously reported",
+                                "{indent}{prefix}{name} {version_set}, which conflicts with any installable versions previously reported",
                             )?;
                         }
                     } else {
@@ -1051,6 +1190,12 @@ impl<I: Interner> fmt::Display for DisplayUnsat<'_, I> {
                         )?;
                     }
                     ConflictCause::Excluded => continue,
+                    // Env literal conflicts at root level are already handled by
+                    // fmt_graph traversal (via solvable -> env literal edges) or
+                    // are not meaningful to display directly at the top level.
+                    ConflictCause::EnvConstrains(_) | ConflictCause::EnvMutuallyExclusive => {
+                        continue;
+                    }
                 };
             }
         }
