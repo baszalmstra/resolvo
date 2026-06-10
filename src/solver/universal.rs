@@ -343,11 +343,23 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     ///
     /// Both the solvable order (first occurrence across cells) and the
     /// disjunct order are deterministic.
-    pub fn merged(&self) -> Vec<(Id, Presence<N>)> {
+    pub fn merged(&self) -> Vec<(Id, Presence<N>)>
+    where
+        Id: std::hash::Hash,
+    {
+        // Hash sets for the membership tests below: `merged` is quadratic in
+        // cells x solvables otherwise (hundreds of cells in archspec-heavy
+        // partitions).
+        let cell_sets: Vec<ahash::HashSet<Id>> = self
+            .cells
+            .iter()
+            .map(|(_, solvables)| solvables.iter().copied().collect())
+            .collect();
         let mut order: Vec<Id> = Vec::new();
+        let mut seen: ahash::HashSet<Id> = ahash::HashSet::default();
         for (_, solvables) in &self.cells {
             for &solvable in solvables {
-                if !order.contains(&solvable) {
+                if seen.insert(solvable) {
                     order.push(solvable);
                 }
             }
@@ -356,7 +368,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
             .into_iter()
             .map(|solvable| {
                 let presence =
-                    self.presence_for_cells(|index| self.cells[index].1.contains(&solvable));
+                    self.presence_for_cells(|index| cell_sets[index].contains(&solvable));
                 (solvable, presence)
             })
             .collect()
@@ -370,16 +382,27 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// The edge order (first occurrence across cells) and the disjunct order
     /// are deterministic. This is the view a lockfile serializer needs to
     /// store a conditional dependency graph.
-    pub fn edges(&self) -> Vec<(CellEdge<Id>, Presence<N>)> {
+    pub fn edges(&self) -> Vec<(CellEdge<Id>, Presence<N>)>
+    where
+        Id: std::hash::Hash,
+    {
         debug_assert_eq!(
             self.cell_edges.len(),
             self.cells.len(),
             "cell_edges must be parallel to cells"
         );
+        // Hash sets for the membership tests below: `edges` is quadratic in
+        // cells x edges otherwise.
+        let edge_sets: Vec<ahash::HashSet<CellEdge<Id>>> = self
+            .cell_edges
+            .iter()
+            .map(|edges| edges.iter().copied().collect())
+            .collect();
         let mut order: Vec<CellEdge<Id>> = Vec::new();
+        let mut seen: ahash::HashSet<CellEdge<Id>> = ahash::HashSet::default();
         for edges in &self.cell_edges {
             for &edge in edges {
-                if !order.contains(&edge) {
+                if seen.insert(edge) {
                     order.push(edge);
                 }
             }
@@ -387,8 +410,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         order
             .into_iter()
             .map(|edge| {
-                let presence =
-                    self.presence_for_cells(|index| self.cell_edges[index].contains(&edge));
+                let presence = self.presence_for_cells(|index| edge_sets[index].contains(&edge));
                 (edge, presence)
             })
             .collect()
