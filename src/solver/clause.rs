@@ -296,9 +296,20 @@ impl<N: SolverId> Clause<N> {
         // solvable would be false (and we just asserted that it is not)
         let conflict = decision_tracker.assigned_value(forbidden_solvable) == Some(true);
 
+        // A solvable that violates a constraint it itself declares produces
+        // the degenerate clause `(not A or not A)`, which is the assertion
+        // `not A`. A clause cannot watch the same literal twice, so it gets
+        // no watches; the encoder registers it as a negative assertion
+        // (mirroring exclusion clauses).
+        let watched_literals = if parent == forbidden_solvable {
+            None
+        } else {
+            Some([parent.negative(), forbidden_solvable.negative()])
+        };
+
         (
             Clause::Constrains(parent, forbidden_solvable, via),
-            Some([parent.negative(), forbidden_solvable.negative()]),
+            watched_literals,
             conflict,
         )
     }

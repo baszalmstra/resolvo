@@ -578,6 +578,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
 
                     let clause_id = self.state.add_clause(watched_literals, kind);
 
+                    // A solvable that violates its own constraint yields the
+                    // assertion `not A` (no watches); track it like an
+                    // exclusion so propagation applies it.
+                    if variable == forbidden_candidate_var {
+                        self.state.negative_assertions.push((variable, clause_id));
+                    }
+
                     if conflict {
                         self.conflicting_clauses.push(clause_id);
                     }

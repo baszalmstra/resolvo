@@ -1345,6 +1345,35 @@ fn test_constrains_transitive() {
     "###);
 }
 
+/// A solvable that violates a constraint it itself declares cannot be
+/// installed: `a=2` constrains `a 3..4` and is itself a non-matching
+/// candidate, so the degenerate Constrains clause `(not a=2 or not a=2)` is
+/// the assertion `not a=2` and the solver falls back to `a=1`. Found by the
+/// universal-solve property test; the bug predates universal solving (the
+/// encoder created a clause watching the same literal twice).
+#[test]
+fn test_self_constrains_falls_back_to_other_version() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("a", 2.into(), &[], &["a 3..4"]);
+    provider.add_package("a", 1.into(), &[], &[]);
+    insta::assert_snapshot!(solve_snapshot(provider, &["a"]), @r"
+    a=1
+    ");
+}
+
+/// The unsolvable variant of the self-constrains case: the only candidate
+/// violates its own constraint, so the requirement cannot be satisfied.
+#[test]
+fn test_self_constrains_unsolvable() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("a", 1.into(), &[], &["a 2..3"]);
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let result = solver.solve(problem);
+    assert!(matches!(result, Err(UnsolvableOrCancelled::Unsolvable(_))));
+}
+
 // ===========================================================================
 // M1: Environment literals in the encoder -- scenario tests
 // ===========================================================================
