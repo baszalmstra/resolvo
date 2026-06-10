@@ -61,6 +61,9 @@ impl Conflict {
         let root_node = Self::add_node(&mut graph, &mut nodes, SolvableIdOrRoot::root());
         let unresolved_node = graph.add_node(ConflictNode::UnresolvedDependency);
         let mut last_node_by_name: HashMap<D::NameId, NodeIndex> = HashMap::default();
+        // Mutual-exclusivity edges from oracle consistency clauses, deferred
+        // until all other clauses have created their env literal nodes.
+        let mut deferred_oracle_edges: Vec<(crate::VariableId, crate::VariableId)> = Vec::new();
 
         for clause_id in &self.clauses {
             let clause = &state.clauses.kinds[clause_id.to_index()];
@@ -90,28 +93,29 @@ impl Conflict {
                         .expect("only solvables can be excluded");
                     let package_node = Self::add_node(&mut graph, &mut nodes, solvable);
 
-                    // If the requirement is on an environment package, represent
-                    // it as an edge to the unresolved-dependency node (no
-                    // concrete solvable candidates exist for env packages).
-                    // Env-package requirements are always Single; a Union
-                    // requirement would span multiple package names and cannot
-                    // target a single env package.
-                    let is_env_package = if let Requirement::Single(vs) = version_set_id {
+                    // A requirement on an environment package is symbolic: no
+                    // concrete solvable candidates exist (and never will), so
+                    // it must not be treated as a missing dependency. Instead
+                    // it becomes a requires edge to the environment-literal
+                    // node for the version set. Env-package requirements are
+                    // always Single; a Union requirement mixing environment
+                    // and concrete packages is rejected during encoding.
+                    if let Requirement::Single(vs) = version_set_id {
                         let pkg_name = solver.provider().version_set_name(vs);
-                        state.env_packages.get(pkg_name).is_some()
-                    } else {
-                        false
-                    };
-                    if is_env_package {
-                        tracing::trace!(
-                            "{package_id:?} requires env package {version_set_id:?} (no solvable candidates)"
-                        );
-                        graph.add_edge(
-                            package_node,
-                            unresolved_node,
-                            ConflictEdge::Requires(version_set_id),
-                        );
-                        continue;
+                        if state.env_packages.get(pkg_name).is_some() {
+                            tracing::trace!(
+                                "{package_id:?} requires env package {version_set_id:?}"
+                            );
+                            let target_node = *env_matches_nodes
+                                .entry(vs)
+                                .or_insert_with(|| graph.add_node(ConflictNode::EnvMatches(vs)));
+                            graph.add_edge(
+                                package_node,
+                                target_node,
+                                ConflictEdge::Requires(version_set_id),
+                            );
+                            continue;
+                        }
                     }
 
                     let candidates = solver.async_runtime.block_on(solver.cache.get_or_cache_sorted_candidates(version_set_id)).unwrap_or_else(|_| {
@@ -221,29 +225,12 @@ impl Conflict {
                 }
                 Clause::EnvOracleConsistency(lit_a, lit_b) => {
                     // Oracle consistency: two environment literals are
-                    // mutually exclusive. Only add a conflict edge if both
-                    // literal nodes are already present in the graph (i.e.
-                    // already reachable via other clauses). Creating new
-                    // orphan nodes here would break the reachability invariant.
-                    let node_a = Self::get_env_literal_node(
-                        &env_matches_nodes,
-                        &env_absent_nodes,
-                        &state.variable_map,
-                        lit_a.variable(),
-                    );
-                    let node_b = Self::get_env_literal_node(
-                        &env_matches_nodes,
-                        &env_absent_nodes,
-                        &state.variable_map,
-                        lit_b.variable(),
-                    );
-                    if let (Some(node_a), Some(node_b)) = (node_a, node_b) {
-                        graph.add_edge(
-                            node_a,
-                            node_b,
-                            ConflictEdge::Conflict(ConflictCause::EnvMutuallyExclusive),
-                        );
-                    }
+                    // mutually exclusive. Defer the edge until all other
+                    // clauses have created their nodes: an edge is only added
+                    // when both literal nodes exist (i.e. are reachable via
+                    // other clauses). Creating new orphan nodes here would
+                    // break the reachability invariant.
+                    deferred_oracle_edges.push((lit_a.variable(), lit_b.variable()));
                 }
                 Clause::EnvClause(_env_clause_id) => {
                     // Model and blocking clauses encode the environment region
@@ -252,6 +239,30 @@ impl Conflict {
                     // is shown separately by the caller), so we skip them here.
                     continue;
                 }
+            }
+        }
+
+        // Second pass: add mutual-exclusivity edges between env literal nodes
+        // that both ended up in the graph.
+        for (var_a, var_b) in deferred_oracle_edges {
+            let node_a = Self::get_env_literal_node(
+                &env_matches_nodes,
+                &env_absent_nodes,
+                &state.variable_map,
+                var_a,
+            );
+            let node_b = Self::get_env_literal_node(
+                &env_matches_nodes,
+                &env_absent_nodes,
+                &state.variable_map,
+                var_b,
+            );
+            if let (Some(node_a), Some(node_b)) = (node_a, node_b) {
+                graph.add_edge(
+                    node_a,
+                    node_b,
+                    ConflictEdge::Conflict(ConflictCause::EnvMutuallyExclusive),
+                );
             }
         }
 
@@ -623,6 +634,16 @@ impl<S: SolverId, N: SolverId> ConflictGraph<S, N> {
                 continue;
             }
 
+            if matches!(
+                self.graph[nx],
+                ConflictNode::EnvMatches(_) | ConflictNode::EnvAbsent(_)
+            ) {
+                // Environment literals are symbolic: they are never
+                // installable (and never missing). A requirement that points
+                // at one is reported as an environment requirement instead.
+                continue;
+            }
+
             // Determine any incoming "exclude" edges to the node. This would indicate that
             // the node is disabled for external reasons.
             let excluding_edges = self
@@ -809,6 +830,24 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
         }
     }
 
+    /// Renders an environment-literal node as user-facing text, e.g.
+    /// `cuda >=11, <100` for a matches literal or `absent cuda` for an
+    /// absent literal.
+    fn display_env_node(&self, node: ConflictNode<I::SolvableId, I::NameId>) -> String {
+        match node {
+            ConflictNode::EnvMatches(version_set_id) => format!(
+                "{} {}",
+                self.interner
+                    .display_name(self.interner.version_set_name(version_set_id)),
+                self.interner.display_version_set(version_set_id),
+            ),
+            ConflictNode::EnvAbsent(name) => {
+                format!("absent {}", self.interner.display_name(name))
+            }
+            _ => unreachable!("expected an environment literal node"),
+        }
+    }
+
     fn fmt_graph(
         &self,
         f: &mut Formatter<'_>,
@@ -869,9 +908,50 @@ impl<'i, I: Interner> DisplayUnsat<'i, I> {
                     let req = requirement.display(self.interner).to_string();
 
                     let target_nx = graph.edge_endpoints(edges[0]).unwrap().1;
+                    let env_literal = edges.len() == 1
+                        && matches!(
+                            graph[target_nx],
+                            ConflictNode::EnvMatches(_) | ConflictNode::EnvAbsent(_)
+                        );
                     let missing =
                         edges.len() == 1 && graph[target_nx] == ConflictNode::UnresolvedDependency;
-                    if missing {
+                    if env_literal {
+                        // A requirement on an environment package. Environment
+                        // packages are symbolic: they have no candidates by
+                        // definition, so they must never be reported as
+                        // missing. Report the environment requirement, and any
+                        // mutual-exclusivity conflicts (oracle consistency
+                        // clauses) with other environment literals as children.
+                        if top_level {
+                            writeln!(f, "{indent}the environment must provide {req}")?;
+                        } else {
+                            writeln!(f, "{indent}{req}, which the environment cannot provide")?;
+                        }
+
+                        let this = self.display_env_node(graph[target_nx]);
+                        let mut others = graph
+                            .edges(target_nx)
+                            .filter(|e| {
+                                matches!(
+                                    e.weight(),
+                                    ConflictEdge::Conflict(ConflictCause::EnvMutuallyExclusive)
+                                )
+                            })
+                            .map(|e| e.target())
+                            .peekable();
+                        let mut indenter = indenter.push_level();
+                        while let Some(other_nx) = others.next() {
+                            if others.peek().is_none() {
+                                indenter.set_last();
+                            }
+                            let indent = indenter.get_indent();
+                            let other = self.display_env_node(graph[other_nx]);
+                            writeln!(
+                                f,
+                                "{indent}{this} and {other} are mutually exclusive environment requirements",
+                            )?;
+                        }
+                    } else if missing {
                         // No candidates for requirement
                         if top_level {
                             writeln!(f, "{indent}No candidates were found for {req}.")?;

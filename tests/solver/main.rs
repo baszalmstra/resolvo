@@ -2674,7 +2674,8 @@ fn universal_failure_snapshot(
 /// (M5-a) Scoped conflict for `test_universal_unsolvable_region`: `a=1`
 /// requires `glibc >=228`, but the only modeled region has `glibc in
 /// [217, 228)`.  After the scoped re-solve the conflict display must mention
-/// the requirement on the environment literal without panicking.
+/// the requirement on the environment literal without panicking. Environment
+/// packages are symbolic: they must never be reported as "missing".
 #[test]
 fn test_m5_conflict_display_requires_env_package() {
     let mut provider = BundleBoxProvider::new();
@@ -2684,15 +2685,17 @@ fn test_m5_conflict_display_requires_env_package() {
     let result = universal_failure_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
     assert_snapshot!(result, @r"
     cell: glibc in >=217, <228 AND not (glibc in >=228, <1000)
-    a * cannot be installed because there are no viable options:
-    └─ a 1 would require
-       └─ glibc >=228, <1000, for which no candidates were found.
+    The following packages are incompatible
+    └─ a * cannot be installed because there are no viable options:
+       └─ a 1 would require
+          └─ glibc >=228, <1000, which the environment cannot provide
     ");
 }
 
 /// (M5-b) Plain solve with two disjoint requirements on the same env package:
-/// the oracle consistency clause is in the conflict but the display must not
-/// panic. Both requirements appear as missing (no concrete solvables).
+/// the requirements are rendered as environment requirements (never as
+/// missing packages) and the oracle consistency clause between them is
+/// rendered as a mutual-exclusivity conflict.
 #[test]
 fn test_m5_conflict_display_oracle_disjoint() {
     let mut provider = BundleBoxProvider::new();
@@ -2704,10 +2707,14 @@ fn test_m5_conflict_display_oracle_disjoint() {
     match solver.solve(problem) {
         Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
             let display = conflict.display_user_friendly(&solver).to_string();
-            // Must not panic, and must mention both environment requirements.
+            // Must not panic, must mention both environment requirements and
+            // their mutual exclusivity, and must not claim candidates are
+            // missing.
             assert_snapshot!(display, @r"
-            No candidates were found for cuda >=0, <5.
-            No candidates were found for cuda >=11, <100.
+            The following packages are incompatible
+            ├─ the environment must provide cuda >=0, <5
+            └─ the environment must provide cuda >=11, <100
+               └─ cuda >=11, <100 and cuda >=0, <5 are mutually exclusive environment requirements
             ");
         }
         other => panic!("expected Unsolvable, got {other:?}"),
