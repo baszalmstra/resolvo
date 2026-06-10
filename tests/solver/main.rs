@@ -2739,3 +2739,252 @@ fn test_m5_conflict_display_env_constrains_scoped() {
           └─ the environment to lack cuda or provide cuda >=11, <100, but this environment region provides cuda outside that range
     ");
 }
+
+// ============================================================================
+// Snapshot support for universal solving (bench infrastructure)
+// ============================================================================
+
+/// Builds a tiny handcrafted [`resolvo::snapshot::DependencySnapshot`] with an
+/// environment package `__glibc` whose simulated machine candidate is 2.35,
+/// and a package `a` whose build 2 requires `__glibc >=3` and build 1
+/// requires `__glibc >=2`. The precomputed relation table holds the single
+/// cross entry `>=2 superset of >=3`.
+fn environment_snapshot() -> resolvo::snapshot::DependencySnapshot {
+    use resolvo::{
+        DenseIndex, Dependencies, EnvironmentPackage, KnownDependencies, Mapping,
+        VersionSetRelation,
+        snapshot::{DependencySnapshot, Package, Solvable, VersionSet},
+    };
+
+    let name_a = NameId::from_index(0);
+    let name_glibc = NameId::from_index(1);
+    let solvable_a2 = SolvableId::from_index(0);
+    let solvable_a1 = SolvableId::from_index(1);
+    let solvable_glibc = SolvableId::from_index(2);
+    let glibc_ge2 = VersionSetId::from_index(0);
+    let glibc_ge3 = VersionSetId::from_index(1);
+
+    let mut solvables = Mapping::default();
+    solvables.insert(
+        solvable_a2,
+        Solvable {
+            display: "a=2".to_string(),
+            name: name_a,
+            order: 0,
+            dependencies: Dependencies::Known(KnownDependencies {
+                requirements: vec![glibc_ge3.into()],
+                constrains: vec![],
+            }),
+            hint_dependencies_available: true,
+        },
+    );
+    solvables.insert(
+        solvable_a1,
+        Solvable {
+            display: "a=1".to_string(),
+            name: name_a,
+            order: 1,
+            dependencies: Dependencies::Known(KnownDependencies {
+                requirements: vec![glibc_ge2.into()],
+                constrains: vec![],
+            }),
+            hint_dependencies_available: true,
+        },
+    );
+    solvables.insert(
+        solvable_glibc,
+        Solvable {
+            display: "__glibc=2.35".to_string(),
+            name: name_glibc,
+            order: 0,
+            dependencies: Dependencies::Known(KnownDependencies {
+                requirements: vec![],
+                constrains: vec![],
+            }),
+            hint_dependencies_available: true,
+        },
+    );
+
+    let mut version_sets = Mapping::default();
+    version_sets.insert(
+        glibc_ge2,
+        VersionSet {
+            name: name_glibc,
+            display: ">=2".to_string(),
+            matching_candidates: [solvable_glibc].into_iter().collect(),
+        },
+    );
+    version_sets.insert(
+        glibc_ge3,
+        VersionSet {
+            name: name_glibc,
+            display: ">=3".to_string(),
+            matching_candidates: std::iter::empty().collect(),
+        },
+    );
+
+    let mut packages = Mapping::default();
+    packages.insert(
+        name_a,
+        Package {
+            name: "a".to_string(),
+            solvables: vec![solvable_a2, solvable_a1],
+            excluded: vec![],
+            environment: None,
+        },
+    );
+    packages.insert(
+        name_glibc,
+        Package {
+            name: "__glibc".to_string(),
+            solvables: vec![solvable_glibc],
+            excluded: vec![],
+            environment: Some(EnvironmentPackage {
+                can_be_absent: false,
+            }),
+        },
+    );
+
+    DependencySnapshot {
+        solvables,
+        version_set_unions: Mapping::default(),
+        version_sets,
+        packages,
+        strings: Mapping::default(),
+        conditions: Mapping::default(),
+        environment_version_set_relations: vec![(
+            glibc_ge2,
+            glibc_ge3,
+            VersionSetRelation::Superset,
+        )],
+    }
+}
+
+/// Regression test: additional version sets must not shadow the snapshot's
+/// last version set (`Mapping::max` returns the highest id, not the count).
+#[test]
+fn test_snapshot_additional_version_set_does_not_shadow_last() {
+    use resolvo::DenseIndex;
+
+    let snapshot = environment_snapshot();
+    let mut provider = snapshot.provider();
+    let req = provider.add_package_requirement(NameId::from_index(0), "*");
+    assert_eq!(
+        provider
+            .display_version_set(VersionSetId::from_index(1))
+            .to_string(),
+        ">=3"
+    );
+    assert_eq!(provider.display_version_set(req).to_string(), "*");
+}
+
+/// In concrete mode (the default) the environment marker is ignored: the
+/// machine candidate `__glibc=2.35` is a plain solvable, so `a=2`
+/// (requiring `__glibc >=3`) is uninstallable and the solver falls back to
+/// `a=1`.
+#[test]
+fn test_snapshot_concrete_mode_solves_machine_candidates() {
+    use resolvo::DenseIndex;
+
+    let snapshot = environment_snapshot();
+    let mut provider = snapshot.provider();
+    let req = provider.add_package_requirement(NameId::from_index(0), "*");
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(vec![req.into()]);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    __glibc=2.35
+    a=1
+    ");
+}
+
+/// In universal mode the marked package becomes an environment package and
+/// the embedded relation table answers the oracle: the solve splits on the
+/// two glibc literals, and the disjointness repair needs the `Superset`
+/// answer (looked up in flipped order) to know `>=2` and `>=3` overlap.
+#[test]
+fn test_snapshot_universal_mode_enumerates_cells() {
+    use std::fmt::Write;
+
+    use resolvo::DenseIndex;
+
+    let snapshot = environment_snapshot();
+    let name_glibc = NameId::from_index(1);
+    let glibc_ge2 = VersionSetId::from_index(0);
+
+    let mut provider = snapshot.provider().with_universal_mode(true);
+    let req = provider.add_package_requirement(NameId::from_index(0), "*");
+    let mut solver = Solver::new(provider);
+    let model = vec![vec![(
+        EnvLiteral {
+            package: name_glibc,
+            kind: EnvLiteralKind::Matches(glibc_ge2),
+        },
+        true,
+    )]];
+    let problem = UniversalProblem::new()
+        .requirements(vec![req.into()])
+        .environment_model(model);
+    let solution = solver.solve_universal(problem).unwrap();
+
+    let mut buf = String::new();
+    for (condition, solvables) in &solution.cells {
+        writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
+        for solvable in solvables
+            .iter()
+            .map(|&s| solver.provider().display_solvable(s).to_string())
+            .sorted()
+        {
+            writeln!(buf, "  {solvable}").unwrap();
+        }
+    }
+    assert_snapshot!(buf, @r"
+    cell: __glibc in >=3
+      a=2
+    cell: __glibc in >=2 AND not (__glibc in >=3)
+      a=1
+    ");
+
+    // The independent verifier accepts the partition through the same
+    // table-backed oracle.
+    solution.verify(solver.provider()).unwrap();
+
+    // Projection onto simulated machines: glibc 2.x matches only `>=2`,
+    // glibc 3.x matches both literals.
+    let machine_2 = solution
+        .project(|literal| literal.kind == EnvLiteralKind::Matches(glibc_ge2))
+        .expect("a cell covers glibc 2.x machines");
+    assert_eq!(machine_2, &[SolvableId::from_index(1)]);
+    let machine_3 = solution
+        .project(|_| true)
+        .expect("a cell covers glibc 3.x machines");
+    assert_eq!(machine_3, &[SolvableId::from_index(0)]);
+}
+
+/// The environment marker and the relation table survive a JSON round trip.
+#[cfg(feature = "serde")]
+#[test]
+fn test_snapshot_environment_serde_roundtrip() {
+    use resolvo::{DenseIndex, VersionSetRelation, snapshot::DependencySnapshot};
+
+    let snapshot = environment_snapshot();
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let deserialized: DependencySnapshot = serde_json::from_str(&json).unwrap();
+    assert!(
+        deserialized
+            .packages
+            .get(NameId::from_index(1))
+            .unwrap()
+            .environment
+            .is_some()
+    );
+    assert_eq!(
+        deserialized.environment_version_set_relations,
+        vec![(
+            VersionSetId::from_index(0),
+            VersionSetId::from_index(1),
+            VersionSetRelation::Superset,
+        )]
+    );
+}

@@ -67,6 +67,7 @@ pub use utils::{IndexedSet, Mapping, MappingIter};
 /// lockfiles; `Unknown` merely risks describing environment regions no real
 /// machine has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VersionSetRelation {
     /// No value matches both version sets.
     Disjoint,
@@ -84,6 +85,7 @@ pub enum VersionSetRelation {
 /// time. Returned by [`DependencyProvider::get_candidates`] via
 /// [`PackageCandidates::Environment`].
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnvironmentPackage {
     /// Whether the environment may lack this package entirely. Controls
     /// creation of the absent literal.
