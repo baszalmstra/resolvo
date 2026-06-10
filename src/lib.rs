@@ -35,8 +35,8 @@ pub use id::{
 use itertools::Itertools;
 pub use requirement::Requirement;
 pub use solver::{
-    EmptySolvables, EnvironmentModel, Problem, Solver, SolverCache, UniversalFailure,
-    UniversalProblem, UniversalSolution, UnsolvableOrCancelled,
+    CellEdge, EmptySolvables, EnvironmentModel, Problem, Solver, SolverCache, UniversalFailure,
+    UniversalProblem, UniversalSolution, UnsolvableOrCancelled, Violation,
 };
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
@@ -113,7 +113,7 @@ pub enum EnvLiteralKind {
 /// A conjunction of signed environment literals.
 ///
 /// An empty conjunction means "all environments".
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CellCondition<N>(pub Vec<(EnvLiteral<N>, bool)>);
 
 impl<N> CellCondition<N> {
@@ -163,6 +163,67 @@ impl<I: Interner> Display for CellConditionDisplay<'_, I> {
             }
             if !positive {
                 write!(f, ")")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A presence condition: a disjunction (logical OR) of [`CellCondition`]
+/// conjunctions, i.e. a formula in disjunctive normal form over signed
+/// environment literals.
+///
+/// A presence condition holds in a concrete environment when at least one of
+/// its disjuncts holds. A disjunct that is the empty conjunction holds in
+/// every environment, making the whole presence condition always true; an
+/// empty disjunction never holds.
+///
+/// Produced by [`UniversalSolution::merged`] and [`UniversalSolution::edges`],
+/// which OR together the conditions of the cells a solvable (or edge) appears
+/// in, simplified within the bounds of the environment model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Presence<N>(pub Vec<CellCondition<N>>);
+
+impl<N> Presence<N> {
+    /// Returns an object that formats the presence condition in a human
+    /// readable way, e.g. `(cuda in >=11, <100 AND rocm in >=5, <10) OR
+    /// cuda absent`. The always-true presence is formatted as
+    /// `<all environments>` and the empty disjunction as
+    /// `<no environments>`.
+    pub fn display<'a, I: Interner<NameId = N>>(
+        &'a self,
+        interner: &'a I,
+    ) -> PresenceDisplay<'a, I> {
+        PresenceDisplay {
+            presence: self,
+            interner,
+        }
+    }
+}
+
+/// A helper struct that implements [`Display`] for a [`Presence`]. See
+/// [`Presence::display`].
+pub struct PresenceDisplay<'a, I: Interner> {
+    presence: &'a Presence<I::NameId>,
+    interner: &'a I,
+}
+
+impl<I: Interner> Display for PresenceDisplay<'_, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let disjuncts = &self.presence.0;
+        if disjuncts.is_empty() {
+            return write!(f, "<no environments>");
+        }
+        for (idx, disjunct) in disjuncts.iter().enumerate() {
+            if idx > 0 {
+                write!(f, " OR ")?;
+            }
+            // Parenthesize multi-literal conjunctions when there are
+            // multiple disjuncts, so OR/AND precedence stays unambiguous.
+            if disjuncts.len() > 1 && disjunct.0.len() > 1 {
+                write!(f, "({})", disjunct.display(self.interner))?;
+            } else {
+                write!(f, "{}", disjunct.display(self.interner))?;
             }
         }
         Ok(())

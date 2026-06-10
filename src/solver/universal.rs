@@ -16,7 +16,7 @@ use std::{any::Any, marker::PhantomData};
 use crate::{
     CellCondition, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
     EnvLiteral, EnvLiteralKind, EnvironmentPackage, KnownDependencies, NameId, PackageCandidates,
-    SolvableId, VariableId, VersionSetId, VersionSetRelation,
+    Presence, Requirement, SolvableId, VariableId, VersionSetId, VersionSetRelation,
     conflict::Conflict,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     runtime::AsyncRuntime,
@@ -118,6 +118,154 @@ pub struct UniversalSolution<Id = SolvableId, N = NameId> {
     /// order (the baseline cell first), and together cover the environment
     /// model.
     pub cells: Vec<(CellCondition<N>, Vec<Id>)>,
+
+    /// The environment model the solve was bounded by. Stored so that
+    /// [`UniversalSolution::verify`] can re-check model coverage without any
+    /// solver state (e.g. on a solution reconstructed from a lockfile).
+    pub environment_model: EnvironmentModel<N>,
+
+    /// The dependency edges active in each cell, parallel to
+    /// [`UniversalSolution::cells`] (entry `i` holds the edges of cell `i`).
+    /// Captured at solve time because the solver state is reset by the next
+    /// solve. Use [`UniversalSolution::edges`] for the aggregated view.
+    pub cell_edges: Vec<Vec<CellEdge<Id>>>,
+}
+
+/// A single dependency edge of one cell of a [`UniversalSolution`]: within
+/// that cell, `parent` is installed and its `requirement` is active and
+/// satisfied by `target`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CellEdge<Id = SolvableId> {
+    /// The solvable whose requirement this edge satisfies, or `None` when the
+    /// requirement comes from the root problem.
+    pub parent: Option<Id>,
+
+    /// The requirement this edge satisfies.
+    pub requirement: Requirement,
+
+    /// The solvable chosen to satisfy the requirement, or `None` when the
+    /// requirement is on an environment package (the environment itself
+    /// satisfies it; there is no solvable to install).
+    pub target: Option<Id>,
+}
+
+/// A consistency violation reported by [`UniversalSolution::verify`].
+///
+/// `verify` can *prove* violations, but it cannot always prove their absence:
+/// when the relation oracle answers [`VersionSetRelation::Unknown`] for a
+/// pair of version sets, disjointness of two cells may be unprovable without
+/// being false. Such cases are reported as
+/// [`Violation::UnprovenDisjointness`], which callers may choose to treat as
+/// a warning instead of an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Violation<N = NameId> {
+    /// The conditions of two cells with different solvable sets are not
+    /// provably disjoint, and all relevant oracle answers were definite: the
+    /// cells genuinely describe overlapping environment regions.
+    OverlappingCells {
+        /// Index of the first cell in [`UniversalSolution::cells`].
+        first: usize,
+        /// Index of the second cell in [`UniversalSolution::cells`].
+        second: usize,
+    },
+
+    /// The conditions of two cells with different solvable sets could not be
+    /// proven disjoint because the relation oracle answered
+    /// [`VersionSetRelation::Unknown`] for at least one pair of version sets.
+    /// The cells may still be disjoint in reality.
+    UnprovenDisjointness {
+        /// Index of the first cell in [`UniversalSolution::cells`].
+        first: usize,
+        /// Index of the second cell in [`UniversalSolution::cells`].
+        second: usize,
+    },
+
+    /// A region of the environment model is not covered by any cell. The
+    /// reported condition describes one such region (it may be vacuous when
+    /// the oracle answered [`VersionSetRelation::Unknown`] for literals
+    /// involved in it, but a complete partition never produces this
+    /// violation).
+    UncoveredRegion(CellCondition<N>),
+}
+
+impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
+    /// Returns the merged presence-condition view of the solution: one entry
+    /// per distinct solvable, paired with the OR of the conditions of the
+    /// cells that contain it.
+    ///
+    /// The presence is simplified within the bounds of the environment model:
+    /// a solvable that appears in every cell gets the always-true presence
+    /// (the cells together cover the model), and disjuncts that are identical
+    /// except for one literal appearing with opposite signs merge by dropping
+    /// that literal (run to fixpoint).
+    ///
+    /// Both the solvable order (first occurrence across cells) and the
+    /// disjunct order are deterministic.
+    pub fn merged(&self) -> Vec<(Id, Presence<N>)> {
+        let mut order: Vec<Id> = Vec::new();
+        for (_, solvables) in &self.cells {
+            for &solvable in solvables {
+                if !order.contains(&solvable) {
+                    order.push(solvable);
+                }
+            }
+        }
+        order
+            .into_iter()
+            .map(|solvable| {
+                let presence =
+                    self.presence_for_cells(|index| self.cells[index].1.contains(&solvable));
+                (solvable, presence)
+            })
+            .collect()
+    }
+
+    /// Returns the aggregated dependency edges of the solution: one entry per
+    /// distinct `(parent, requirement, target)` edge, paired with the OR of
+    /// the conditions of the cells in which the edge is active, simplified
+    /// exactly like [`UniversalSolution::merged`].
+    ///
+    /// The edge order (first occurrence across cells) and the disjunct order
+    /// are deterministic. This is the view a lockfile serializer needs to
+    /// store a conditional dependency graph.
+    pub fn edges(&self) -> Vec<(CellEdge<Id>, Presence<N>)> {
+        debug_assert_eq!(
+            self.cell_edges.len(),
+            self.cells.len(),
+            "cell_edges must be parallel to cells"
+        );
+        let mut order: Vec<CellEdge<Id>> = Vec::new();
+        for edges in &self.cell_edges {
+            for &edge in edges {
+                if !order.contains(&edge) {
+                    order.push(edge);
+                }
+            }
+        }
+        order
+            .into_iter()
+            .map(|edge| {
+                let presence =
+                    self.presence_for_cells(|index| self.cell_edges[index].contains(&edge));
+                (edge, presence)
+            })
+            .collect()
+    }
+
+    /// Computes the presence condition for the cells selected by `member`:
+    /// the always-true presence when every cell is a member (the cells
+    /// together cover the environment model), otherwise the simplified OR of
+    /// the member cells' conditions.
+    fn presence_for_cells(&self, member: impl Fn(usize) -> bool) -> Presence<N> {
+        if (0..self.cells.len()).all(&member) {
+            return Presence(vec![CellCondition(Vec::new())]);
+        }
+        let disjuncts = (0..self.cells.len())
+            .filter(|&index| member(index))
+            .map(|index| self.cells[index].0.clone())
+            .collect();
+        Presence(simplify_disjuncts(disjuncts))
+    }
 }
 
 /// The errors of an unsuccessful [`Solver::solve_universal`] call.
@@ -174,9 +322,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // model bounds every enumerated cell and the oracle consistency
         // clauses between model literals and later requirement literals are
         // emitted on first interning.
-        self.encode_environment_model(&problem.environment_model)?;
+        let environment_model = problem.environment_model;
+        self.encode_environment_model(&environment_model)?;
 
         let mut cells = Vec::new();
+        // The dependency edges of each recorded cell, captured while the
+        // cell's assignment is still on the decision stack.
+        let mut cell_edges = Vec::new();
         // The same cells in solver variable space, used for disjointness
         // checks against new cells.
         let mut cell_assignments: Vec<Vec<(VariableId, bool)>> = Vec::new();
@@ -199,6 +351,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     let solvables = self.state.chosen_solvables().collect();
                     let cell_is_empty = cell.is_empty();
                     cells.push((condition, solvables));
+                    cell_edges.push(self.capture_cell_edges());
                     cell_assignments.push(cell.clone());
 
                     // Retract all decisions before adding the blocking clause
@@ -251,7 +404,101 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
-        Ok(UniversalSolution { cells })
+        Ok(UniversalSolution {
+            cells,
+            environment_model,
+            cell_edges,
+        })
+    }
+
+    /// Captures the dependency edges that are active in the current solution
+    /// (design doc 5.8, "conditional edges"). Must be called while the
+    /// solution's decisions are still on the decision stack.
+    ///
+    /// An edge exists for every requires clause whose parent (a solvable or
+    /// the root) is installed and whose condition holds, where "holds" means
+    /// every condition complement literal evaluates to false under the
+    /// undecided-counts-as-false completion. The edge's target is the first
+    /// installed candidate of the requirement, or `None` when the requirement
+    /// is on an environment package (its candidate is an environment literal,
+    /// not a solvable).
+    fn capture_cell_edges(&self) -> Vec<CellEdge<D::SolvableId>> {
+        let state = &self.state;
+        let decision_map = state.decision_tracker.map();
+        let mut edges: Vec<CellEdge<D::SolvableId>> = Vec::new();
+
+        for (&parent_var, requirements) in state.requires_clauses.iter() {
+            if state.decision_tracker.assigned_value(parent_var) != Some(true) {
+                continue;
+            }
+            let parent = match state.variable_map.origin(parent_var) {
+                VariableOrigin::Root => None,
+                VariableOrigin::Solvable(solvable) => Some(solvable),
+                // Auxiliary variables (at-least-one trackers) re-encode
+                // requirements that are already captured for their real
+                // parent; they are not part of the dependency graph.
+                _ => continue,
+            };
+
+            for (requirement, disjunction, _clause_id) in requirements {
+                // The edge is active when the clause has no condition, or
+                // when the condition holds: every complement literal of the
+                // disjunction evaluates to false under the
+                // undecided-counts-as-false completion.
+                if let Some(disjunction) = *disjunction {
+                    let condition_holds = state.disjunctions[disjunction]
+                        .literals
+                        .iter()
+                        .all(|literal| !literal.eval(decision_map).unwrap_or(literal.negate()));
+                    if !condition_holds {
+                        continue;
+                    }
+                }
+
+                // The target is the first candidate of the requirement that
+                // is installed. An active requirement always has one: for a
+                // concrete requirement propagation forces a candidate, and
+                // for a requirement on an environment package the candidate
+                // is the (propagated true) environment literal.
+                let installed_candidate = state.requirement_to_sorted_candidates[*requirement]
+                    .iter()
+                    .flatten()
+                    .find(|&&candidate| {
+                        state.decision_tracker.assigned_value(candidate) == Some(true)
+                    });
+                let target = match installed_candidate {
+                    Some(&candidate) => match state.variable_map.origin(candidate) {
+                        VariableOrigin::Solvable(solvable) => Some(solvable),
+                        VariableOrigin::EnvMatches(_) => None,
+                        origin => unreachable!(
+                            "requirement candidates are solvables or environment literals, \
+                             not {origin:?}"
+                        ),
+                    },
+                    None => {
+                        debug_assert!(
+                            false,
+                            "bug: an active requirement of an installed parent has no \
+                             installed candidate"
+                        );
+                        continue;
+                    }
+                };
+
+                // A requirement with an OR condition produces one clause per
+                // DNF disjunct; deduplicate so the edge is recorded once.
+                let edge = CellEdge {
+                    parent,
+                    requirement: *requirement,
+                    target,
+                };
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        edges
     }
 
     /// Encodes the environment model CNF as [`Clause::EnvClause`] clauses.
@@ -636,6 +883,78 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     }
 }
 
+/// Simplifies a disjunction of conjunctions (the disjuncts of a
+/// [`Presence`]): repeatedly merges any two disjuncts that contain exactly
+/// the same literals and differ in the sign of exactly one (dropping that
+/// literal), and deduplicates identical disjuncts, until a fixpoint is
+/// reached. The disjunct counts are small (bounded by the cell count), so a
+/// quadratic pass per round is fine.
+///
+/// When a merge empties a disjunct the whole disjunction is always true and
+/// collapses to a single empty conjunction.
+fn simplify_disjuncts<N: Copy + Eq>(mut disjuncts: Vec<CellCondition<N>>) -> Vec<CellCondition<N>> {
+    'merge: loop {
+        for first in 0..disjuncts.len() {
+            for second in first + 1..disjuncts.len() {
+                let Some(merged) = merge_disjunct_pair(&disjuncts[first], &disjuncts[second])
+                else {
+                    continue;
+                };
+                if merged.0.is_empty() {
+                    // The merged disjunct holds in every environment, which
+                    // makes every other disjunct redundant.
+                    return vec![CellCondition(Vec::new())];
+                }
+                disjuncts[first] = merged;
+                disjuncts.remove(second);
+                continue 'merge;
+            }
+        }
+        return disjuncts;
+    }
+}
+
+/// Merges two conjunctions when they contain exactly the same literals
+/// (order insensitive) and differ in the sign of at most one: identical
+/// conjunctions merge to either of them, and conjunctions differing in
+/// exactly one sign merge by dropping that literal (`(C and x) or
+/// (C and not x)` simplifies to `C`). Returns `None` when the pair is not
+/// mergeable.
+///
+/// Assumes no conjunction mentions the same literal twice, which holds for
+/// cell conditions (each records one sign per environment literal variable).
+fn merge_disjunct_pair<N: Copy + Eq>(
+    a: &CellCondition<N>,
+    b: &CellCondition<N>,
+) -> Option<CellCondition<N>> {
+    if a.0.len() != b.0.len() {
+        return None;
+    }
+    let mut differing = None;
+    for (index, (literal, sign)) in a.0.iter().enumerate() {
+        let (_, b_sign) = b.0.iter().find(|(b_literal, _)| b_literal == literal)?;
+        if sign != b_sign {
+            if differing.is_some() {
+                return None;
+            }
+            differing = Some(index);
+        }
+    }
+    // Equal lengths and every literal of `a` found in `b`: with no duplicate
+    // literals this is a bijection, so the literal sets are identical.
+    let merged = match differing {
+        None => a.0.clone(),
+        Some(drop_index) => {
+            a.0.iter()
+                .enumerate()
+                .filter(|&(index, _)| index != drop_index)
+                .map(|(_, literal)| literal.clone())
+                .collect()
+        }
+    };
+    Some(CellCondition(merged))
+}
+
 /// A dedicated backtracking search for an assignment satisfying all the
 /// given clauses. The number of environment literals is small, so a simple
 /// exhaustive search with clause-violation pruning is sufficient; the main
@@ -819,6 +1138,88 @@ mod test {
         cuda absent -> [a=1]
         cuda in 11..100 -> [a=1]
         ");
+    }
+
+    /// Helper for the simplification unit tests: a matches literal for
+    /// version set index `vs` of a single shared package.
+    fn env_lit(vs: usize) -> EnvLiteral<NameId> {
+        EnvLiteral {
+            package: NameId::from_index(0),
+            kind: EnvLiteralKind::Matches(VersionSetId::from_index(vs)),
+        }
+    }
+
+    /// Helper for the simplification unit tests: a conjunction of signed
+    /// literals given as `(version set index, sign)` pairs.
+    fn conj(literals: &[(usize, bool)]) -> CellCondition<NameId> {
+        CellCondition(
+            literals
+                .iter()
+                .map(|&(vs, sign)| (env_lit(vs), sign))
+                .collect(),
+        )
+    }
+
+    /// Two disjuncts that are identical except for one literal appearing
+    /// with opposite signs merge by dropping that literal.
+    #[test]
+    fn test_simplify_merges_opposite_literal() {
+        let disjuncts = vec![
+            conj(&[(0, true), (1, true)]),
+            conj(&[(0, true), (1, false)]),
+        ];
+        assert_eq!(simplify_disjuncts(disjuncts), vec![conj(&[(0, true)])]);
+    }
+
+    /// Literal order within a conjunction does not matter for merging.
+    #[test]
+    fn test_simplify_merges_reordered_literals() {
+        let disjuncts = vec![
+            conj(&[(0, true), (1, true)]),
+            conj(&[(1, false), (0, true)]),
+        ];
+        assert_eq!(simplify_disjuncts(disjuncts), vec![conj(&[(0, true)])]);
+    }
+
+    /// All four sign combinations of two literals collapse to the
+    /// always-true presence (a single empty conjunction) at the fixpoint.
+    #[test]
+    fn test_simplify_fixpoint_collapses_to_all_environments() {
+        let disjuncts = vec![
+            conj(&[(0, true), (1, true)]),
+            conj(&[(0, true), (1, false)]),
+            conj(&[(0, false), (1, true)]),
+            conj(&[(0, false), (1, false)]),
+        ];
+        assert_eq!(simplify_disjuncts(disjuncts), vec![conj(&[])]);
+    }
+
+    /// Disjuncts over different literals or of different lengths are not
+    /// merged.
+    #[test]
+    fn test_simplify_keeps_unmergeable_disjuncts() {
+        let disjuncts = vec![conj(&[(0, true)]), conj(&[(1, true)])];
+        assert_eq!(simplify_disjuncts(disjuncts.clone()), disjuncts);
+
+        let disjuncts = vec![conj(&[(0, true)]), conj(&[(0, false), (1, true)])];
+        assert_eq!(simplify_disjuncts(disjuncts.clone()), disjuncts);
+    }
+
+    /// Disjuncts differing in more than one sign are not merged.
+    #[test]
+    fn test_simplify_keeps_doubly_differing_disjuncts() {
+        let disjuncts = vec![
+            conj(&[(0, true), (1, true)]),
+            conj(&[(0, false), (1, false)]),
+        ];
+        assert_eq!(simplify_disjuncts(disjuncts.clone()), disjuncts);
+    }
+
+    /// Identical disjuncts are deduplicated.
+    #[test]
+    fn test_simplify_drops_duplicate_disjuncts() {
+        let disjuncts = vec![conj(&[(0, true)]), conj(&[(0, true)])];
+        assert_eq!(simplify_disjuncts(disjuncts), vec![conj(&[(0, true)])]);
     }
 
     /// No clauses at all: the (empty) assignment vacuously satisfies

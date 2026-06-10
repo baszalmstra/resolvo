@@ -1918,6 +1918,147 @@ fn test_universal_or_condition_dnf_partition() {
     ");
 }
 
+// ===========================================================================
+// M3: Output layer (merged presence view and conditional edges)
+// ===========================================================================
+
+/// Runs a universal solve and formats the merged presence view and the
+/// aggregated conditional edges for inline snapshots.
+fn universal_merged_and_edges_snapshot(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> String {
+    use std::fmt::Write;
+
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model);
+    let solution = solver.solve_universal(problem).expect("solvable");
+    let provider = solver.provider();
+
+    let mut buf = String::new();
+    writeln!(buf, "merged:").unwrap();
+    for (solvable, presence) in solution.merged() {
+        writeln!(
+            buf,
+            "  {} -> {}",
+            provider.display_solvable(solvable),
+            presence.display(provider)
+        )
+        .unwrap();
+    }
+    writeln!(buf, "edges:").unwrap();
+    for (edge, presence) in solution.edges() {
+        let parent = match edge.parent {
+            Some(parent) => provider.display_solvable(parent).to_string(),
+            None => "<root>".to_string(),
+        };
+        let target = match edge.target {
+            Some(target) => provider.display_solvable(target).to_string(),
+            None => "<environment>".to_string(),
+        };
+        writeln!(
+            buf,
+            "  {parent} -> {} -> {target} [{}]",
+            edge.requirement.display(provider),
+            presence.display(provider)
+        )
+        .unwrap();
+    }
+    buf
+}
+
+/// merged() over the cross-product scenario: `a` is in every cell and gets
+/// the always-true presence; the cells containing `b` (resp. `c`) differ only
+/// in the sign of the rocm (resp. cuda) literal, so the pairwise merge drops
+/// it. The edges carry the same presences: the root edge to `a` is
+/// unconditional, the conditional dependencies of `a` are active exactly
+/// where their guard literal is true.
+#[test]
+fn test_universal_merged_and_edges_cross_product() {
+    let result = universal_merged_and_edges_snapshot(cross_product_provider(), &["a"], &[]);
+    assert_snapshot!(result, @r"
+    merged:
+      a=1 -> <all environments>
+      b=1 -> cuda in >=11, <100
+      c=1 -> rocm in >=5, <10
+    edges:
+      <root> -> a * -> a=1 [<all environments>]
+      a=1 -> b >=1, <2 -> b=1 [cuda in >=11, <100]
+      a=1 -> c >=1, <2 -> c=1 [rocm in >=5, <10]
+    ");
+}
+
+/// merged() with a presence that does not simplify to a single conjunction:
+/// in the OR-condition scenario `b` is installed in the `cuda` cell and in
+/// the `not cuda AND rocm` cell. The two disjuncts have different lengths,
+/// so they stay an OR (the multi-literal disjunct is parenthesized).
+#[test]
+fn test_universal_merged_or_condition_keeps_disjunction() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 or rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_merged_and_edges_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    merged:
+      a=1 -> <all environments>
+      b=1 -> cuda in >=11, <100 OR (not (cuda in >=11, <100) AND rocm in >=5, <100)
+    edges:
+      <root> -> a * -> a=1 [<all environments>]
+      a=1 -> b >=1, <2 -> b=1 [cuda in >=11, <100 OR (not (cuda in >=11, <100) AND rocm in >=5, <100)]
+    ");
+}
+
+/// An edge whose requirement is on an environment package has no target
+/// solvable: the environment itself satisfies it. The root edge to `rocm` is
+/// active in every cell and aggregates to the always-true presence.
+#[test]
+fn test_universal_edges_env_requirement_has_no_target() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result =
+        universal_merged_and_edges_snapshot(provider, &["a", "rocm 5..100"], &[&["rocm 5..100"]]);
+    assert_snapshot!(result, @r"
+    merged:
+      a=1 -> <all environments>
+      b=1 -> rocm in >=5, <100 AND cuda in >=11, <100
+    edges:
+      <root> -> a * -> a=1 [<all environments>]
+      <root> -> rocm >=5, <100 -> <environment> [<all environments>]
+      a=1 -> b >=1, <2 -> b=1 [rocm in >=5, <100 AND cuda in >=11, <100]
+    ");
+}
+
 /// The environment model may only reference environment packages; a
 /// concrete package is reported with a clear panic.
 #[test]

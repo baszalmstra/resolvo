@@ -45,7 +45,9 @@ mod universal;
 pub(crate) mod variable_map;
 mod watch_map;
 
-pub use universal::{EnvironmentModel, UniversalFailure, UniversalProblem, UniversalSolution};
+pub use universal::{
+    CellEdge, EnvironmentModel, UniversalFailure, UniversalProblem, UniversalSolution, Violation,
+};
 
 /// Describes the problem that is to be solved by the solver.
 ///
