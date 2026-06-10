@@ -415,6 +415,38 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         ))
     }
 
+    /// Returns the solvables of the unique cell whose condition holds in the
+    /// concrete environment described by `eval`: a `(literal, true)` entry
+    /// requires `eval(literal)` to be true and a `(literal, false)` entry
+    /// requires it to be false. This is the runtime "walker" entry point: an
+    /// installer evaluates the environment literals against the actual
+    /// machine and installs the projected cell, no solving required.
+    ///
+    /// Returns `None` when no cell matches, which only happens for
+    /// environments outside the environment model. More than one matching
+    /// cell is a broken pairwise-disjointness invariant: this is a
+    /// `debug_assert`, and release builds return the first match.
+    pub fn project(&self, eval: impl Fn(&EnvLiteral<N>) -> bool) -> Option<&[Id]> {
+        let mut found: Option<&[Id]> = None;
+        for (condition, solvables) in &self.cells {
+            let matches = condition
+                .0
+                .iter()
+                .all(|(literal, sign)| eval(literal) == *sign);
+            if !matches {
+                continue;
+            }
+            debug_assert!(
+                found.is_none(),
+                "broken invariant: multiple cells match the same environment"
+            );
+            if found.is_none() {
+                found = Some(solvables);
+            }
+        }
+        found
+    }
+
     /// Computes the presence condition for the cells selected by `member`:
     /// the always-true presence when every cell is a member (the cells
     /// together cover the environment model), otherwise the simplified OR of
@@ -1625,6 +1657,74 @@ mod test {
         };
 
         assert_eq!(solution.verify(&provider), Ok(()));
+    }
+
+    /// project() picks the unique cell whose condition holds under the
+    /// evaluation closure: a glibc 230 machine satisfies both range literals
+    /// and lands in the first cell, a glibc 220 machine fails the `>=228`
+    /// literal and lands in the second.
+    #[test]
+    fn test_project_selects_unique_cell() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("glibc", false);
+        let glibc_217 = provider.version_set("glibc", 217, 1000);
+        let glibc_228 = provider.version_set("glibc", 228, 1000);
+        let glibc_name = provider.pool.intern_package_name("glibc");
+        let pkg_2 = provider.add_package("pkg", 2);
+        let pkg_1 = provider.add_package("pkg", 1);
+        provider.set_dependencies(pkg_2, vec![glibc_228.into()], vec![]);
+        provider.set_dependencies(pkg_1, vec![glibc_217.into()], vec![]);
+        let pkg_any = provider.version_set("pkg", 0, 3);
+
+        let mut solver = Solver::new(provider);
+        let problem = UniversalProblem::new()
+            .requirements(vec![pkg_any.into()])
+            .environment_model(vec![vec![(
+                EnvLiteral {
+                    package: glibc_name,
+                    kind: EnvLiteralKind::Matches(glibc_217),
+                },
+                true,
+            )]]);
+        let solution = solver.solve_universal(problem).expect("solvable");
+
+        let provider = solver.provider();
+        let eval_for = |glibc_version: u32| {
+            move |literal: &EnvLiteral<NameId>| match literal.kind {
+                EnvLiteralKind::Matches(version_set) => provider
+                    .pool
+                    .resolve_version_set(version_set)
+                    .contains(glibc_version),
+                EnvLiteralKind::Absent => false,
+            }
+        };
+
+        assert_eq!(solution.project(eval_for(230)), Some(&[pkg_2][..]));
+        assert_eq!(solution.project(eval_for(220)), Some(&[pkg_1][..]));
+        // Outside the model (glibc < 217) no cell matches.
+        assert_eq!(solution.project(eval_for(100)), None);
+    }
+
+    /// Two cells matching the same environment is a broken invariant:
+    /// project() debug-asserts (and returns the first match in release).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "multiple cells")]
+    fn test_project_panics_on_overlapping_cells_in_debug() {
+        let mut provider = EnvTestProvider::default();
+        let a1 = provider.add_package("a", 1);
+        let a2 = provider.add_package("a", 2);
+
+        let solution: UniversalSolution = UniversalSolution {
+            cells: vec![
+                (CellCondition(vec![]), vec![a1]),
+                (CellCondition(vec![]), vec![a2]),
+            ],
+            environment_model: vec![],
+            cell_edges: vec![vec![], vec![]],
+        };
+
+        let _ = solution.project(|_| false);
     }
 
     /// Helper for the simplification unit tests: a matches literal for
