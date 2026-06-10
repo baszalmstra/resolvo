@@ -442,6 +442,40 @@ This is the trickiest internal change; it needs careful tests around
 backjumping (a learnt clause asserting at an assumption level, conflicts at
 level n+1, etc.).
 
+(Learned in M4, now implemented:) the exact mechanics that proved out:
+
+- `ClauseId::assumption()` is deliberately NOT backed by a real clause: it
+  sits at the top of the id space, is only ever compared against, and an
+  accidental dereference panics out of bounds. Conflict analysis never
+  resolves on assumption decisions: the analysis pop loop only consumes
+  decisions at the conflict level, which all sit above the assumptions on
+  the level-monotone stack (debug asserted). Learnt clauses therefore stay
+  globally valid; assumptions enter them only as literals.
+- The "root level" generalizes from 1 to n+1 everywhere: the root install
+  sits directly above the assumption prefix. `learn_from_conflict` treats a
+  conflict at level <= n+1 as "unsolvable as seeded" (internal
+  `ResolveError::AssumptionConflict`), which `run_sat` surfaces as
+  `Ok(false)`, the same contract as the existing prior-decisions
+  unsolvable path; while assumptions are active every unsolvable outcome
+  means exactly that, so no extra distinction is needed. `analyze` clamps
+  the backjump target to n+1: a raw target inside the assumption prefix
+  (every non-UIP literal at assumption levels) would pop the root install,
+  which nothing reinstalls mid-run; asserting the UIP literal at the root
+  level instead is a valid, merely later-than-necessary unit propagation.
+- Cell solvables are recorded in canonical variable-interning order, not
+  decision-stack order: propagation order (watchlist history) legitimately
+  differs between a free and a seeded solve of the same cell.
+- Seeded re-solves are NOT always byte-identical: a cell's original
+  solution can be steered by transient learnt state from conflicts in
+  earlier cells of the same run, while the seeded replay avoids those
+  conflicts and finds a better solution whose support can be more general
+  (healing applies to solvables, not just stale conditions; about a fifth
+  of the conflict-heavy random universes in the property test heal). One
+  reseed round is a byte-identical fixed point, and conflict-free replays
+  reproduce exactly. Callers that want version-level stickiness on top
+  should pass the previous solution as `Candidates::favored`, which keeps
+  working unchanged in universal mode.
+
 ### 5.8 Output types, merge, verify, project
 
 ```rust
