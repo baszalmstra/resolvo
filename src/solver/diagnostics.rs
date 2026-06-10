@@ -185,6 +185,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         .unwrap();
         writeln!(writer, "Conflicts:\t{}", counters.conflicts).unwrap();
 
+        let mut by_clause: Vec<_> = counters.conflicts_by_clause.iter().collect();
+        by_clause.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
+        if !by_clause.is_empty() {
+            writeln!(writer, "\nTop conflicting clauses:").unwrap();
+            for (key, count) in by_clause.into_iter().take(15) {
+                writeln!(writer, "- {count}x\t{key}").unwrap();
+            }
+        }
+
         writeln!(writer, "\nClause visits by type:").unwrap();
         let vbt = &counters.visits_by_type;
         writeln!(writer, "- Requires:\t{}", vbt.requires).unwrap();

@@ -686,7 +686,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 seeded = self.push_seed_assumptions(&seed)?;
             }
 
-            match self.run_sat(SolvableIdOrRoot::root(), &root_dependencies) {
+            let sat_start = std::time::Instant::now();
+            let sat_result = self.run_sat(SolvableIdOrRoot::root(), &root_dependencies);
+            tracing::info!(
+                "universal: run_sat #{} ({}) took {:?} ({} clauses, {} learnt)",
+                cells.len() + 1,
+                if seeded { "seeded" } else { "free" },
+                sat_start.elapsed(),
+                self.state.clauses.kinds.len(),
+                self.state.learnt_clauses.len(),
+            );
+            match sat_result {
                 Ok(true) => {
                     // Extract the load-bearing environment literal
                     // assignments and restore provable disjointness against
@@ -762,7 +772,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         !seeded,
                         "bug: a seeded solve surfaces unsolvability as Ok(false)"
                     );
-                    match self.find_environment_witness() {
+                    let witness_start = std::time::Instant::now();
+                    let witness = self.find_environment_witness();
+                    tracing::info!(
+                        "universal: witness search took {:?}",
+                        witness_start.elapsed()
+                    );
+                    match witness {
                         None => {
                             // No environment assignment satisfies the model,
                             // oracle and blocking clauses: the recorded cells
@@ -791,6 +807,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 }
             }
         }
+
+        #[cfg(feature = "diagnostics")]
+        self.report_diagnostics();
 
         Ok(UniversalSolution {
             cells,

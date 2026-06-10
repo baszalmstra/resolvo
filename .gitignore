@@ -29,3 +29,6 @@ snapshot_*.json
 bench-final/
 
 timings_*
+timings.csv
+conda-forge-timings.csv
+conda-forge-*.json

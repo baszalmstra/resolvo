@@ -356,6 +356,9 @@ pub(crate) struct PropagationCounters {
     pub unwatched_calls_by_type: PropagationVisitsByType,
     pub propagate_calls: u64,
     pub conflicts: u64,
+    /// Conflict tally keyed by a rendering of the conflicting clause,
+    /// for pinpointing which clauses drive conflict storms.
+    pub conflicts_by_clause: std::collections::HashMap<String, u64>,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -560,8 +563,16 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         };
         assert_eq!(root_clause, ClauseId::install_root());
 
+        let sat_start = std::time::Instant::now();
+        let sat_result = self.run_sat(SolvableIdOrRoot::root(), &root_dependencies)?;
+        tracing::info!(
+            "concrete: run_sat took {:?} ({} clauses, {} learnt)",
+            sat_start.elapsed(),
+            self.state.clauses.kinds.len(),
+            self.state.learnt_clauses.len(),
+        );
         assert!(
-            self.run_sat(SolvableIdOrRoot::root(), &root_dependencies)?,
+            sat_result,
             "bug: Since root is the first requested solvable, \
                   should have returned Err instead of Ok(false) if root is unsolvable"
         );
@@ -1410,6 +1421,21 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ) -> Result<u32, ResolveError> {
         #[cfg(feature = "diagnostics")]
         let learn_start = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut key = format!(
+                "{}",
+                self.state.clauses.kinds[conflicting_clause.to_index()]
+                    .display(&self.state.variable_map, self.provider())
+            );
+            key.truncate(160);
+            *self
+                .state
+                .propagation_counters
+                .conflicts_by_clause
+                .entry(key)
+                .or_default() += 1;
+        }
         {
             tracing::debug!(
                 "├┬ Propagation conflicted: could not set {solvable} to {attempted_value}",
