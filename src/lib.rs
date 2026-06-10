@@ -7,6 +7,24 @@
 //! libsolv is, however, very low level C, so if you are looking for an
 //! introduction to CDCL, you are encouraged to look at the paper instead or to
 //! keep reading through this codebase and its comments.
+//!
+//! # Universal solving
+//!
+//! Besides classic single-environment resolution ([`Solver::solve`]), resolvo
+//! supports *universal* multi-environment resolution via
+//! [`Solver::solve_universal`]: a single solve whose result is valid for a
+//! whole family of environments (for example all glibc versions in a range,
+//! or machines with and without CUDA). Properties of the target environment
+//! are modeled as *environment packages*: packages whose value is unknown at
+//! solve time, declared by returning [`PackageCandidates::Environment`] from
+//! [`DependencyProvider::get_candidates`] and related through the
+//! [`DependencyProvider::environment_version_set_relation`] oracle. A
+//! [`UniversalProblem`] bounds the environment space with an explicit
+//! [`EnvironmentModel`]; the solver partitions that space into disjoint
+//! cells, each paired with the solvables valid throughout the cell, returned
+//! as a [`UniversalSolution`] (or a [`UniversalFailure`] carrying a conflict
+//! scoped to the unsolvable region). See the `solver::universal` module
+//! documentation in the source for a worked end-to-end example.
 
 #![deny(missing_docs)]
 #![deny(unnameable_types)]

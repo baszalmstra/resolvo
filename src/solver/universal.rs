@@ -11,6 +11,100 @@
 //! the environment model is fully covered (success) or an uncovered region
 //! remains that is unsolvable (failure).
 //!
+//! # Worked example
+//!
+//! The example below shows the full life cycle: declaring an environment
+//! package, implementing the relation oracle, building and solving a
+//! [`UniversalProblem`], consuming the solution, and seeding the next solve.
+//! The code is illustrative (`ignore`); `tests/solver/main.rs` contains
+//! executable equivalents of every step (see the `test_universal_*` tests).
+//!
+//! ```ignore
+//! use resolvo::{
+//!     Candidates, DependencyProvider, EnvLiteral, EnvLiteralKind, EnvironmentPackage,
+//!     PackageCandidates, Solver, UniversalProblem, VersionSetRelation,
+//! };
+//!
+//! // 1. Declare an environment package: a package whose value is unknown at
+//! //    solve time (e.g. `cuda`). Instead of concrete candidate solvables,
+//! //    `get_candidates` returns `PackageCandidates::Environment`.
+//! impl DependencyProvider for MyProvider {
+//!     async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
+//!         if self.is_environment_package(name) {
+//!             return Some(PackageCandidates::Environment(EnvironmentPackage {
+//!                 // Machines without CUDA exist, so the absent literal is
+//!                 // part of the environment space.
+//!                 can_be_absent: true,
+//!             }));
+//!         }
+//!         Some(Candidates { candidates: self.candidates_for(name), ..Default::default() }.into())
+//!     }
+//!
+//!     // 2. Implement the relation oracle for version sets of environment
+//!     //    packages. Soundness contract: answers other than `Unknown` must
+//!     //    be correct; when in doubt return `Unknown`. A wrong `Disjoint`
+//!     //    or `Subset` answer produces broken solutions, `Unknown` merely
+//!     //    risks describing environment regions no real machine has.
+//!     fn environment_version_set_relation(
+//!         &self,
+//!         a: VersionSetId,
+//!         b: VersionSetId,
+//!     ) -> VersionSetRelation {
+//!         let (a, b) = (self.range(a), self.range(b));
+//!         if a == b {
+//!             VersionSetRelation::Equal
+//!         } else if a.is_disjoint(&b) {
+//!             VersionSetRelation::Disjoint
+//!         } else if b.contains(&a) {
+//!             VersionSetRelation::Subset
+//!         } else {
+//!             VersionSetRelation::Unknown
+//!         }
+//!     }
+//!
+//!     // ... the remaining DependencyProvider methods as usual ...
+//! }
+//!
+//! // 3. Build the problem: requirements as usual, plus an environment model
+//! //    bounding the environment space the solution must cover. The model is
+//! //    a CNF over signed environment literals; this one says "cuda is
+//! //    absent, or cuda matches >=11". An empty model means "all
+//! //    environments".
+//! let model = vec![vec![
+//!     (EnvLiteral { package: cuda_name, kind: EnvLiteralKind::Absent }, true),
+//!     (EnvLiteral { package: cuda_name, kind: EnvLiteralKind::Matches(cuda_ge_11) }, true),
+//! ]];
+//! let problem = UniversalProblem::new()
+//!     .requirements(requirements)
+//!     .environment_model(model.clone());
+//!
+//! let mut solver = Solver::new(provider);
+//! let solution = solver.solve_universal(problem)?;
+//!
+//! // 4. Consume the solution. `cells` partitions the environment space:
+//! //    each cell pairs a region (a conjunction of signed environment
+//! //    literals) with the solvables valid throughout that region.
+//! for (condition, solvables) in &solution.cells {
+//!     println!("{}: {solvables:?}", condition.display(solver.provider()));
+//! }
+//! // Per-solvable presence conditions, simplified within the model bounds.
+//! let merged = solution.merged();
+//! // The conditional dependency graph: what a lockfile serializer stores.
+//! let edges = solution.edges();
+//! // Project onto one concrete machine by evaluating each literal.
+//! let on_this_machine = solution.project(|literal| my_machine.satisfies(literal));
+//! // Re-check pairwise disjointness and model coverage, e.g. after
+//! // reconstructing a solution from a lockfile.
+//! solution.verify(solver.provider()).expect("disjoint cells covering the model");
+//!
+//! // 5. Seed the next solve with the previous partition: stable regions
+//! //    re-solve first and keep their cell identity, which minimizes churn.
+//! let next = UniversalProblem::new()
+//!     .requirements(new_requirements)
+//!     .environment_model(model)
+//!     .seed_partition(solution.cells.iter().map(|(c, _)| c.clone()).collect());
+//! ```
+//!
 //! # Conflict reporting
 //!
 //! When [`Solver::solve_universal`] returns
@@ -21,15 +115,17 @@
 //! clauses that are relevant within the specific cell where the formula is
 //! unsatisfiable.
 //!
-//! Environment-package requirements (packages declared via
-//! [`PackageCandidates::Environment`]) are handled without panicking:
-//! they appear as "no candidates" edges in the conflict graph rather than
-//! attempting to enumerate concrete solvables (which would panic because no
-//! such solvables exist for environment packages). Constraints placed on
-//! environment packages by solvables appear as conflict edges pointing to
-//! [`ConflictNode::EnvMatches`](crate::conflict::ConflictNode::EnvMatches) or
-//! [`ConflictNode::EnvAbsent`](crate::conflict::ConflictNode::EnvAbsent) nodes
-//! in the graph.
+//! Environment packages are symbolic, so the conflict graph never treats
+//! them as missing dependencies. A requirement on an environment package
+//! becomes a requires edge to the
+//! [`ConflictNode::EnvMatches`](crate::conflict::ConflictNode::EnvMatches)
+//! node for its version set, rendered as a requirement on the environment.
+//! Constraints placed on environment packages by solvables, and
+//! mutual-exclusivity relations between environment literals (oracle
+//! consistency clauses), appear as conflict edges between solvable nodes and
+//! environment-literal nodes
+//! ([`ConflictNode::EnvMatches`](crate::conflict::ConflictNode::EnvMatches) /
+//! [`ConflictNode::EnvAbsent`](crate::conflict::ConflictNode::EnvAbsent)).
 
 use std::{any::Any, marker::PhantomData};
 
