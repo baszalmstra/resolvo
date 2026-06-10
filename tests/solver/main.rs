@@ -6,9 +6,9 @@ use bundle_box::{BundleBoxProvider, Pack};
 use insta::assert_snapshot;
 use itertools::Itertools;
 use resolvo::{
-    ConditionalRequirement, DependencyProvider, EnvLiteral, EnvLiteralKind, Interner, NameId,
-    Problem, SolvableId, Solver, UniversalFailure, UniversalProblem, UnsolvableOrCancelled,
-    VersionSetId,
+    CellCondition, ConditionalRequirement, DependencyProvider, EnvLiteral, EnvLiteralKind,
+    Interner, NameId, Problem, SolvableId, Solver, UniversalFailure, UniversalProblem,
+    UniversalSolution, UnsolvableOrCancelled, VersionSetId,
 };
 use tracing_test::traced_test;
 
@@ -2119,6 +2119,281 @@ fn test_universal_model_rejects_empty_disjunction() {
     provider.add_environment_package("cuda", true);
 
     let _ = universal_solve_snapshot(provider, &[], &[&[]]);
+}
+
+// ===========================================================================
+// M4: Seeded partition (assumptions)
+// ===========================================================================
+
+/// Runs a universal solve with a seed partition and returns the solver plus
+/// the raw result, for tests that compare full solutions (via their `Debug`
+/// representation) or feed one solve's cells into another solve's seeds.
+///
+/// Note for identity comparisons across two solver instances: identically
+/// constructed [`BundleBoxProvider`]s assign identical interned ids
+/// (`add_package` interns dependency version sets eagerly, in construction
+/// order), which is what makes `Debug` output comparable byte for byte.
+#[allow(clippy::type_complexity)]
+fn universal_solve_with_seeds(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+    seeds: Vec<CellCondition<NameId>>,
+) -> (
+    Solver<BundleBoxProvider>,
+    Result<UniversalSolution, UniversalFailure<NameId>>,
+) {
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model)
+        .seed_partition(seeds);
+    let result = solver.solve_universal(problem);
+    (solver, result)
+}
+
+/// Formats a universal solve result exactly like [`universal_solve_snapshot`]
+/// does, for tests that hold the result.
+fn format_universal_result(
+    solver: &Solver<BundleBoxProvider>,
+    result: &Result<UniversalSolution, UniversalFailure<NameId>>,
+) -> String {
+    use std::fmt::Write;
+    match result {
+        Ok(solution) => {
+            let mut buf = String::new();
+            for (condition, solvables) in &solution.cells {
+                writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
+                for solvable in solvables
+                    .iter()
+                    .map(|&s| solver.provider().display_solvable(s).to_string())
+                    .sorted()
+                {
+                    writeln!(buf, "  {solvable}").unwrap();
+                }
+            }
+            buf
+        }
+        Err(UniversalFailure::Unsolvable { cell, .. }) => {
+            format!("unsolvable in cell: {}", cell.display(solver.provider()))
+        }
+        Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+    }
+}
+
+/// Runs an unseeded universal solve followed by a re-solve of the same
+/// problem with the first result's cells as the seed partition, on the SAME
+/// solver. This is the real re-solve flow: the provider, and with it every
+/// lazily interned id, persists across the two calls (the solver state
+/// itself is reset per call). Returns the solver and both solutions.
+fn universal_resolve_with_own_cells(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> (
+    Solver<BundleBoxProvider>,
+    UniversalSolution,
+    UniversalSolution,
+) {
+    let requirements = provider.requirements(specs);
+    let environment_model: Vec<Vec<(EnvLiteral<NameId>, bool)>> = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let first = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements.clone())
+                .environment_model(environment_model.clone()),
+        )
+        .expect("solvable");
+
+    let seeds = first
+        .cells
+        .iter()
+        .map(|(condition, _)| condition.clone())
+        .collect();
+    let second = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(environment_model)
+                .seed_partition(seeds),
+        )
+        .expect("solvable");
+
+    (solver, first, second)
+}
+
+/// Seed stability (design doc 5.7 / M4 acceptance): re-solving the same
+/// universe with the previous result's cells as the seed partition
+/// reproduces the partition exactly: identical cells (conditions and
+/// solvables), identical environment model and identical edges. Each seed is
+/// solved first under assumptions; because each seed equals a recorded cell
+/// of the same universe, every inner solve replays the original solution,
+/// the disjointness repair re-derives the original conditions, and the
+/// trailing free enumeration finds the model already fully covered.
+#[test]
+fn test_universal_seed_reproduces_partition() {
+    let (solver, first, second) =
+        universal_resolve_with_own_cells(cross_product_provider(), &["a"], &[]);
+
+    // Byte-identical solutions: cells, environment model and per-cell edges.
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+    // And in human-readable form: the seeded partition is exactly the
+    // unseeded cross-product partition of the M2 test.
+    assert_snapshot!(format_universal_result(&solver, &Ok(second)), @r"
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <10)
+      a=1
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <10)
+      a=1
+      b=1
+    cell: cuda in >=11, <100 AND rocm in >=5, <10
+      a=1
+      b=1
+      c=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <10
+      a=1
+      c=1
+    ");
+}
+
+/// Determinism (M4 acceptance): the same seeded input solved twice, in two
+/// independent but identically constructed solvers, produces byte-identical
+/// output. (Identical construction drives identical lazy interning, so the
+/// ids embedded in the `Debug` output are comparable across the instances.)
+#[test]
+fn test_universal_seeded_determinism() {
+    let (_, _, first) = universal_resolve_with_own_cells(cross_product_provider(), &["a"], &[]);
+    let (_, _, second) = universal_resolve_with_own_cells(cross_product_provider(), &["a"], &[]);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+}
+
+/// A seed literal whose package is not an environment package is a caller
+/// error and panics with a clear message.
+#[test]
+#[should_panic(expected = "is not an environment package")]
+fn test_universal_seed_rejects_concrete_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let seed = CellCondition(vec![parse_env_literal(&mut provider, "b 1..2")]);
+    let _ = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+}
+
+/// An absent seed literal for a package declared with `can_be_absent: false`
+/// is a caller error and panics with a clear message.
+#[test]
+#[should_panic(expected = "can_be_absent: false")]
+fn test_universal_seed_rejects_absent_literal_for_present_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let seed = CellCondition(vec![parse_env_literal(&mut provider, "cuda absent")]);
+    let _ = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+}
+
+/// Assumption-boundary case named by the design doc: a conflict at exactly
+/// level n+1, the root install level of a seeded solve. The seed
+/// `not (cuda absent) AND not (cuda 11..100)` describes a region outside the
+/// model `cuda absent OR cuda 11..100`: the two assumptions occupy levels 1
+/// and 2, the root is installed at level 3 = n+1, and the very first
+/// propagation walks the model clause `(absent OR matches)`, whose two
+/// literals are both false by assumption, forcing a conflict at level n+1
+/// before any search decision is made. The solver must report the seed
+/// unsolvable as seeded (not a global conflict), drop it, and free
+/// enumeration must then produce exactly the unseeded partition.
+#[test]
+fn test_universal_seed_conflict_at_level_n_plus_one_drops_seed() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 11..100"),
+    ]];
+    let seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "not cuda absent"),
+        parse_env_literal(&mut provider, "not cuda 11..100"),
+    ]);
+
+    let mut solver = Solver::new(provider);
+    let unseeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements.clone())
+                .environment_model(model.clone()),
+        )
+        .expect("solvable");
+    let seeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(vec![seed]),
+        )
+        .expect("solvable");
+
+    assert_eq!(format!("{unseeded:?}"), format!("{seeded:?}"));
+    assert_snapshot!(format_universal_result(&solver, &Ok(seeded)), @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
+/// A seed that contradicts itself on the same literal (`cuda 11..100` both
+/// positive and negative) describes no environment at all: it is dropped at
+/// assumption setup (the second decision on the same variable fails) and the
+/// solve continues as if the seed was not given.
+#[test]
+fn test_universal_self_contradictory_seed_dropped() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "cuda 11..100"),
+        parse_env_literal(&mut provider, "not cuda 11..100"),
+    ]);
+    let (solver, result) = universal_solve_with_seeds(
+        provider,
+        &["a"],
+        &[&["cuda absent", "cuda 11..100"]],
+        vec![seed],
+    );
+    assert_snapshot!(format_universal_result(&solver, &result), @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    ");
 }
 
 /// Multiple constraints from different parents on the same package.

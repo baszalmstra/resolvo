@@ -15,6 +15,22 @@ impl ClauseId {
     pub(crate) fn install_root() -> Self {
         Self(unsafe { NonZeroU32::new_unchecked(1) })
     }
+
+    /// A sentinel used as the `derived_from` of assumption decisions pushed
+    /// by `solve_universal` for seeded cells (patterned after
+    /// [`ClauseId::install_root`], which conflict analysis also compares
+    /// against rather than dereferences for root decisions).
+    ///
+    /// Unlike `install_root` the sentinel is deliberately NOT backed by a
+    /// real clause: the id sits at the very top of the id space so that
+    /// accidentally indexing the clause arena with it fails loudly with an
+    /// out-of-bounds panic instead of silently reading an unrelated clause.
+    /// Conflict analysis never resolves on assumption decisions (a conflict
+    /// at or below the assumption boundary ends the seeded solve instead),
+    /// so the id is only ever compared against, never dereferenced.
+    pub(crate) fn assumption() -> Self {
+        Self(NonZeroU32::MAX)
+    }
 }
 
 impl DenseIndex for ClauseId {

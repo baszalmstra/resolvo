@@ -24,6 +24,7 @@ use crate::{
     solver::{
         Solver, SolverState, UnsolvableOrCancelled,
         clause::{Clause, EnvClauseKind, Literal, WatchedLiterals},
+        decision::Decision,
         variable_map::VariableOrigin,
     },
     solver_id::IdMap,
@@ -53,6 +54,7 @@ pub struct UniversalProblem<Id = SolvableId, N = NameId> {
     requirements: Vec<ConditionalRequirement>,
     constraints: Vec<VersionSetId>,
     environment_model: EnvironmentModel<N>,
+    seed_partition: Vec<CellCondition<N>>,
     _marker: PhantomData<fn(Id) -> Id>,
 }
 
@@ -71,6 +73,7 @@ impl<Id, N> UniversalProblem<Id, N> {
             requirements: Vec::new(),
             constraints: Vec::new(),
             environment_model: Vec::new(),
+            seed_partition: Vec::new(),
             _marker: PhantomData,
         }
     }
@@ -103,6 +106,28 @@ impl<Id, N> UniversalProblem<Id, N> {
     pub fn environment_model(self, environment_model: EnvironmentModel<N>) -> Self {
         Self {
             environment_model,
+            ..self
+        }
+    }
+
+    /// Sets the seed partition: cell conditions from a previous solve (or any
+    /// caller-supplied conjunctions of environment literals) that are solved
+    /// first, in the given order, under assumptions (design doc 5.7).
+    ///
+    /// Seeding makes re-solves stable: a seed whose region is still solvable
+    /// reproduces a cell for that region (possibly with a *more general*
+    /// condition than the seed when the new solution depends on fewer
+    /// environment literals; a stale over-specific seed heals). A seed whose
+    /// region became unsolvable, contradicts the environment model, or
+    /// contradicts itself is dropped, and the region it described is covered
+    /// by the free enumeration that runs after all seeds.
+    ///
+    /// Seeds may only reference environment packages; an absent literal for
+    /// a package declared with `can_be_absent: false` is also a caller error.
+    /// Both panic with a clear message.
+    pub fn seed_partition(self, seed_partition: Vec<CellCondition<N>>) -> Self {
+        Self {
+            seed_partition,
             ..self
         }
     }
@@ -528,29 +553,49 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // checks against new cells.
         let mut cell_assignments: Vec<Vec<(VariableId, bool)>> = Vec::new();
 
-        loop {
-            match self.run_sat(SolvableIdOrRoot::root(), &root_dependencies) {
-                Ok(success) => {
-                    assert!(
-                        success,
-                        "bug: run_sat for the root either succeeds or returns an error"
-                    );
+        // Cells from a previous solve are solved first, in order, each under
+        // its condition pushed as assumption decisions (design doc 5.7). When
+        // the seeds run out the loop continues as free enumeration.
+        let mut pending_seeds = problem.seed_partition.into_iter();
 
+        loop {
+            // Set up the assumptions of the next viable seed, if any remain.
+            // Seeds that contribute no assumptions are skipped: an empty
+            // condition describes the whole environment space (which free
+            // enumeration covers anyway) and a self-contradictory condition
+            // describes no environment at all.
+            let mut seeded = false;
+            while !seeded {
+                let Some(seed) = pending_seeds.next() else {
+                    break;
+                };
+                seeded = self.push_seed_assumptions(&seed)?;
+            }
+
+            match self.run_sat(SolvableIdOrRoot::root(), &root_dependencies) {
+                Ok(true) => {
                     // Extract the load-bearing environment literal
                     // assignments and restore provable disjointness against
-                    // all previously recorded cells.
+                    // all previously recorded cells. For a seeded cell the
+                    // extraction may produce a condition that is MORE GENERAL
+                    // than the seed: the recorded cell reflects what the new
+                    // solution actually depends on, so a stale over-specific
+                    // seed heals (the repair step still re-specializes where
+                    // needed to keep cells disjoint).
                     let mut cell = self.extract_cell();
                     self.repair_disjointness(&mut cell, &cell_assignments);
 
                     let condition = self.cell_to_condition(&cell);
-                    let solvables = self.state.chosen_solvables().collect();
+                    let solvables = self.chosen_solvables_canonical();
                     let cell_is_empty = cell.is_empty();
                     cells.push((condition, solvables));
                     cell_edges.push(self.capture_cell_edges());
                     cell_assignments.push(cell.clone());
 
-                    // Retract all decisions before adding the blocking clause
-                    // so that its watch initialization sees no decisions.
+                    // Retract all decisions (assumptions included) before
+                    // adding the blocking clause so that its watch
+                    // initialization sees no decisions.
+                    self.state.assumption_levels = 0;
                     self.state.decision_tracker.undo_until(0);
 
                     if cell_is_empty {
@@ -565,19 +610,44 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // negations of the cell's signed literals. A cell literal
                     // `(var, value)` is negated by `Literal::new(var, value)`
                     // because the `negate` flag of a literal equals the value
-                    // it forbids the variable to take here.
+                    // it forbids the variable to take here. Blocking clauses
+                    // from seeded cells constrain later seeds and the free
+                    // phase exactly like free-phase blocking clauses do.
                     let blocking = cell
                         .iter()
                         .map(|&(variable, value)| Literal::new(variable, value))
                         .collect();
                     self.state.add_env_clause(blocking, EnvClauseKind::Blocking);
                 }
+                Ok(false) => {
+                    // The seeded cell is unsolvable AS SEEDED (`run_sat`
+                    // surfaces every unsolvable outcome as `Ok(false)` while
+                    // prior decisions, here the assumptions, exist). This is
+                    // not a global conflict: drop the seed, retract its
+                    // assumptions and continue; the region it described is
+                    // covered by free enumeration (and if it is genuinely
+                    // unsolvable inside the model, the witness check fails
+                    // the solve with a proper conflict later).
+                    debug_assert!(
+                        seeded,
+                        "bug: run_sat only returns Ok(false) when prior decisions exist, \
+                         which in a universal solve means assumptions were pushed"
+                    );
+                    self.state.assumption_levels = 0;
+                    self.state.decision_tracker.undo_until(0);
+                }
                 Err(UnsolvableOrCancelled::Cancelled(value)) => {
                     return Err(UniversalFailure::Cancelled(value));
                 }
                 Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
-                    // The formula is unsolvable. Check whether any region of
-                    // the environment model remains uncovered.
+                    // The formula is unsolvable. This only happens in the
+                    // free phase (a seeded solve reports `Ok(false)`); check
+                    // whether any region of the environment model remains
+                    // uncovered.
+                    debug_assert!(
+                        !seeded,
+                        "bug: a seeded solve surfaces unsolvability as Ok(false)"
+                    );
                     match self.find_environment_witness() {
                         None => {
                             // No environment assignment satisfies the model,
@@ -604,6 +674,29 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             environment_model,
             cell_edges,
         })
+    }
+
+    /// Returns the solvables chosen by the current solution in canonical
+    /// order: by variable id, which is the (deterministic, encoding-driven)
+    /// interning order. The decision stack order is NOT used because it
+    /// depends on unit-propagation internals (watchlist traversal order),
+    /// which legitimately differ between a free and a seeded solve of the
+    /// same cell; the canonical order makes re-solves byte-identical.
+    fn chosen_solvables_canonical(&self) -> Vec<D::SolvableId> {
+        let mut chosen: Vec<(VariableId, D::SolvableId)> = self
+            .state
+            .decision_tracker
+            .stack()
+            .filter(|decision| decision.value)
+            .filter_map(|decision| {
+                decision
+                    .variable
+                    .as_solvable(&self.state.variable_map)
+                    .map(|solvable| (decision.variable, solvable))
+            })
+            .collect();
+        chosen.sort_by_key(|&(variable, _)| variable.to_index());
+        chosen.into_iter().map(|(_, solvable)| solvable).collect()
     }
 
     /// Captures the dependency edges that are active in the current solution
@@ -726,7 +819,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             self.provider().display_version_set(version_set),
                             self.provider().display_name(package_name),
                         );
-                        self.declare_environment_package(package_name)?;
+                        self.declare_environment_package(package_name, "environment model")?;
                         self.state.intern_env_matches_with_oracle_clauses(
                             self.cache.provider(),
                             version_set,
@@ -735,7 +828,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     }
                     EnvLiteralKind::Absent => {
                         let package_name = env_literal.package;
-                        let env_pkg = self.declare_environment_package(package_name)?;
+                        let env_pkg =
+                            self.declare_environment_package(package_name, "environment model")?;
                         assert!(
                             env_pkg.can_be_absent,
                             "the environment model contains an absent literal for package '{}' \
@@ -758,9 +852,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Resolves the candidates for `package_name` and requires the package to
     /// be an environment package. Records its metadata in the solver state
     /// (mirroring what the encoder does in `on_candidates_available`).
+    ///
+    /// `context` names the input that referenced the package (the
+    /// environment model or the seed partition) for the panic message.
     fn declare_environment_package(
         &mut self,
         package_name: D::NameId,
+        context: &str,
     ) -> Result<EnvironmentPackage, UniversalFailure<D::NameId>> {
         let package_candidates = self
             .async_runtime
@@ -769,14 +867,109 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let env_pkg = match package_candidates {
             PackageCandidates::Environment(env_pkg) => *env_pkg,
             PackageCandidates::Candidates(_) => panic!(
-                "the environment model references package '{}' which is not an environment \
-                 package; only packages declared via `PackageCandidates::Environment` can appear \
-                 in the environment model",
+                "the {context} references package '{}' which is not an environment package; only \
+                 packages declared via `PackageCandidates::Environment` can appear in the \
+                 {context}",
                 self.provider().display_name(package_name),
             ),
         };
         self.state.env_packages.set(package_name, Some(env_pkg));
         Ok(env_pkg)
+    }
+
+    /// Validates one seed cell condition and pushes its literals as
+    /// assumption decisions at levels `1..=n`, one level per literal (design
+    /// doc 5.7), interning environment literal variables (and emitting their
+    /// oracle consistency clauses) as needed: a seed may reference version
+    /// sets no other input mentions. Returns whether at least one assumption
+    /// is now active; `SolverState::assumption_levels` is set accordingly.
+    ///
+    /// Seeds that yield no assumptions are skipped with `Ok(false)`: an
+    /// empty condition describes the whole environment space, which free
+    /// enumeration covers anyway, and a condition that contradicts itself on
+    /// a literal describes no environment at all (its partially pushed
+    /// assumptions are retracted again).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the seed references a package that is not an environment
+    /// package, contains an absent literal for a package declared with
+    /// `can_be_absent: false`, or pairs a package with a version set that
+    /// belongs to a different package. These are caller errors, mirroring
+    /// the environment model validation.
+    fn push_seed_assumptions(
+        &mut self,
+        seed: &CellCondition<D::NameId>,
+    ) -> Result<bool, UniversalFailure<D::NameId>> {
+        debug_assert_eq!(
+            self.state.assumption_levels, 0,
+            "bug: the previous seed's assumptions were not cleared"
+        );
+        debug_assert!(
+            self.state.decision_tracker.stack().next().is_none(),
+            "bug: assumptions must be pushed on an empty decision stack"
+        );
+
+        // Intern (and validate) every literal before pushing any decision:
+        // interning emits oracle consistency clauses, whose watch
+        // initialization assumes the involved variables are undecided.
+        let mut assumptions = Vec::with_capacity(seed.0.len());
+        for (env_literal, sign) in &seed.0 {
+            let variable = match env_literal.kind {
+                EnvLiteralKind::Matches(version_set) => {
+                    let package_name = self.cache.provider().version_set_name(version_set);
+                    assert!(
+                        package_name == env_literal.package,
+                        "seed partition literal for package '{}' references version set '{}' \
+                         which belongs to package '{}'",
+                        self.provider().display_name(env_literal.package),
+                        self.provider().display_version_set(version_set),
+                        self.provider().display_name(package_name),
+                    );
+                    self.declare_environment_package(package_name, "seed partition")?;
+                    self.state.intern_env_matches_with_oracle_clauses(
+                        self.cache.provider(),
+                        version_set,
+                        package_name,
+                    )
+                }
+                EnvLiteralKind::Absent => {
+                    let package_name = env_literal.package;
+                    let env_pkg =
+                        self.declare_environment_package(package_name, "seed partition")?;
+                    assert!(
+                        env_pkg.can_be_absent,
+                        "the seed partition contains an absent literal for package '{}' which \
+                         was declared with `can_be_absent: false`",
+                        self.provider().display_name(package_name),
+                    );
+                    self.state
+                        .intern_env_absent_with_oracle_clauses(package_name)
+                }
+            };
+            assumptions.push((variable, *sign));
+        }
+
+        // Push each assumption as a decision at its own level, derived from
+        // the assumption sentinel. A literal repeated with the same sign is
+        // redundant and skipped (no level of its own); a literal repeated
+        // with the opposite sign makes the seed self-contradictory.
+        let mut level = 0u32;
+        for (variable, value) in assumptions {
+            match self.state.decision_tracker.try_add_decision(
+                Decision::new(variable, value, ClauseId::assumption()),
+                level + 1,
+            ) {
+                Ok(true) => level += 1,
+                Ok(false) => {}
+                Err(()) => {
+                    self.state.decision_tracker.undo_until(0);
+                    return Ok(false);
+                }
+            }
+        }
+        self.state.assumption_levels = level;
+        Ok(level > 0)
     }
 
     /// Computes the cell for the current solution: a map from environment

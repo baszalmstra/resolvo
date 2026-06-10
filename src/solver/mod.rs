@@ -176,6 +176,11 @@ impl<N> Clauses<N> {
         kind: Clause<N>,
     ) -> ClauseId {
         let id = ClauseId::from_index(self.kinds.len());
+        debug_assert_ne!(
+            id,
+            ClauseId::assumption(),
+            "the clause arena grew into the reserved assumption sentinel id"
+        );
         self.kinds.push(kind);
         self.watched_literals.push(watched_literals);
         id
@@ -283,6 +288,15 @@ pub(crate) struct SolverState<D: DependencyProvider> {
 
     pub(crate) decision_tracker: DecisionTracker,
 
+    /// The number of assumption decision levels currently active: decisions
+    /// at levels `1..=assumption_levels` are seeded-cell assumptions pushed
+    /// by `solve_universal`, derived from [`ClauseId::assumption`]. Zero
+    /// outside seeded solves. While non-zero, conflict analysis must never
+    /// backtrack below this boundary (see [`Solver::learn_from_conflict`]
+    /// and [`Solver::analyze`]); a conflict at or below it means the seeded
+    /// cell is unsolvable as seeded, not that the problem is unsolvable.
+    pub(crate) assumption_levels: u32,
+
     /// Activity score per package.
     name_activity: <D::NameId as SolverId>::Map<f32>,
 
@@ -315,6 +329,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             at_least_one_tracker: Default::default(),
             env_packages: Default::default(),
             decision_tracker: Default::default(),
+            assumption_levels: 0,
             name_activity: Default::default(),
             #[cfg(feature = "diagnostics")]
             propagation_counters: Default::default(),
@@ -1839,6 +1854,14 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         mut conflicting_solvable: VariableId,
         mut clause_id: ClauseId,
     ) -> (u32, ClauseId, Literal) {
+        // Transitional guard: backjump handling at the assumption boundary
+        // lands in the follow-up commit. Until then, fail loudly instead of
+        // silently popping assumption decisions.
+        assert_eq!(
+            self.state.assumption_levels, 0,
+            "conflict analysis under assumptions is not implemented yet"
+        );
+
         let mut seen = HashSet::default();
         let mut causes_at_current_level = 0u32;
         let mut learnt = Vec::new();
