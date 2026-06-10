@@ -402,8 +402,9 @@ fn main() {
                                 .yellow()
                         );
                         record.outcome = "unsolvable";
-                        record.error =
-                            Some(truncate_error(conflict.display_user_friendly(&solver).to_string()));
+                        record.error = Some(truncate_error(
+                            conflict.display_user_friendly(&solver).to_string(),
+                        ));
                     }
                     Err(UnsolvableOrCancelled::Cancelled(_)) => {
                         eprintln!(

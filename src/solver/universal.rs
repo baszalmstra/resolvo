@@ -1618,7 +1618,7 @@ fn find_witness_indexed(
         "every clause literal must reference a variable below `variable_count`"
     );
     let mut assignment: Vec<Option<bool>> = vec![None; variable_count];
-    if search_indexed(clauses, &mut assignment, 0) {
+    if search_indexed(clauses, &mut assignment) {
         Some(
             assignment
                 .into_iter()
@@ -1631,36 +1631,94 @@ fn find_witness_indexed(
 }
 
 /// Recursive helper of [`find_witness_indexed`]: tries to extend the partial
-/// `assignment` from `depth` onwards. Returns true when a satisfying total
-/// assignment was found (left in `assignment`).
-fn search_indexed(
-    clauses: &[Vec<IndexedLiteral>],
-    assignment: &mut [Option<bool>],
-    depth: usize,
-) -> bool {
-    // Prune: a clause whose literals are all assigned and false can never
-    // be satisfied by extending the assignment.
-    let violated = clauses.iter().any(|clause| {
-        clause
-            .iter()
-            .all(|&(index, negate)| assignment[index] == Some(negate))
-    });
-    if violated {
+/// `assignment` to a satisfying total assignment. Returns true when one was
+/// found (left in `assignment`).
+///
+/// The search interleaves decisions (ascending variable index, `false`
+/// first) with unit propagation. Propagation only assigns values entailed by
+/// the current partial assignment, so the first satisfying assignment found
+/// is still the lexicographically smallest one, exactly as the previous
+/// propagation-free exhaustive search returned: the witness semantics are
+/// unchanged. Propagation is what keeps the coverage check tractable when
+/// hundreds of blocking clauses have accumulated (a high-cell-count solve
+/// used to spend minutes here, orders of magnitude longer than the
+/// enumeration itself).
+fn search_indexed(clauses: &[Vec<IndexedLiteral>], assignment: &mut [Option<bool>]) -> bool {
+    // Propagate the consequences of the current assignment, recording what
+    // was assigned so it can be undone on backtrack.
+    let mut propagated: Vec<usize> = Vec::new();
+    if !propagate_indexed(clauses, assignment, &mut propagated) {
+        for index in propagated {
+            assignment[index] = None;
+        }
         return false;
     }
 
-    if depth == assignment.len() {
+    let Some(unassigned) = assignment.iter().position(Option::is_none) else {
         return true;
-    }
+    };
 
     for value in [false, true] {
-        assignment[depth] = Some(value);
-        if search_indexed(clauses, assignment, depth + 1) {
+        assignment[unassigned] = Some(value);
+        if search_indexed(clauses, assignment) {
             return true;
         }
     }
-    assignment[depth] = None;
+    assignment[unassigned] = None;
+    for index in propagated {
+        assignment[index] = None;
+    }
     false
+}
+
+/// Unit propagation for [`search_indexed`]: repeatedly assigns the last
+/// unassigned literal of any clause whose other literals are all false,
+/// pushing every assigned index onto `propagated`. Returns false when a
+/// clause is violated (all literals assigned and false).
+fn propagate_indexed(
+    clauses: &[Vec<IndexedLiteral>],
+    assignment: &mut [Option<bool>],
+    propagated: &mut Vec<usize>,
+) -> bool {
+    loop {
+        let mut changed = false;
+        for clause in clauses {
+            let mut unit: Option<IndexedLiteral> = None;
+            let mut unassigned = 0usize;
+            let mut satisfied = false;
+            for &(index, negate) in clause {
+                match assignment[index] {
+                    None => {
+                        unassigned += 1;
+                        unit = Some((index, negate));
+                        if unassigned > 1 {
+                            break;
+                        }
+                    }
+                    Some(value) => {
+                        if value != negate {
+                            satisfied = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if satisfied || unassigned > 1 {
+                continue;
+            }
+            match unit {
+                None => return false,
+                Some((index, negate)) => {
+                    assignment[index] = Some(!negate);
+                    propagated.push(index);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return true;
+        }
+    }
 }
 
 /// Searches for an assignment of solver variables satisfying all the given
@@ -2245,5 +2303,27 @@ mod test {
     #[test]
     fn test_find_witness_indexed_empty_clause() {
         assert_eq!(find_witness_indexed(2, &[vec![]]), None);
+    }
+
+    /// Regression test for the unit-propagation search: deciding `x0 =
+    /// false` propagates `x1 = true` and `x2 = true` into a conflict, and
+    /// the propagated values must be unassigned on backtrack or the
+    /// satisfiable `x0 = true` branch (with `x1 = false`) would wrongly
+    /// fail. The result is the lexicographically smallest model, exactly
+    /// what the propagation-free search returned.
+    #[test]
+    fn test_find_witness_indexed_propagation_undone_on_backtrack() {
+        let clauses = vec![
+            // (x0 or x1)
+            vec![(0, false), (1, false)],
+            // (not x1 or x2)
+            vec![(1, true), (2, false)],
+            // (not x2 or not x1)
+            vec![(2, true), (1, true)],
+        ];
+        assert_eq!(
+            find_witness_indexed(3, &clauses),
+            Some(vec![true, false, false])
+        );
     }
 }
