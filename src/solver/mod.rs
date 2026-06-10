@@ -426,6 +426,33 @@ impl From<Box<dyn Any>> for UnsolvableOrCancelled {
     }
 }
 
+/// The error of the inner CDCL chain ([`Solver::resolve_dependencies`],
+/// [`Solver::set_propagate_learn`], [`Solver::propagate_and_learn`],
+/// [`Solver::learn_from_conflict`]).
+///
+/// Compared to [`UnsolvableOrCancelled`] there is one extra outcome: a
+/// conflict at or below the assumption boundary, which [`Solver::run_sat`]
+/// translates into "unsolvable under the current assumptions" (`Ok(false)`)
+/// instead of a global conflict.
+#[derive(Debug)]
+enum ResolveError {
+    /// The problem is unsolvable, regardless of any assumptions.
+    Unsolvable(Conflict),
+    /// The conflict is forced at or below the assumption boundary: the
+    /// problem is unsolvable under the active assumption decisions. The
+    /// assumptions only steer the search and are not part of the problem,
+    /// so this says nothing about global solvability.
+    AssumptionConflict,
+    /// The solving process was cancelled.
+    Cancelled(Box<dyn Any>),
+}
+
+impl From<Conflict> for ResolveError {
+    fn from(value: Conflict) -> Self {
+        ResolveError::Unsolvable(value)
+    }
+}
+
 /// An error during the propagation step
 #[derive(Debug)]
 pub(crate) enum PropagationError {
@@ -703,7 +730,32 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // Enter the solver loop, return immediately if no new assignments have been
             // made.
             tracing::trace!("Level {}: Resolving dependencies", level);
-            level = self.resolve_dependencies(level)?;
+            level = match self.resolve_dependencies(level) {
+                Ok(new_level) => new_level,
+                Err(ResolveError::AssumptionConflict) => {
+                    // The problem is unsolvable under the active assumption
+                    // decisions (a seeded cell of a universal solve). Mirror
+                    // the `run_sat_process_unsolvable` contract for callers
+                    // with prior decisions: retract everything above the
+                    // starting level (which keeps the assumptions, exactly
+                    // the levels `1..=starting_level`) and report `Ok(false)`
+                    // so the caller can retract the assumptions and drop the
+                    // seed.
+                    debug_assert!(
+                        self.state.assumption_levels > 0,
+                        "bug: an assumption conflict was reported without active assumptions"
+                    );
+                    debug_assert_eq!(starting_level, self.state.assumption_levels);
+                    self.state.decision_tracker.undo_until(starting_level);
+                    return Ok(false);
+                }
+                Err(ResolveError::Unsolvable(conflict)) => {
+                    return Err(UnsolvableOrCancelled::Unsolvable(conflict));
+                }
+                Err(ResolveError::Cancelled(value)) => {
+                    return Err(UnsolvableOrCancelled::Cancelled(value));
+                }
+            };
             tracing::trace!("Level {}: Done resolving dependencies", level);
 
             // We have a partial solution. E.g. there is a solution that satisfies all the
@@ -847,7 +899,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// for which no concrete package has been picked yet. Then we pick the
     /// highest possible version for that package, or the favored version if
     /// it was provided by the user, and set its value to true.
-    fn resolve_dependencies(&mut self, mut level: u32) -> Result<u32, UnsolvableOrCancelled> {
+    fn resolve_dependencies(&mut self, mut level: u32) -> Result<u32, ResolveError> {
         loop {
             // Make a decision. If no decision could be made it means the problem is
             // satisfyable.
@@ -878,13 +930,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     level = new_level;
                     tracing::debug!("╘══ Propagation completed");
                 }
-                Err(UnsolvableOrCancelled::Cancelled(value)) => {
+                Err(ResolveError::Cancelled(value)) => {
                     tracing::debug!("╘══ Propagation cancelled");
-                    return Err(UnsolvableOrCancelled::Cancelled(value));
+                    return Err(ResolveError::Cancelled(value));
                 }
-                Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
+                Err(ResolveError::Unsolvable(conflict)) => {
                     tracing::debug!("╘══ Propagation resulted in a conflict");
-                    return Err(UnsolvableOrCancelled::Unsolvable(conflict));
+                    return Err(ResolveError::Unsolvable(conflict));
+                }
+                Err(ResolveError::AssumptionConflict) => {
+                    tracing::debug!("╘══ Propagation conflicted at the assumption boundary");
+                    return Err(ResolveError::AssumptionConflict);
                 }
             }
         }
@@ -1309,7 +1365,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         solvable: VariableId,
         _required_by: VariableId,
         clause_id: ClauseId,
-    ) -> Result<u32, UnsolvableOrCancelled> {
+    ) -> Result<u32, ResolveError> {
         level += 1;
 
         self.state
@@ -1320,14 +1376,14 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.propagate_and_learn(level)
     }
 
-    fn propagate_and_learn(&mut self, mut level: u32) -> Result<u32, UnsolvableOrCancelled> {
+    fn propagate_and_learn(&mut self, mut level: u32) -> Result<u32, ResolveError> {
         loop {
             match self.propagate(level) {
                 Ok(()) => {
                     return Ok(level);
                 }
                 Err(PropagationError::Cancelled(value)) => {
-                    return Err(UnsolvableOrCancelled::Cancelled(value));
+                    return Err(ResolveError::Cancelled(value));
                 }
                 Err(PropagationError::Conflict(
                     conflicting_solvable,
@@ -1351,7 +1407,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         conflicting_solvable: VariableId,
         attempted_value: bool,
         conflicting_clause: ClauseId,
-    ) -> Result<u32, Conflict> {
+    ) -> Result<u32, ResolveError> {
         #[cfg(feature = "diagnostics")]
         let learn_start = std::time::Instant::now();
         {
@@ -1365,20 +1421,55 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     .display(&self.state.variable_map, self.provider())
             );
 
-            tracing::debug!(
-                "││ Previously decided value: {}. Derived from: {}",
-                !attempted_value,
-                self.state.clauses.kinds[self
-                    .state
-                    .decision_tracker
-                    .find_clause_for_assignment(conflicting_solvable)
-                    .unwrap()
-                    .to_index()]
-                .display(&self.state.variable_map, self.provider()),
-            );
+            // The conflicting variable may be an assumption decision, whose
+            // `derived_from` is the assumption sentinel, not a real clause.
+            let derived_from = self
+                .state
+                .decision_tracker
+                .find_clause_for_assignment(conflicting_solvable)
+                .unwrap();
+            if derived_from == ClauseId::assumption() {
+                tracing::debug!(
+                    "││ Previously decided value: {}. Derived from an assumption",
+                    !attempted_value,
+                );
+            } else {
+                tracing::debug!(
+                    "││ Previously decided value: {}. Derived from: {}",
+                    !attempted_value,
+                    self.state.clauses.kinds[derived_from.to_index()]
+                        .display(&self.state.variable_map, self.provider()),
+                );
+            }
         }
 
-        if level == 1 {
+        // A conflict at or below the root level cannot be fixed by
+        // backtracking the search. The root level is 1 when solving freely;
+        // when solving under assumptions the assumptions occupy levels
+        // `1..=n` and the root install sits directly above them at `n + 1`.
+        let root_level = self.state.assumption_levels + 1;
+        if level <= root_level {
+            if self.state.assumption_levels > 0 {
+                // Everything at or below the root level is forced: the
+                // assumptions themselves plus unit propagation from them and
+                // the root install (which must be installed regardless).
+                // Hence the conflict proves the problem unsolvable UNDER THE
+                // ASSUMPTIONS; it is not a global conflict and must not go
+                // through `analyze_unsolvable` (which builds a conflict for
+                // the unconditional problem and cannot represent assumption
+                // decisions). Any clause learnt earlier in this solve stays
+                // valid: learnt clauses are resolvents of real clauses only.
+                tracing::debug!(
+                    "│└ Conflict at level {level} is at or below the assumption boundary \
+                     (root level {root_level}); the problem is unsolvable as seeded"
+                );
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state.propagation_counters.learn_duration += learn_start.elapsed();
+                }
+                return Err(ResolveError::AssumptionConflict);
+            }
+
             for decision in self.state.decision_tracker.stack() {
                 let clause_id = decision.derived_from;
                 let clause = self.state.clauses.kinds[clause_id.to_index()];
@@ -1404,7 +1495,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             {
                 self.state.propagation_counters.learn_duration += learn_start.elapsed();
             }
-            return Err(self.analyze_unsolvable(conflicting_clause));
+            return Err(self.analyze_unsolvable(conflicting_clause).into());
         }
 
         let (new_level, learned_clause_id, literal) =
@@ -1766,6 +1857,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Create a [`Conflict`] based on the id of the clause that triggered an
     /// unrecoverable conflict
     fn analyze_unsolvable(&mut self, clause_id: ClauseId) -> Conflict {
+        debug_assert_eq!(
+            self.state.assumption_levels, 0,
+            "bug: a conflict under assumptions must not be analyzed as a global conflict"
+        );
         let last_decision = self.state.decision_tracker.stack().last().unwrap();
         let highest_level = self.state.decision_tracker.level(last_decision.variable);
         debug_assert_eq!(highest_level, 1);
@@ -1854,14 +1949,6 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         mut conflicting_solvable: VariableId,
         mut clause_id: ClauseId,
     ) -> (u32, ClauseId, Literal) {
-        // Transitional guard: backjump handling at the assumption boundary
-        // lands in the follow-up commit. Until then, fail loudly instead of
-        // silently popping assumption decisions.
-        assert_eq!(
-            self.state.assumption_levels, 0,
-            "conflict analysis under assumptions is not implemented yet"
-        );
-
         let mut seen = HashSet::default();
         let mut causes_at_current_level = 0u32;
         let mut learnt = Vec::new();
@@ -1916,6 +2003,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // Select next literal to look at
             loop {
                 let (last_decision, last_decision_level) = self.state.decision_tracker.undo_last();
+
+                // Assumption decisions are never popped during analysis: the
+                // conflict level is above the assumption boundary
+                // (`learn_from_conflict` ends the solve for conflicts at or
+                // below it) and the analysis consumes only decisions at the
+                // conflict level, which all sit above the assumptions on the
+                // stack. Resolving on an assumption would dereference the
+                // sentinel "clause" and derive an unsound learnt clause.
+                debug_assert_ne!(
+                    last_decision.derived_from,
+                    ClauseId::assumption(),
+                    "bug: conflict analysis popped an assumption decision"
+                );
 
                 conflicting_solvable = last_decision.variable;
                 s_value = last_decision.value;
@@ -1972,8 +2072,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             );
         }
 
-        // Should revert at most to the root level
-        let target_level = back_track_to.max(1);
+        // Should revert at most to the root level: level 1 when solving
+        // freely, or the level directly above the assumption prefix when
+        // solving under assumptions. A raw backjump target inside the
+        // assumption prefix (possible when every non-UIP literal of the
+        // learnt clause sits at an assumption level) would pop the root
+        // install decision, and nothing would reinstall it. Clamping is
+        // sound: the literals that make the learnt clause unit live at
+        // levels at or below the clamped target either way, so asserting
+        // the UIP literal at the root level is a valid (merely later than
+        // strictly necessary) unit propagation.
+        let target_level = back_track_to.max(self.state.assumption_levels + 1);
         self.state.decision_tracker.undo_until(target_level);
 
         self.decay_activity_scores();

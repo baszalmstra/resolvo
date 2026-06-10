@@ -2366,6 +2366,97 @@ fn test_universal_seed_conflict_at_level_n_plus_one_drops_seed() {
     ");
 }
 
+/// Re-seeding the candidate-split universe of
+/// [`test_universal_candidate_split_generalization`] with its own partition
+/// reproduces it byte-identically. Notably this run involves NO conflict at
+/// all: for the second seed (`glibc >=217 AND not (glibc >=228)`), pkg=2's
+/// requires clause `(not pkg2 or L_228)` already exists (encoded during the
+/// first seed's solve), so propagating the assumption `not L_228` excludes
+/// pkg=2 before any decision is made and pkg=1 is chosen directly. The
+/// conflict-driven variant of the same universe, where the clause is only
+/// created mid-solve, is [`test_universal_seed_order_changes_generalization`].
+#[test]
+fn test_universal_seed_reproduces_candidate_split_partition() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("pkg", Pack::new(2), &["glibc 228..1000"], &[]);
+    provider.add_package("pkg", Pack::new(1), &["glibc 217..1000"], &[]);
+
+    let (solver, first, second) =
+        universal_resolve_with_own_cells(provider, &["pkg"], &[&["glibc 217..1000"]]);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    assert_snapshot!(format_universal_result(&solver, &Ok(second)), @r"
+    cell: glibc in >=228, <1000
+      pkg=2
+    cell: glibc in >=217, <1000 AND not (glibc in >=228, <1000)
+      pkg=1
+    ");
+}
+
+/// Assumption-boundary case named by the design doc: a learnt clause whose
+/// raw backjump target lies INSIDE the assumption prefix and must be
+/// clamped to the root level directly above it.
+///
+/// The candidate-split universe is seeded with its SECOND cell first:
+/// `glibc >=217 AND not (glibc >=228)`, n = 2 assumptions at levels 1 and
+/// 2, root at level 3. pkg=2's requires clause does not exist yet when the
+/// assumptions are propagated (no earlier cell encoded it), so the solver
+/// decides pkg=2 (highest version) at level 4 and only then encodes
+/// `(not pkg2 or L_228)`, whose candidates are all false under the
+/// assumptions; after the resulting restart pkg=2 is re-decided at level 4
+/// and propagation now conflicts at level 4 > n+1. Analysis learns
+/// `(L_228 or not pkg2)` whose lone non-UIP literal sits at assumption
+/// level 2, giving a raw backjump target of 2 INSIDE the assumption
+/// prefix; jumping there would pop the root install (and nothing would
+/// reinstall it), so the target is clamped to the root level n+1 = 3,
+/// where `not pkg2` is asserted and the solve completes with pkg=1. The
+/// learnt clause is a valid resolvent of real clauses (assumptions appear
+/// only as literals, never as resolution steps) and safely persists.
+///
+/// The test also documents two effects of seed order: (1) with no earlier
+/// cell to stay disjoint from, the recorded cell generalizes to all of
+/// `glibc >=217` (pkg=1 is valid for the entire model), and (2) the second
+/// seed `glibc >=228` then contradicts the first cell's blocking clause
+/// during its first propagation and is dropped. The partition legitimately
+/// DIFFERS from the unseeded one (which prefers pkg=2 where possible) but
+/// is a valid cover; this is why the shuffled-seed property test asserts
+/// validity, not equality: generalization depends on which cells were
+/// recorded before, so seed order can change the partition's content.
+#[test]
+fn test_universal_seed_order_changes_generalization() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("pkg", Pack::new(2), &["glibc 228..1000"], &[]);
+    provider.add_package("pkg", Pack::new(1), &["glibc 217..1000"], &[]);
+
+    let requirements = provider.requirements(&["pkg"]);
+    let model = vec![vec![parse_env_literal(&mut provider, "glibc 217..1000")]];
+    let seeds = vec![
+        CellCondition(vec![
+            parse_env_literal(&mut provider, "glibc 217..1000"),
+            parse_env_literal(&mut provider, "not glibc 228..1000"),
+        ]),
+        CellCondition(vec![parse_env_literal(&mut provider, "glibc 228..1000")]),
+    ];
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(seeds),
+        )
+        .expect("solvable");
+
+    // The partition is a valid, disjoint, covering one.
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_snapshot!(format_universal_result(&solver, &Ok(solution)), @r"
+    cell: glibc in >=217, <1000
+      pkg=1
+    ");
+}
+
 /// A seed that contradicts itself on the same literal (`cuda 11..100` both
 /// positive and negative) describes no environment at all: it is dropped at
 /// assumption setup (the second decision on the same variable fails) and the
