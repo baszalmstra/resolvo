@@ -42,6 +42,8 @@ mod encoding;
 #[cfg(test)]
 pub(crate) mod env_test_provider;
 mod universal;
+#[cfg(test)]
+mod universal_prop;
 pub(crate) mod variable_map;
 mod watch_map;
 
