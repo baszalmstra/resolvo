@@ -1,0 +1,6 @@
+{
+  "clauses": [
+    [ {"package": "__win", "matches": "*"} ],
+    [ {"package": "__archspec", "matches": "* x86_64"} ]
+  ]
+}

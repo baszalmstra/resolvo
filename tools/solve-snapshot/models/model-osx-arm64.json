@@ -1,0 +1,7 @@
+{
+  "clauses": [
+    [ {"package": "__osx", "matches": ">=11.0,<16.0a0"} ],
+    [ {"package": "__archspec", "matches": "* aarch64"} ],
+    [ {"package": "__unix", "matches": "*"} ]
+  ]
+}

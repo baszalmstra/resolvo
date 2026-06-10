@@ -1,0 +1,872 @@
+{
+  "clauses": [
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.17,<3.0.a0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.17",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.28,<3.0.a0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.34,<3.0.a0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.28",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.34",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.39",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": "*",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.29",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.14",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.4",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.28,<3",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": ">=2.17,<3.0a0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__glibc",
+        "matches": "==2.35",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=12.0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "*",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "<0.0a0",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=12.9",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=12.6",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.8",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=13.0",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "==11.0",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "==11.1",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.2,<12",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "==10.2",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.8,<12",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.2,<11.8",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=12.0,<13.0a0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=10",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=9",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=10.2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.1",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=12.2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=12.4",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=12.8",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=10.1",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.2.1",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.2.2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.3.1",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.4.2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.5.0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.5.1",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.6.0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=9.2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "==11.1|11.1.*",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "==11.0|11.0.*",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "==10.2|10.2.*",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11.0,<=11.6",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": ">=11,<14.0a0",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__cuda",
+        "matches": "==12.4",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 power10le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* power10le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 power8le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 ppc64le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* power8le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* ppc64le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 power9le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* power9le",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 core2",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 k10",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 nocona",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 x86_64",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* core2",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* k10",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* nocona",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* x86_64",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 bulldozer",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 ivybridge",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 nehalem",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 piledriver",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 sandybridge",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 steamroller",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 westmere",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 x86_64_v2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* bulldozer",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* ivybridge",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* nehalem",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* piledriver",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* sandybridge",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* steamroller",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* westmere",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* x86_64_v2",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 broadwell",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 cannonlake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 excavator",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 haswell",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 mic_knl",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 skylake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 x86_64_v3",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 zen",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 zen2",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 zen3",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* broadwell",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* cannonlake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* excavator",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* haswell",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* mic_knl",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* skylake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* x86_64_v3",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* zen",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* zen2",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* zen3",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 cascadelake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 icelake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 skylake_avx512",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 x86_64_v4",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 zen4",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 sapphirerapids",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "==1 zen5",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* cascadelake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* icelake",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* sapphirerapids",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* skylake_avx512",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* x86_64_v4",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* zen4",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "1.* zen5",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__archspec",
+        "matches": "* x86_64",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__linux",
+        "matches": "*",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__linux",
+        "matches": "==0.0.0",
+        "positive": false
+      }
+    ],
+    [
+      {
+        "package": "__linux",
+        "matches": "==6.8",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__unix",
+        "matches": "*",
+        "positive": true
+      }
+    ],
+    [
+      {
+        "package": "__unix",
+        "matches": "==0",
+        "positive": true
+      }
+    ]
+  ]
+}
