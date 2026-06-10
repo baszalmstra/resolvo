@@ -9,22 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `ConflictGraph` and `ConflictNode` now carry a second generic parameter `N`
-  (the name-id type) and expose two new node variants: `EnvMatches(VersionSetId)`
-  and `EnvAbsent(N)` for environment-literal nodes. `ConflictCause` gains
-  `EnvConstrains(VersionSetId)` and `EnvMutuallyExclusive` variants.
-- `UniversalFailure::Unsolvable` now reports a conflict that is scoped to the
-  failing witness region via a targeted re-solve, rather than the unscoped
-  conflict produced by the initial free enumeration.
+- Universal multi-environment solving: `Solver::solve_universal` resolves a
+  `UniversalProblem` (requirements plus an explicit environment model, and
+  optionally a seed partition from a previous solve) into a
+  `UniversalSolution` that partitions the environment space into pairwise
+  disjoint cells, each with the solvables valid throughout that cell. The
+  solution exposes `cells` (the raw partition), `merged` (per-solvable
+  presence conditions), `edges` (the conditional dependency graph for
+  lockfile serialization), `project` (selecting the cell of one concrete
+  environment) and `verify` (re-checking disjointness and model coverage,
+  e.g. for solutions reconstructed from a lockfile). Failures are reported
+  as `UniversalFailure::Unsolvable` carrying the unsolvable region and a
+  conflict scoped to that region via a targeted re-solve.
+- Environment packages: packages whose value is unknown at solve time (e.g.
+  `__glibc`, `__cuda`), declared by returning the new
+  `PackageCandidates::Environment` variant from
+  `DependencyProvider::get_candidates`. Their version sets are related
+  through the new `DependencyProvider::environment_version_set_relation`
+  oracle method. Soundness contract: answers other than `Unknown` must be
+  correct; when in doubt return `Unknown` (a wrong `Disjoint`/`Subset`
+  answer produces broken solutions, `Unknown` merely risks describing
+  environment regions no real machine has).
+- [**breaking**] `DependencyProvider::get_candidates` now returns
+  `Option<PackageCandidates>` instead of `Option<Candidates>`. Wrap existing
+  return values in `PackageCandidates::Candidates` (a `From<Candidates>`
+  impl is provided).
+- `ConflictGraph` and `ConflictNode` carry a second generic parameter `N`
+  (the name-id type) and gain environment-literal node variants
+  `EnvMatches(VersionSetId)` and `EnvAbsent(N)`; `ConflictCause` gains
+  `EnvConstrains` and `EnvMutuallyExclusive` variants. Conflicts involving
+  environment packages render without panicking: a requirement on an
+  environment package is reported as a requirement on the environment
+  (never as a missing package), environment constraints are rendered as the
+  lack-or-match disjunction they encode, and oracle consistency clauses are
+  rendered as mutually exclusive environment requirements.
 
 ### Fixed
 
-- `Conflict::graph()` no longer panics when the conflict involves requirements
-  on environment packages (`PackageCandidates::Environment`). Those requirements
-  are now routed to the `UnresolvedDependency` node, and `EnvConstrains` /
-  `EnvOracleConsistency` clauses are rendered as conflict edges in the graph.
-- `Conflict::display_user_friendly()` no longer panics for universal-solve
-  failures that involve environment-package requirements or constraints.
+- A solvable declaring a constraint on its own package while being a
+  non-matching candidate produced the degenerate clause `(not A or not A)`
+  with both watches on the same literal, corrupting the watch lists (debug
+  assertion in debug builds). The clause is now encoded as the negative
+  assertion it semantically is, mirroring exclusion clauses. This bug
+  predates universal solving and reproduces with a plain solve.
 
 ## [0.10.4](https://github.com/prefix-dev/resolvo/compare/resolvo-v0.10.3...resolvo-v0.10.4) - 2026-06-02
 
