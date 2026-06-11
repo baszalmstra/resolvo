@@ -556,7 +556,6 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     .requirement
                     .version_sets(provider)
                     .map(|version_set| provider.version_set_name(version_set)),
-                &version_set_variables,
                 clause_id,
                 &self.state.decision_tracker,
             );

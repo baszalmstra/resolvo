@@ -114,6 +114,12 @@ struct ReqEntry {
     state: ReqState,
     /// Whether `state` must be recomputed before use.
     dirty: bool,
+    /// Whether the candidate occurrence lists of this requirement were
+    /// registered. Registration is deferred to the first evaluation: the
+    /// vast majority of encoded requirements belong to candidate solvables
+    /// that are never installed, and the cached walk only needs
+    /// invalidation once it exists.
+    occ_registered: bool,
     /// The items whose clause carries this requirement.
     items: Vec<ItemId>,
 }
@@ -147,9 +153,12 @@ pub(crate) struct DecideQueue<N: SolverId> {
     hot_queue: BTreeSet<(u64, ItemId)>,
     /// Package names whose activity was ever bumped.
     hot_names: ahash::HashSet<N>,
-    /// Package name -> items whose requirement mentions the name, for the
-    /// cold-to-hot migration when the name is first bumped.
-    name_items: ahash::HashMap<N, Vec<ItemId>>,
+    /// Package name -> requirements that mention the name, for the
+    /// cold-to-hot migration when the name is first bumped (the affected
+    /// items are reached through the requirement entries).
+    name_reqs: ahash::HashMap<N, Vec<Requirement>>,
+    /// Package name -> env-constrains items constraining the name.
+    name_env_items: ahash::HashMap<N, Vec<ItemId>>,
     /// Cached candidate walks, keyed by requirement.
     reqs: RequirementMap<ReqEntry>,
     /// Variable -> items whose clause parent is the variable.
@@ -173,7 +182,8 @@ impl<N: SolverId> Default for DecideQueue<N> {
             queue: Default::default(),
             hot_queue: Default::default(),
             hot_names: Default::default(),
-            name_items: Default::default(),
+            name_reqs: Default::default(),
+            name_env_items: Default::default(),
             reqs: Default::default(),
             parent_occ: Default::default(),
             cand_occ: Default::default(),
@@ -233,17 +243,43 @@ impl<N: SolverId> DecideQueue<N> {
         condition: Option<DisjunctionId>,
         condition_variables: impl Iterator<Item = VariableId>,
         package_names: impl Iterator<Item = N>,
-        sorted_candidates: &[Vec<VariableId>],
         clause_id: ClauseId,
         tracker: &DecisionTracker,
     ) {
         let id: ItemId = self.items.len().try_into().expect("decide item overflow");
         let key = pack_key(SEGMENT_REQUIRES, parent_pos, clause_pos);
 
+        // Track the requirement's entry (shared by all clauses with the
+        // same requirement). A new requirement registers its package names
+        // for the cold-to-hot migration; the per-candidate occurrences are
+        // deferred to the first evaluation (most encoded requirements are
+        // never evaluated, see `ReqEntry::occ_registered`).
+        let is_new_requirement = match self.reqs.get_mut(requirement) {
+            Some(entry) => {
+                entry.items.push(id);
+                false
+            }
+            None => {
+                self.reqs.insert(
+                    requirement,
+                    ReqEntry {
+                        // The state is recomputed on first use.
+                        state: ReqState::AllFalse,
+                        dirty: true,
+                        occ_registered: false,
+                        items: vec![id],
+                    },
+                );
+                true
+            }
+        };
+
         let mut hot = false;
         for name in package_names {
             hot |= self.hot_names.contains(&name);
-            self.name_items.entry(name).or_default().push(id);
+            if is_new_requirement {
+                self.name_reqs.entry(name).or_default().push(requirement);
+            }
         }
 
         self.items.push(DecideItem {
@@ -261,26 +297,6 @@ impl<N: SolverId> DecideQueue<N> {
         occ_push(&mut self.parent_occ, parent, id);
         for variable in condition_variables {
             occ_push(&mut self.cond_occ, variable, id);
-        }
-
-        // Register the requirement's candidate occurrences exactly once;
-        // all clauses with the same requirement share the cached walk.
-        match self.reqs.get_mut(requirement) {
-            Some(entry) => entry.items.push(id),
-            None => {
-                for &candidate in sorted_candidates.iter().flatten() {
-                    occ_push(&mut self.cand_occ, candidate, requirement);
-                }
-                self.reqs.insert(
-                    requirement,
-                    ReqEntry {
-                        // The state is recomputed on first use.
-                        state: ReqState::AllFalse,
-                        dirty: true,
-                        items: vec![id],
-                    },
-                );
-            }
         }
 
         // The parent may already be installed (clauses are encoded after
@@ -313,7 +329,10 @@ impl<N: SolverId> DecideQueue<N> {
         let key = pack_key(SEGMENT_ENV_CONSTRAINS, parent_pos, clause_pos);
 
         let hot = self.hot_names.contains(&package_name);
-        self.name_items.entry(package_name).or_default().push(id);
+        self.name_env_items
+            .entry(package_name)
+            .or_default()
+            .push(id);
 
         self.items.push(DecideItem {
             key,
@@ -346,17 +365,33 @@ impl<N: SolverId> DecideQueue<N> {
         if !self.hot_names.insert(name) {
             return;
         }
-        let Some(item_ids) = self.name_items.get(&name) else {
-            return;
-        };
-        for &id in item_ids {
-            let item = &mut self.items[id as usize];
+        let DecideQueue {
+            items,
+            hot_queue,
+            name_reqs,
+            name_env_items,
+            reqs,
+            ..
+        } = self;
+        let mut mark = |id: ItemId| {
+            let item = &mut items[id as usize];
             if !item.hot {
                 item.hot = true;
                 if item.queued {
-                    self.hot_queue.insert((item.key, id));
+                    hot_queue.insert((item.key, id));
                 }
             }
+        };
+        for &requirement in name_reqs.get(&name).into_iter().flatten() {
+            let entry = reqs
+                .get(requirement)
+                .expect("hot requirement is registered");
+            for &id in &entry.items {
+                mark(id);
+            }
+        }
+        for &id in name_env_items.get(&name).into_iter().flatten() {
+            mark(id);
         }
     }
 
@@ -536,6 +571,17 @@ impl<N: SolverId> DecideQueue<N> {
         }
 
         let candidates_per_set = &sorted_candidates[requirement];
+
+        // First evaluation: register the candidate occurrences that
+        // invalidate the cached walk from now on (see
+        // `ReqEntry::occ_registered`). Before this point the entry was
+        // permanently dirty, so missed touches could not lose information.
+        if !entry.occ_registered {
+            entry.occ_registered = true;
+            for &candidate in candidates_per_set.iter().flatten() {
+                occ_push(&mut self.cand_occ, candidate, requirement);
+            }
+        }
         let mut frontier: Option<(VariableId, VersionSetId, u32)> = None;
         let mut satisfied = None;
         'walk: for (version_set, candidates) in
