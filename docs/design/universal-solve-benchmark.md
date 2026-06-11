@@ -447,6 +447,26 @@ preserving commits.
     watch item) is de-prioritized by this profile: the mechanical
     class has nearly no conflicts to stabilize, and the hard-corner
     class's conflicts are real search, not drift.
+  - *Cross-check against uv*: uv's universal resolver does structurally
+    what trail-prefix preservation proposes. Its `ForkState` carries
+    the full PubGrub state (partial solution and derived
+    incompatibilities) and each marker fork continues from a clone of
+    the state at the divergence point, so the shared prefix is never
+    recomputed; forks with identical packages are merged, and
+    `resolution-markers` persisted in `uv.lock` replay fork points
+    across re-resolves (their analog of the seed partition). Two
+    differences favor the single-instance backtracking variant for
+    resolvo: no state cloning per branch, and learnt clauses keep
+    flowing between sibling regions after the split, which uv's
+    cloned forks do not get and which is what the hard-corner class
+    needs. uv's eager fork placement yields a maximal shared prefix
+    by construction; the backtracking variant only keeps the trail
+    below the first load-bearing environment literal, which is why a
+    decision order that defers env-sensitive subtrees belongs in the
+    same work item. uv's documented worst case is the same torch
+    ecosystem, and its `tool.uv.environments` setting (disjoint
+    entries that bound the marker space) is the direct analog of the
+    environment model as the cost lever.
 - **Cancellation inside the witness search**: after the two fixes the
   search is fast in practice, but it still cannot be cancelled
   mid-flight; plumb `should_cancel_with_value` through for defense in
