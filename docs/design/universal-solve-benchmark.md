@@ -421,12 +421,32 @@ preserving commits.
 - **Cherry-pick the two mainline bugs to main** independently of the
   universal work: the `SnapshotProvider::add_package_requirement` id
   shadowing and the `MappingIter` sparse-mapping truncation.
-- **Per-cell re-solve cost** is the remaining tail driver (55 ms/cell
-  on the worst problem; 23 linux timeouts are enumeration-bound).
-  Ideas, in increasing order of invasiveness: freeze or reset VSIDS
-  activity between cells (design-doc watch item), warm-start each cell
-  from the previous solution's shared prefix, and bounding cell counts
-  per package via merge-aware generalization.
+- **Per-cell re-solve cost**: a diagnostics-feature profile of the tail
+  splits it into two distinct classes with different remedies.
+  - *Mechanical re-work* (the high-cell completed outliers): problem
+    370's 360 cells spend 54% in the decide loop and 40% in
+    propagation with only 984 conflicts across the whole enumeration
+    (3 per cell, learn time 0.07 s of 23.7 s). Each cell re-decides
+    and re-propagates a nearly identical assignment over a ~13M clause
+    formula. The fix that changes the asymptotics is trail-prefix
+    preservation: after a solution, retract only to just above the
+    deepest decision level the new blocking clause touches instead of
+    `undo_until(0)`; any prefix that does not falsify the added clause
+    remains valid, and the blocking clause only mentions environment
+    literals. A decision ordering that defers env-sensitive subtrees
+    maximizes the reusable prefix.
+  - *Intrinsically hard corners* (the timeout cluster): problem 34
+    completes in 568 s with only 54 cells but 175,861 conflicts
+    (3,300 per cell, 80% propagation), against 0.31 s concretely. The
+    cells in old-cuda corners force ancient GPU stacks whose
+    refutation is genuinely expensive, and the concrete machine never
+    visits those regions. Trail reuse helps only partially here; the
+    effective lever is the model bound (cuda >=12 removes the corners
+    entirely, as the glibc 2.28 variant demonstrated for glibc).
+  - Freezing or resetting VSIDS activity between cells (the design-doc
+    watch item) is de-prioritized by this profile: the mechanical
+    class has nearly no conflicts to stabilize, and the hard-corner
+    class's conflicts are real search, not drift.
 - **Cancellation inside the witness search**: after the two fixes the
   search is fast in practice, but it still cannot be cancelled
   mid-flight; plumb `should_cancel_with_value` through for defense in
