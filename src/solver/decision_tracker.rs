@@ -8,6 +8,12 @@ pub(crate) struct DecisionTracker {
     map: DecisionMap,
     stack: Vec<Decision>,
     propagate_index: usize,
+
+    /// The lowest stack length observed since the last call to
+    /// [`Self::take_sync_floor`]. Consumers that mirror the assignment
+    /// trail (the decide queue) use this to find the point from which
+    /// their mirror and the trail diverge without hooking every undo.
+    sync_floor: usize,
 }
 
 impl DecisionTracker {
@@ -94,6 +100,7 @@ impl DecisionTracker {
         self.map.reset(decision.variable);
 
         self.propagate_index = self.stack.len();
+        self.sync_floor = self.sync_floor.min(self.stack.len());
 
         let top_decision = self.stack.last().unwrap();
         (decision, self.map.level(top_decision.variable))
@@ -107,5 +114,61 @@ impl DecisionTracker {
         let &decision = self.stack[self.propagate_index..].iter().next()?;
         self.propagate_index += 1;
         Some(decision)
+    }
+
+    /// Returns the lowest stack length observed since the previous call and
+    /// resets the marker to the current stack length.
+    ///
+    /// A consumer that keeps a mirror of the trail catches up by treating
+    /// every mirrored entry at or beyond the returned floor as undone and
+    /// every trail entry at or beyond it as newly assigned. Assignments
+    /// that were both made and undone between two calls cancel out, which
+    /// is exactly right for consumers that only care about the difference
+    /// between the two snapshots.
+    pub(crate) fn take_sync_floor(&mut self) -> usize {
+        let floor = self.sync_floor;
+        self.sync_floor = self.stack.len();
+        floor
+    }
+
+    /// The decisions on the stack starting at `index`, in assignment order.
+    pub(crate) fn stack_from(&self, index: usize) -> impl Iterator<Item = Decision> + '_ {
+        self.stack[index..].iter().copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DenseIndex;
+
+    fn decision(index: usize, value: bool) -> Decision {
+        Decision::new(VariableId::from_index(index), value, ClauseId::install_root())
+    }
+
+    #[test]
+    fn sync_floor_tracks_the_deepest_truncation_between_calls() {
+        let mut tracker = DecisionTracker::default();
+        assert_eq!(tracker.take_sync_floor(), 0);
+
+        for i in 1..=4 {
+            tracker.try_add_decision(decision(i, true), i as u32).unwrap();
+        }
+        // Nothing was undone: the floor is the previous snapshot point.
+        assert_eq!(tracker.take_sync_floor(), 0);
+        assert_eq!(tracker.stack_from(0).count(), 4);
+
+        // Undo to level 2, then add new decisions on top: the floor must
+        // point at the truncation, not at the final length.
+        tracker.undo_until(2);
+        for i in 5..=7 {
+            tracker.try_add_decision(decision(i, false), 3).unwrap();
+        }
+        assert_eq!(tracker.take_sync_floor(), 2);
+        assert_eq!(tracker.take_sync_floor(), 5);
+
+        // A full clear resets the floor to zero.
+        tracker.clear();
+        assert_eq!(tracker.take_sync_floor(), 0);
     }
 }
