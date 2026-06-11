@@ -31,3 +31,4 @@ bench-final/
 timings_*
 
 bench-universal/
+*.pending-snap
