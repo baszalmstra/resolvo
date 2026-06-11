@@ -297,6 +297,44 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// cell is unsolvable as seeded, not that the problem is unsolvable.
     pub(crate) assumption_levels: u32,
 
+    /// Total decisions propagated by this state, ever. Drives the kept-prefix
+    /// work budget; counted unconditionally (one increment per propagated
+    /// decision, negligible next to the watchlist traversal it pays for).
+    propagated_total: u64,
+
+    /// While the current `run_sat` started from a kept trail prefix
+    /// (trail-prefix preservation in `solve_universal`'s free phase), the
+    /// value of [`Self::propagated_total`] at which the run must give up.
+    /// Reuse pays off when the new region is a small edit of the previous
+    /// solution; a prefix-started run that needs real search performs far
+    /// worse than a restart-from-scratch enumeration (the inherited trail
+    /// and the solver state shaped by earlier reused transitions steer it
+    /// badly), and the damage is not repairable mid-run. Once the run has
+    /// propagated several times the cost of a from-scratch solve it aborts
+    /// with [`PrefixBudgetExhausted`] so that `solve_universal` can rebuild
+    /// and re-enumerate with trail reuse disabled, seeded by the cells found
+    /// so far. `None` when no prefix budget is armed.
+    prefix_budget_deadline: Option<u64>,
+
+    /// The propagation cost of the most recent from-scratch solve of the
+    /// current universal enumeration (the first cell), used to calibrate
+    /// [`Self::prefix_budget_deadline`]. Zero until the first cell is
+    /// recorded.
+    fresh_solve_cost: u64,
+
+    /// Decisions propagated by prefix-started runs in the current universal
+    /// enumeration. Complements the per-run deadline: a reuse attempt can
+    /// also fail by bleeding moderate overhead on every transition without
+    /// any single run crossing its deadline. Compared against
+    /// [`Self::prefix_cumulative_budget`].
+    prefix_spent: u64,
+
+    /// Cumulative work budget for all prefix-started runs, maintained by
+    /// `solve_universal` as the enumeration records cells: trail reuse must
+    /// on average cost less than one from-scratch solve per cell or it is
+    /// not paying for itself.
+    prefix_cumulative_budget: u64,
+
     /// Activity score per package.
     name_activity: <D::NameId as SolverId>::Map<f32>,
 
@@ -330,12 +368,34 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_packages: Default::default(),
             decision_tracker: Default::default(),
             assumption_levels: 0,
+            propagated_total: 0,
+            prefix_budget_deadline: None,
+            fresh_solve_cost: 0,
+            prefix_spent: 0,
+            prefix_cumulative_budget: 0,
             name_activity: Default::default(),
             #[cfg(feature = "diagnostics")]
             propagation_counters: Default::default(),
         }
     }
 }
+
+/// Work budget multiple for a `run_sat` that starts from a kept trail
+/// prefix, in units of the from-scratch solve cost (see
+/// [`SolverState::prefix_budget_deadline`]). Mechanical cell-to-cell hops
+/// cost a fraction of a fresh solve and the heaviest legitimate transitions
+/// observed in the benchmark corpus stay around ten; the pathological runs
+/// this budget exists for cost hundreds to thousands of fresh solves.
+const PREFIX_BUDGET_FACTOR: u64 = 16;
+
+/// Lower bound for the kept-prefix work budget, so that trivial first cells
+/// do not abort transitions that are cheap in absolute terms.
+const PREFIX_BUDGET_FLOOR: u64 = 10_000;
+
+/// Cancellation sentinel raised by [`Solver::learn_from_conflict`] when a
+/// prefix-started run exhausts [`PREFIX_CONFLICT_LIMIT`]. `solve_universal`
+/// intercepts it before it can escape to the caller.
+pub(crate) struct PrefixBudgetExhausted;
 
 /// Counters that track propagation loop behavior for performance analysis.
 #[cfg(feature = "diagnostics")]
@@ -361,6 +421,8 @@ pub(crate) struct PropagationCounters {
     /// [`Self::decisions_propagated`] between cell recordings). Empty for a
     /// plain solve.
     pub cell_decisions: Vec<u64>,
+    /// Times the kept-prefix conflict budget aborted a trail-reuse attempt.
+    pub prefix_budget_aborts: u64,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -647,6 +709,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         );
         let mut new_solvables: Vec<(VariableId, ClauseId)> = Vec::new();
         let mut solvable_ids: Vec<SolvableIdOrRoot<D::SolvableId>> = Vec::new();
+
+        // Arm the kept-prefix work budget (see the field docs). Only a free
+        // universal solve enters with restartable decisions above the
+        // starting level; all other entries leave this disarmed.
+        self.state.prefix_budget_deadline = if level > starting_level {
+            let budget =
+                (self.state.fresh_solve_cost * PREFIX_BUDGET_FACTOR).max(PREFIX_BUDGET_FLOOR);
+            Some(self.state.propagated_total + budget)
+        } else {
+            None
+        };
 
         // A kept trail prefix (restartable decisions above `starting_level`)
         // may contradict clauses added since the retraction: the blocking
@@ -1627,9 +1700,33 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         while let Some(decision) = self.state.decision_tracker.next_unpropagated() {
             let watched_literal = Literal::new(decision.variable, decision.value);
 
+            self.state.propagated_total += 1;
             #[cfg(feature = "diagnostics")]
             {
                 self.state.propagation_counters.decisions_propagated += 1;
+            }
+
+            // A prefix-started run that needs real work performs far worse
+            // than a restart-from-scratch enumeration: once a single run has
+            // cost several fresh solves, or all prefix-started runs together
+            // average about one fresh solve per recorded cell, abort the
+            // trail-reuse attempt so that `solve_universal` can rebuild and
+            // re-enumerate without it.
+            if let Some(deadline) = self.state.prefix_budget_deadline {
+                self.state.prefix_spent += 1;
+                if self.state.propagated_total > deadline
+                    || self.state.prefix_spent > self.state.prefix_cumulative_budget
+                {
+                    tracing::debug!(
+                        "The kept trail prefix exceeded its work budget; abandoning the \
+                         trail-reuse attempt"
+                    );
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        self.state.propagation_counters.prefix_budget_aborts += 1;
+                    }
+                    return Err(PropagationError::Cancelled(Box::new(PrefixBudgetExhausted)));
+                }
             }
 
             debug_assert!(
@@ -2156,6 +2253,23 @@ impl<D: DependencyProvider> SolverState<D> {
         self.watches.start_watching(wl, clause_id);
 
         clause_id
+    }
+
+    /// Records the propagation cost of the first recorded cell of a universal
+    /// enumeration as the calibration constant for the kept-prefix work
+    /// budget (see [`Self::prefix_budget_deadline`]).
+    pub(crate) fn record_fresh_solve_cost(&mut self) {
+        self.fresh_solve_cost = self.propagated_total;
+    }
+
+    /// Extends the cumulative kept-prefix work budget after a cell was
+    /// recorded (see [`Self::prefix_cumulative_budget`]): one from-scratch
+    /// solve per recorded cell plus a fixed slack for the first transitions.
+    pub(crate) fn extend_prefix_budget(&mut self, cells_recorded: usize) {
+        self.prefix_cumulative_budget = self
+            .fresh_solve_cost
+            .saturating_mul(cells_recorded as u64 + 32)
+            .max(PREFIX_BUDGET_FLOOR);
     }
 
     /// Allocate an environment model or blocking clause (a plain disjunction

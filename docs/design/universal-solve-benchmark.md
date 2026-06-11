@@ -485,3 +485,101 @@ preserving commits.
   the relation-table statistics printed by `create-resolvo-snapshot`
   are worth watching when repodata gains more microarch-specific
   builds.
+
+## Trail-prefix preservation: implementation and verdict (2026-06-11)
+
+The mechanical-rework follow-up above was implemented on this branch
+(design note: `universal-trail-reuse.md`; commits `perf(universal):
+trail-prefix preservation across cells` and successors) and measured
+against the same linux-64 corpus
+(`full-linux-64-universal-trailreuse2.csv` vs the
+`full-linux-64-universal-fixed.csv` baseline).
+
+### What landed besides the retraction change
+
+Implementing reuse surfaced three places where cell extraction and
+repair conditioned a choice on a trail value without pinning it, which
+a kept prefix (unlike a fresh trail) actually exercises. All three are
+fixed by one rule, every value a recording decision relied on becomes a
+cell literal: guards of an active conditional requirement with an
+installed target are recorded positively; a support scan that skips a
+true env literal pins the skipped literal; the disjointness repair scan
+pins every agreement it walks past. Cell conditions are additionally
+ordered canonically (version set id, not interning order). These fixes
+strengthened the property test rather than weakening it: all 341 solved
+seeds now reach a byte-identical fixed point after one reseed (before:
+identical only when no healing occurred), and first-reseed stability
+rose from about 79% to 82%. `run_sat` also gained an explicit
+`starting_level` contract, making the soft-requirement entry mode (the
+previous solution as preserved prior state) explicit instead of
+implied by stack depth.
+
+### What the corpus said
+
+- The mechanical class wins as designed: problems with >=32 cells run
+  at median 0.78x of the baseline universal time (mean 0.89x); problem
+  370 drops from 19.0 s to 12-13 s, and four previous timeouts now
+  complete (idx 577, 783, 807, 886).
+- The win is bounded by where env literals sit in the trail. The kept
+  prefix covers 83% of decision levels on average (retract target ~200
+  of depth ~242 on problem 370), but the re-derived suffix still costs
+  about 40% of a fresh solve in propagations per cell, and the decide
+  loop's full clause scan dominates the remainder. The collapse the
+  design hoped for requires env literals to land at the top of the
+  trail, which is the deferred decision-ordering work item, not a
+  retraction-policy detail.
+- A prefix-started run that needs real search is reliably WORSE than a
+  restart, and not mid-run repairable: restarting to the root level
+  after a conflict budget left runs 2x more expensive than truly fresh
+  ones (the damage lives in watchlist order and activity shaped by the
+  reused transitions, which no backjump resets). Unprotected, this
+  turned 7 problems from ok/unsolvable into timeouts (idx 46: 22.8 s to
+  timeout; idx 450: 15.1 s to timeout).
+- The protection that works is wholesale abandonment: prefix-started
+  runs carry a work budget in propagated decisions, calibrated by the
+  first cell's from-scratch cost (16x per run, plus a cumulative one
+  fresh solve per recorded cell). On exhaustion the enumeration
+  rebuilds from a fresh state with reuse disabled and only the original
+  seeds. Worst case is the baseline plus a budget-bounded wasted
+  attempt: idx 450 lands at 30 s (was 218 s unprotected, 19 s
+  baseline), idx 46 at 39 s (was 87 s, 30 s baseline).
+- Seeding the fallback with the cells already found looked free and is
+  not: re-enumerating under 330 seed cells exploded one transition to
+  79M propagations where the unseeded baseline needs 2.5k conflicts
+  total. Replaying LARGE seed partitions is its own scaling hazard
+  (the M4 property test covers small universes only) and deserves a
+  dedicated look before pixi feeds lockfile-sized partitions back in.
+
+Net effect on the full corpus, protected version vs baseline universal:
+same-outcome duration ratio median 1.04 (the cheap majority pays the
+bookkeeping), high-cell median 0.78, total wall 3350 s to 3388 s,
+timeouts 23 to 25. The four timeouts gained are near-cap borderline
+cases (unsolvable verdicts at 48-59 s that now cross 60 s) plus idx 491
+(37.9 s, the one genuine outstanding regression) and idx 750 (52.5 s);
+the four lost are real completions. All 725 universal solutions remain
+verifier-clean.
+
+### Verdict and decision point
+
+Trail-prefix preservation as a standalone change is a wash on this
+corpus: it does not endanger the always-on recommendation, but it does
+not strengthen it either. The reasons are measured, not speculative,
+and they all point at the same lever: until a decision ordering defers
+env-sensitive packages so that retract targets sit near the top of the
+trail, the mechanical win stays bounded at ~25% of the high-cell tail
+while the hard-corner class needs active protection. Options, in
+preference order:
+
+1. Land the extraction/replay-stability fixes and the `run_sat`
+   contract unconditionally (they are correctness hardening, valuable
+   without reuse), keep the reuse machinery merged but behind an
+   internal switch default-off, and revisit after the
+   env-literals-last ordering work, which is now clearly the
+   highest-leverage follow-up of the whole campaign.
+2. Ship reuse always-on with the work-budget protection as benchmarked
+   here, accepting the +2 borderline timeouts for the 4 recovered ones
+   and the bounded tails.
+3. Drop the reuse machinery, keep only the hardening.
+
+The branch implements option 2 (reuse on, protected); flipping to
+option 1 is a one-line change in `solve_universal`.

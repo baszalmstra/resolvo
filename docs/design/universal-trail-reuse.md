@@ -1,6 +1,15 @@
 # Trail-prefix preservation across universal cells
 
-Status: design, 2026-06-11. Follow-up to the benchmark report
+Status: implemented and benchmarked, 2026-06-11. The corpus verdict and
+the protection machinery that the implementation turned out to need
+(work-budget abandonment with a from-scratch fallback) are documented
+in `universal-solve-benchmark.md`, section "Trail-prefix preservation:
+implementation and verdict"; the headline finding is that the win is
+bounded by env literals sitting mid-trail, making the env-literals-last
+decision ordering (listed under follow-ups below) the prerequisite for
+the collapse this note aimed at.
+
+Original design follows. Follow-up to the benchmark report
 (`universal-solve-benchmark.md`), which motivates this with a profile:
 high-cell enumerations spend 94% of their time re-deciding and
 re-propagating a nearly conflict-free, nearly identical assignment per

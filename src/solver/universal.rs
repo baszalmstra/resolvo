@@ -138,13 +138,25 @@ use crate::{
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     runtime::AsyncRuntime,
     solver::{
-        Solver, SolverState, UnsolvableOrCancelled,
+        PrefixBudgetExhausted, Solver, SolverState, UnsolvableOrCancelled,
         clause::{Clause, EnvClauseKind, Literal, WatchedLiterals},
         decision::Decision,
         variable_map::VariableOrigin,
     },
     solver_id::IdMap,
 };
+
+/// The result of one enumeration pass (see `Solver::enumerate_universal`):
+/// either a complete partition, or the trail-reuse attempt was abandoned and
+/// the enumeration must re-run from scratch without it. The abandoned
+/// attempt's cells are NOT reused as seeds: replaying a large recorded
+/// partition is itself a search liability (a heavily seeded re-enumeration
+/// has been observed to behave far worse than the plain restart-from-zero
+/// enumeration), and the fallback must be exactly the no-reuse baseline.
+enum EnumerationOutcome<Id, N> {
+    Done(UniversalSolution<Id, N>),
+    ReuseAbandoned,
+}
 
 /// Returns true when the variable represents an environment literal (either
 /// a matches or an absent literal).
@@ -634,14 +646,72 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         problem: UniversalProblem<D::SolvableId, D::NameId>,
     ) -> Result<UniversalSolution<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
+        let UniversalProblem {
+            requirements,
+            constraints,
+            environment_model,
+            seed_partition,
+            _marker,
+        } = problem;
+
+        // First attempt: enumerate with trail-prefix preservation. When a
+        // prefix-started run exceeds its work budget the attempt is
+        // abandoned wholesale (the solver state shaped by reused transitions
+        // performs badly under real search and is not repairable in place)
+        // and the enumeration re-runs from a fresh state with reuse
+        // disabled, exactly as if trail reuse did not exist. The wasted
+        // attempt is bounded by the work budgets; the fallback never aborts,
+        // so at most one rebuild happens.
+        match self.enumerate_universal(
+            requirements.clone(),
+            constraints.clone(),
+            environment_model.clone(),
+            seed_partition.clone(),
+            true,
+        )? {
+            EnumerationOutcome::Done(solution) => Ok(solution),
+            EnumerationOutcome::ReuseAbandoned => {
+                tracing::debug!(
+                    "trail reuse exceeded its work budget; re-enumerating from scratch \
+                     without it"
+                );
+                match self.enumerate_universal(
+                    requirements,
+                    constraints,
+                    environment_model,
+                    seed_partition,
+                    false,
+                )? {
+                    EnumerationOutcome::Done(solution) => Ok(solution),
+                    EnumerationOutcome::ReuseAbandoned => {
+                        unreachable!("the budget is never armed when trail reuse is disabled")
+                    }
+                }
+            }
+        }
+    }
+
+    /// One enumeration pass over the environment model: the body of
+    /// [`Self::solve_universal`]. With `reuse_trail` the free phase keeps
+    /// the trail prefix that does not falsify each new blocking clause;
+    /// without it every cell restarts from a fully retracted trail.
+    #[allow(clippy::type_complexity)]
+    fn enumerate_universal(
+        &mut self,
+        requirements: Vec<ConditionalRequirement>,
+        constraints: Vec<VersionSetId>,
+        environment_model: EnvironmentModel<D::NameId>,
+        seed_partition: Vec<CellCondition<D::NameId>>,
+        reuse_trail: bool,
+    ) -> Result<EnumerationOutcome<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
         // Re-initialize the solver state, like `solve` does. One state is
         // shared across the whole enumeration loop: the formula only grows,
         // so learnt clauses and interned variables stay valid across cells.
         self.state = SolverState::default();
 
         let root_dependencies = Dependencies::Known(KnownDependencies {
-            requirements: problem.requirements,
-            constrains: problem.constraints,
+            requirements,
+            constrains: constraints,
         });
 
         // The first clause must be the install-root clause (same invariant as
@@ -656,7 +726,6 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // model bounds every enumerated cell and the oracle consistency
         // clauses between model literals and later requirement literals are
         // emitted on first interning.
-        let environment_model = problem.environment_model;
         self.encode_environment_model(&environment_model)?;
 
         let mut cells = Vec::new();
@@ -670,12 +739,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // Cells from a previous solve are solved first, in order, each under
         // its condition pushed as assumption decisions (design doc 5.7). When
         // the seeds run out the loop continues as free enumeration.
-        let mut pending_seeds = problem.seed_partition.into_iter();
+        let mut pending_seeds = seed_partition.into_iter();
 
         // Snapshot of the propagated-decision counter at the previous cell
         // recording, used to attribute propagation work to individual cells.
         #[cfg(feature = "diagnostics")]
         let mut decisions_at_last_cell = 0u64;
+
+        // Whether the from-scratch solve cost that calibrates the kept-prefix
+        // work budget has been recorded yet (the first recorded cell always
+        // runs from a fresh or fully retracted trail).
+        let mut fresh_cost_recorded = false;
 
         loop {
             // Set up the assumptions of the next viable seed, if any remain.
@@ -729,6 +803,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         decisions_at_last_cell = total;
                     }
 
+                    if !fresh_cost_recorded {
+                        fresh_cost_recorded = true;
+                        self.state.record_fresh_solve_cost();
+                    }
+                    self.state.extend_prefix_budget(cells.len());
+
                     if cell_is_empty {
                         // No environment literal was load bearing: the
                         // solution is valid in every environment, so coverage
@@ -746,7 +826,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // seeded cell still retracts fully: its trail starts with
                     // assumption decisions, which must never leak into the
                     // next solve.
-                    let retract_target = if self.state.assumption_levels > 0 {
+                    let retract_target = if self.state.assumption_levels > 0 || !reuse_trail {
                         0
                     } else {
                         self.blocking_clause_retract_target(&cell)
@@ -785,6 +865,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     self.state.decision_tracker.undo_until(0);
                 }
                 Err(UnsolvableOrCancelled::Cancelled(value)) => {
+                    // A prefix-started run that exceeded its conflict budget
+                    // aborts the whole trail-reuse attempt; the caller
+                    // re-enumerates from scratch with the cells found so far
+                    // as seeds. Real cancellations pass through.
+                    if value.downcast_ref::<PrefixBudgetExhausted>().is_some() {
+                        debug_assert!(
+                            reuse_trail,
+                            "bug: the prefix budget is never armed without trail reuse"
+                        );
+                        return Ok(EnumerationOutcome::ReuseAbandoned);
+                    }
                     return Err(UniversalFailure::Cancelled(value));
                 }
                 Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
@@ -826,11 +917,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
-        Ok(UniversalSolution {
+        Ok(EnumerationOutcome::Done(UniversalSolution {
             cells,
             environment_model,
             cell_edges,
-        })
+        }))
     }
 
     /// Returns, for each cell recorded by the last [`Self::solve_universal`]
