@@ -351,6 +351,50 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     learnt_why: Mapping<LearntClauseId, Vec<ClauseId>>,
     learnt_clause_ids: Vec<ClauseId>,
 
+    /// The LBD (literal block distance: distinct decision levels among the
+    /// literals at learn time) of every learnt clause, indexed by
+    /// [`LearntClauseId`]. Glucose's quality measure for learnt clauses;
+    /// drives [`Solver::reduce_learnt_db`].
+    learnt_lbds: Vec<u32>,
+
+    /// Whether each learnt clause participated in a conflict analysis since
+    /// the last learnt-DB reduction, indexed by [`LearntClauseId`]. A used
+    /// clause is protected from the next reduction (and the flags are then
+    /// cleared): a static learn-time LBD alone freezes clauses that an
+    /// unsolvability proof re-derives over and over.
+    learnt_used: Vec<bool>,
+
+    /// The learnt-clause count at the previous reduction: clauses allocated
+    /// after it get a full interval of grace before becoming deletable.
+    reduce_watermark: usize,
+
+    /// Clauses (by index) that have been frozen by learnt-DB reduction: the
+    /// clause stays allocated (ids stay stable, `learnt_why` chains keep
+    /// resolving for error reporting) but no longer participates in
+    /// propagation. The propagation loop lazily unlinks frozen clauses from
+    /// the watch lists it traverses; `Vec<bool>` is grown on demand, so an
+    /// index past the end means "not frozen".
+    frozen_clauses: Vec<bool>,
+
+    /// Total conflicts learnt by this state, across all `run_sat` calls (a
+    /// universal enumeration shares one state and one learnt DB).
+    conflicts_learnt_total: u64,
+
+    /// The value of [`Self::conflicts_learnt_total`] at which the next
+    /// learnt-DB reduction fires.
+    next_reduce_at: u64,
+
+    /// Number of learnt-DB reductions performed; paces the growth of the
+    /// reduction interval.
+    reductions_performed: u64,
+
+    /// Signatures (order-independent literal-set hashes) of frozen learnt
+    /// clauses, used to count re-learned clauses: a high count means the
+    /// reduction is deleting clauses the search still needs (and in a
+    /// universal solve, that cross-cell clause sharing is being destroyed).
+    #[cfg(feature = "diagnostics")]
+    frozen_signatures: HashSet<u64>,
+
     disjunctions: Arena<DisjunctionId, Disjunction>,
 
     clauses_added_for_package: <D::NameId as SolverId>::Set,
@@ -472,6 +516,15 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             learnt_clauses: Default::default(),
             learnt_why: Default::default(),
             learnt_clause_ids: Default::default(),
+            learnt_lbds: Default::default(),
+            learnt_used: Default::default(),
+            reduce_watermark: 0,
+            frozen_clauses: Default::default(),
+            conflicts_learnt_total: 0,
+            next_reduce_at: REDUCE_FIRST_INTERVAL,
+            reductions_performed: 0,
+            #[cfg(feature = "diagnostics")]
+            frozen_signatures: Default::default(),
             disjunctions: Default::default(),
             clauses_added_for_package: Default::default(),
             clauses_added_for_solvable: Default::default(),
@@ -523,6 +576,16 @@ pub(crate) struct PrefixBudgetExhausted;
 /// re-descends under the post-conflict ones.
 const RESTART_BASE_INTERVAL: u64 = 128;
 
+/// Learnt conflicts before the first learnt-DB reduction (see
+/// [`Solver::reduce_learnt_db`]).
+const REDUCE_FIRST_INTERVAL: u64 = 2000;
+
+/// Growth of the reduction interval per reduction performed: later
+/// reductions are spaced further apart, so a long search settles into a
+/// learnt DB that has repeatedly proven its keep, and cross-cell sharing
+/// in a universal enumeration is not endlessly churned.
+const REDUCE_INTERVAL_INCREMENT: u64 = 500;
+
 /// The Luby sequence (1, 1, 2, 1, 1, 2, 4, 1, ...) for `x >= 0`, the
 /// textbook universally-optimal restart pacing: frequent short intervals
 /// with geometrically rarer long ones, so neither short- nor long-tailed
@@ -539,6 +602,21 @@ fn luby(mut x: u64) -> u64 {
         x %= size;
     }
     1u64 << seq
+}
+
+/// An order-independent hash of a clause's literal set, used to detect a
+/// clause being learnt again after a learnt-DB reduction froze it.
+#[cfg(feature = "diagnostics")]
+fn clause_signature(literals: &[Literal]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut keys: Vec<u64> = literals
+        .iter()
+        .map(|literal| ((literal.variable().to_index() as u64) << 1) | literal.negate() as u64)
+        .collect();
+    keys.sort_unstable();
+    let mut hasher = ahash::AHasher::default();
+    keys.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Counters that track propagation loop behavior for performance analysis.
@@ -562,6 +640,12 @@ pub(crate) struct PropagationCounters {
     pub conflicts: u64,
     /// Times the Luby restart policy fired (see [`Solver::maybe_restart`]).
     pub restarts: u64,
+    /// Learnt clauses frozen by learnt-DB reduction.
+    pub clauses_frozen: u64,
+    /// Learnt clauses that were learnt again after having been frozen; a
+    /// high count relative to `clauses_frozen` means the reduction is too
+    /// aggressive (in a universal solve: it destroys cross-cell sharing).
+    pub relearned_clauses: u64,
     /// For each recorded cell of a universal solve, the number of decisions
     /// propagated while solving that cell (the delta of
     /// [`Self::decisions_propagated`] between cell recordings). Empty for a
@@ -2097,6 +2181,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         conflicting_clause,
                     )?;
                     level = self.maybe_restart(level);
+                    self.maybe_reduce_learnt_db();
                 }
             }
         }
@@ -2275,6 +2360,122 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         root_level
     }
 
+    /// Fires a learnt-DB reduction when enough conflicts have accumulated
+    /// since the previous one (see [`REDUCE_FIRST_INTERVAL`]). The pacing
+    /// is global to the solver state, not per `run_sat` call: a universal
+    /// enumeration shares one learnt DB across all its cells.
+    fn maybe_reduce_learnt_db(&mut self) {
+        if self.state.conflicts_learnt_total < self.state.next_reduce_at {
+            return;
+        }
+        self.reduce_learnt_db();
+        self.state.reductions_performed += 1;
+        self.state.next_reduce_at = self.state.conflicts_learnt_total
+            + REDUCE_FIRST_INTERVAL
+            + REDUCE_INTERVAL_INCREMENT * self.state.reductions_performed;
+    }
+
+    /// Freezes the worst half of the deletable learnt clauses, Glucose
+    /// style: kept forever are unit and binary clauses, glue clauses
+    /// (LBD <= 2), and clauses currently acting as the reason of a trail
+    /// assignment; of the rest, the half with the highest LBD (oldest
+    /// first within a tie) is frozen.
+    ///
+    /// Freezing is not deletion: the clause arena is append-only (ids must
+    /// stay stable) and `learnt_why` must keep resolving for conflict
+    /// reporting, so the clause merely stops participating in propagation
+    /// (`decide_learned` no longer scans it; the propagation loop unlinks
+    /// it lazily from the watch lists). Dropping a learnt clause from
+    /// propagation is always sound; it can only lengthen the search.
+    fn reduce_learnt_db(&mut self) {
+        let state = &mut self.state;
+
+        // Clauses acting as the reason of a current assignment are kept:
+        // conservative, cheap, and standard.
+        let reasons: HashSet<ClauseId> = state
+            .decision_tracker
+            .stack()
+            .map(|d| d.derived_from)
+            .collect();
+
+        let mut deletable: Vec<(u32, ClauseId)> = Vec::new();
+        for &clause_id in &state.learnt_clause_ids {
+            let Clause::Learnt(learnt_id) = state.clauses.kinds[clause_id.to_index()] else {
+                unreachable!("learnt_clause_ids only holds learnt clauses");
+            };
+            // Clauses learnt since the previous reduction get a full
+            // interval of grace before they can be frozen.
+            if learnt_id.to_index() >= state.reduce_watermark {
+                continue;
+            }
+            // A clause that resolved into a conflict since the previous
+            // reduction has proven useful; freezing such clauses makes the
+            // search re-derive them (the re-learned counter measures this).
+            if state.learnt_used[learnt_id.to_index()] {
+                continue;
+            }
+            if state.learnt_clauses[learnt_id].len() <= 2 {
+                continue;
+            }
+            let lbd = state.learnt_lbds[learnt_id.to_index()];
+            if lbd <= 2 {
+                continue;
+            }
+            if reasons.contains(&clause_id) {
+                continue;
+            }
+            deletable.push((lbd, clause_id));
+        }
+
+        // Every used flag has served its protection round; the next round
+        // starts clean. The grace boundary moves up to the present.
+        for used in &mut state.learnt_used {
+            *used = false;
+        }
+        state.reduce_watermark = state.learnt_clauses.len();
+
+        // Freeze the worst half: highest LBD first, oldest first on ties.
+        let freeze_count = deletable.len() / 2;
+        if freeze_count == 0 {
+            return;
+        }
+        deletable.sort_unstable_by(|(lbd_a, id_a), (lbd_b, id_b)| {
+            lbd_b.cmp(lbd_a).then(id_a.to_index().cmp(&id_b.to_index()))
+        });
+        deletable.truncate(freeze_count);
+
+        let frozen: HashSet<ClauseId> = deletable.iter().map(|&(_, id)| id).collect();
+        if state.frozen_clauses.len() < state.clauses.kinds.len() {
+            state
+                .frozen_clauses
+                .resize(state.clauses.kinds.len(), false);
+        }
+        for &(_, clause_id) in &deletable {
+            state.frozen_clauses[clause_id.to_index()] = true;
+            #[cfg(feature = "diagnostics")]
+            {
+                let Clause::Learnt(learnt_id) = state.clauses.kinds[clause_id.to_index()] else {
+                    unreachable!();
+                };
+                state
+                    .frozen_signatures
+                    .insert(clause_signature(&state.learnt_clauses[learnt_id]));
+            }
+        }
+        state
+            .learnt_clause_ids
+            .retain(|clause_id| !frozen.contains(clause_id));
+
+        #[cfg(feature = "diagnostics")]
+        {
+            state.propagation_counters.clauses_frozen += freeze_count as u64;
+        }
+        tracing::debug!(
+            "├─ Learnt-DB reduction: froze {freeze_count} of {} learnt clauses",
+            freeze_count + state.learnt_clause_ids.len()
+        );
+    }
+
     /// The propagate step of the CDCL algorithm
     ///
     /// Propagation is implemented by means of watches: each clause that has two
@@ -2373,6 +2574,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .cursor(&mut self.state.clauses.watched_literals, watched_literal);
             while let Some(cursor) = next_cursor.take() {
                 let clause_id = cursor.clause_id();
+
+                // Lazily unlink clauses frozen by learnt-DB reduction: a
+                // frozen clause no longer participates in propagation, and
+                // dropping it from the list as it is encountered makes the
+                // freeze free for lists that are never traversed again.
+                let clause_index = clause_id.to_index();
+                if clause_index < self.state.frozen_clauses.len()
+                    && self.state.frozen_clauses[clause_index]
+                {
+                    next_cursor = cursor.remove();
+                    continue;
+                }
+
                 let clause = &clause_kinds[clause_id.to_index()];
                 let watch_index = cursor.watch_index();
 
@@ -2766,6 +2980,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut causes_at_current_level = 0u32;
         let mut learnt = Vec::new();
         let mut back_track_to = 0;
+        // The decision levels of the non-UIP learnt literals, collected at
+        // visit time (while their assignments are still on the trail), for
+        // the LBD of the learnt clause.
+        let mut learnt_levels: Vec<u32> = Vec::new();
 
         let mut s_value;
         let mut learnt_why = Vec::new();
@@ -2773,6 +2991,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let clause_kinds = &self.state.clauses.kinds;
         loop {
             learnt_why.push(clause_id);
+
+            // A learnt clause that takes part in a resolution has proven
+            // useful: protect it from the next learnt-DB reduction.
+            if let Clause::Learnt(used_learnt_id) = clause_kinds[clause_id.to_index()] {
+                self.state.learnt_used[used_learnt_id.to_index()] = true;
+            }
 
             clause_kinds[clause_id.to_index()].visit_literals(
                 &self.state.learnt_clauses,
@@ -2804,6 +3028,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                                 .unwrap(),
                         );
                         learnt.push(learnt_literal);
+                        learnt_levels.push(decision_level);
                         back_track_to = back_track_to.max(decision_level);
                     } else {
                         unreachable!();
@@ -2870,9 +3095,36 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
+        // The LBD of the learnt clause: distinct decision levels among the
+        // non-UIP literals, plus one for the UIP (which sits alone at the
+        // conflict level, above all of them).
+        learnt_levels.sort_unstable();
+        learnt_levels.dedup();
+        let lbd = learnt_levels.len() as u32 + 1;
+
+        // Detect re-learning of a previously frozen clause: a sign that the
+        // learnt-DB reduction deleted a clause the search still needed.
+        #[cfg(feature = "diagnostics")]
+        if !self.state.frozen_signatures.is_empty()
+            && self
+                .state
+                .frozen_signatures
+                .contains(&clause_signature(&learnt))
+        {
+            self.state.propagation_counters.relearned_clauses += 1;
+        }
+
         // Add the clause
         let learnt_id = self.state.learnt_clauses.alloc(learnt);
         self.state.learnt_why.insert(learnt_id, learnt_why);
+        debug_assert_eq!(
+            self.state.learnt_lbds.len(),
+            learnt_id.to_index(),
+            "the LBD store must stay parallel to the learnt clause arena"
+        );
+        self.state.learnt_lbds.push(lbd);
+        self.state.learnt_used.push(false);
+        self.state.conflicts_learnt_total += 1;
 
         let (watched_literals, kind) =
             WatchedLiterals::learnt(learnt_id, &self.state.learnt_clauses[learnt_id]);

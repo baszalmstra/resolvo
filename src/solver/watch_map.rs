@@ -199,6 +199,53 @@ impl WatchMapCursor<'_> {
         self.current.watch_index
     }
 
+    /// Unlinks the current clause from this literal's watch list without
+    /// watching anything else. Used to lazily drop frozen learnt clauses
+    /// from the lists they appear in: the clause's `WatchedLiterals` entry
+    /// stays intact (the other watch list may still link through it), it
+    /// is just no longer reachable from this literal.
+    ///
+    /// Returns a cursor that points to the next node in the linked list or
+    /// `None` if there is no next.
+    #[inline]
+    pub fn remove(mut self) -> Option<Self> {
+        let clause_idx = self.current.clause_id.to_index();
+        let next_node = self.next_node();
+
+        // Update the previous node (or the list head) to point past the
+        // current node, exactly like `update` does.
+        if let Some(previous) = &self.previous {
+            // SAFETY: Within the cursor, the watches are never unset, so if
+            // we have a previous index there will also be watch literals for
+            // that clause.
+            let previous_watches = unsafe {
+                debug_expect_unchecked(
+                    self.watches[previous.clause_id.to_index()].as_mut(),
+                    "previous clause has no watches",
+                )
+            };
+            previous_watches.next_watches[previous.watch_index] =
+                next_node.as_ref().map(|node| node.clause_id);
+        } else if let Some(next_clause_id) = next_node.as_ref().map(|node| node.clause_id) {
+            self.watch_map.map.insert(self.literal, next_clause_id);
+        } else {
+            self.watch_map.map.unset(self.literal);
+        }
+
+        // Clear the removed node's next pointer so no stale link survives.
+        let watch = unsafe {
+            debug_expect_unchecked(
+                self.watches[clause_idx].as_mut(),
+                "clause is not watching literals",
+            )
+        };
+        watch.next_watches[self.current.watch_index] = None;
+
+        // The previous node is unchanged: the current node was unlinked.
+        self.current = next_node?;
+        Some(self)
+    }
+
     /// Update the current watch to a new literal. This removes the current node
     /// from the linked-list and sets up a watch on the new literal.
     ///
