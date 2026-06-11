@@ -3040,6 +3040,24 @@ fn test_universal_trail_reuse_second_cell_decides_less() {
         "the second cell must reuse the kept trail prefix and decide strictly \
          fewer variables than the first (got {cell_decisions:?})"
     );
+
+    // The pin counters attribute every cell literal to exactly one pinning
+    // rule, so per cell their total equals the condition length.
+    let pins = solver.universal_cell_pins();
+    assert_eq!(
+        pins.len(),
+        solution.cells.len(),
+        "one pin-count entry per recorded cell"
+    );
+    for (pin, (condition, _)) in pins.iter().zip(&solution.cells) {
+        assert_eq!(
+            pin.total() as usize,
+            condition.0.len(),
+            "every literal of the cell condition is attributed to exactly one \
+             pinning rule (got {pin:?} for a condition of {} literals)",
+            condition.0.len()
+        );
+    }
 }
 
 /// Environment literals must be decided at the top of the trail so that the

@@ -53,6 +53,9 @@ pub use universal::{
     CellEdge, EnvironmentModel, UniversalFailure, UniversalProblem, UniversalSolution, Violation,
 };
 
+#[cfg(feature = "diagnostics")]
+pub use universal::CellPinCounts;
+
 /// Describes the problem that is to be solved by the solver.
 ///
 /// This struct is generic over the type `S` of the collection of soft
@@ -522,6 +525,10 @@ pub(crate) struct PropagationCounters {
     /// needs no retraction) and the trail depth at that point. Empty for a
     /// plain solve and for seeded cells.
     pub cell_retracts: Vec<(u32, u32)>,
+    /// For each recorded cell of a universal solve, the number of cell
+    /// literals each pinning rule contributed (load-bearing extraction
+    /// versus disjointness-repair appends). Empty for a plain solve.
+    pub cell_pins: Vec<universal::CellPinCounts>,
     /// Times the kept-prefix conflict budget aborted a trail-reuse attempt.
     pub prefix_budget_aborts: u64,
     /// Time spent adding clauses from the dependency provider.

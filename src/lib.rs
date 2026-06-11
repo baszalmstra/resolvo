@@ -56,6 +56,8 @@ pub use solver::{
     CellEdge, EmptySolvables, EnvironmentModel, Problem, Solver, SolverCache, UniversalFailure,
     UniversalProblem, UniversalSolution, UnsolvableOrCancelled, Violation,
 };
+#[cfg(feature = "diagnostics")]
+pub use solver::CellPinCounts;
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
 

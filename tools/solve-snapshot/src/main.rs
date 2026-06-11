@@ -19,9 +19,10 @@ use rand::{
     rngs::StdRng,
 };
 use resolvo::{
-    ConditionalRequirement, EnvLiteral, EnvLiteralKind, EnvironmentModel, NameId, Problem, Solver,
-    UniversalFailure, UniversalProblem, UnsolvableOrCancelled, VersionSetId,
-    snapshot::DependencySnapshot,
+    CellCondition, ConditionalRequirement, EnvLiteral, EnvLiteralKind, EnvironmentModel, NameId,
+    Problem, SolvableId, Solver, UniversalFailure, UniversalProblem, UniversalSolution,
+    UnsolvableOrCancelled, VersionSetId,
+    snapshot::{DependencySnapshot, SnapshotProvider},
 };
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -88,6 +89,12 @@ struct Opts {
     /// Enable tracing output (set RUST_LOG for verbosity, e.g. RUST_LOG=info)
     #[clap(long)]
     tracing: bool,
+
+    /// Dump per-cell statistics of every universal solution
+    /// (distinct solvable sets, per-axis fragmentation, per-cell conditions)
+    /// to the given file.
+    #[clap(long)]
+    cells_dump: Option<PathBuf>,
 }
 
 /// One signed environment literal in the model file, e.g.
@@ -207,6 +214,219 @@ fn resolve_env_model(model: &EnvModelFile, snapshot: &DependencySnapshot) -> Env
                 .collect()
         })
         .collect()
+}
+
+/// Merges two conjunctions when they contain exactly the same
+/// literals and differ in the sign of at most one (mirror of the private
+/// `merge_disjunct_pair` in resolvo::solver::universal).
+fn merge_disjunct_pair(
+    a: &CellCondition<NameId>,
+    b: &CellCondition<NameId>,
+) -> Option<CellCondition<NameId>> {
+    if a.0.len() != b.0.len() {
+        return None;
+    }
+    let mut differing = None;
+    for (index, (literal, sign)) in a.0.iter().enumerate() {
+        let (_, b_sign) = b.0.iter().find(|(b_literal, _)| b_literal == literal)?;
+        if sign != b_sign {
+            if differing.is_some() {
+                return None;
+            }
+            differing = Some(index);
+        }
+    }
+    let merged = match differing {
+        None => a.0.clone(),
+        Some(drop_index) => {
+            a.0.iter()
+                .enumerate()
+                .filter(|&(index, _)| index != drop_index)
+                .map(|(_, literal)| literal.clone())
+                .collect()
+        }
+    };
+    Some(CellCondition(merged))
+}
+
+/// Simplifies a disjunction of conjunctions to a fixpoint (mirror
+/// of the private `simplify_disjuncts` in resolvo::solver::universal).
+fn simplify_disjuncts(mut disjuncts: Vec<CellCondition<NameId>>) -> Vec<CellCondition<NameId>> {
+    'merge: loop {
+        for first in 0..disjuncts.len() {
+            for second in first + 1..disjuncts.len() {
+                let Some(merged) = merge_disjunct_pair(&disjuncts[first], &disjuncts[second])
+                else {
+                    continue;
+                };
+                if merged.0.is_empty() {
+                    return vec![CellCondition(Vec::new())];
+                }
+                disjuncts[first] = merged;
+                disjuncts.remove(second);
+                continue 'merge;
+            }
+        }
+        return disjuncts;
+    }
+}
+
+/// Dumps per-cell statistics of a universal solution: distinct
+/// solvable sets across cells, the simplified disjunct count per set (an
+/// achievable partition size with the current literal vocabulary), per-axis
+/// fragmentation, and the full per-cell condition listing.
+fn dump_cell_stats(
+    path: &PathBuf,
+    problem_index: usize,
+    solution: &UniversalSolution<SolvableId, NameId>,
+    provider: &SnapshotProvider<'_>,
+    snapshot: &DependencySnapshot,
+) {
+    use std::io::Write;
+
+    use resolvo::Interner;
+
+    let mut out = std::io::BufWriter::new(File::create(path).unwrap());
+
+    // Group cells by solvable set. The solvable lists are canonical (sorted
+    // by solver variable id), so identical sets compare equal as vectors.
+    let mut groups: Vec<(Vec<SolvableId>, Vec<usize>)> = Vec::new();
+    for (idx, (_, solvables)) in solution.cells.iter().enumerate() {
+        match groups.iter_mut().find(|(set, _)| set == solvables) {
+            Some((_, cells)) => cells.push(idx),
+            None => groups.push((solvables.clone(), vec![idx])),
+        }
+    }
+
+    // Per-group simplified disjunct count: how many conjunctive cells the
+    // group's region actually needs with the current literal vocabulary.
+    let mut total_simplified = 0usize;
+    let mut group_simplified: Vec<usize> = Vec::new();
+    for (_, cells) in &groups {
+        let disjuncts: Vec<CellCondition<NameId>> = cells
+            .iter()
+            .map(|&idx| solution.cells[idx].0.clone())
+            .collect();
+        let simplified = simplify_disjuncts(disjuncts).len();
+        group_simplified.push(simplified);
+        total_simplified += simplified;
+    }
+
+    writeln!(out, "=== problem {problem_index} cell statistics ===").unwrap();
+    writeln!(
+        out,
+        "cells: {}  distinct solvable sets: {}  simplified partition size: {}",
+        solution.cells.len(),
+        groups.len(),
+        total_simplified
+    )
+    .unwrap();
+
+    // Axis statistics: per environment package, the distinct literals seen
+    // in cell conditions and how many cells mention them.
+    writeln!(out, "\n=== axis fragmentation ===").unwrap();
+    let mut axis: Vec<(NameId, Vec<(String, usize, usize)>)> = Vec::new();
+    for (condition, _) in &solution.cells {
+        for (literal, sign) in &condition.0 {
+            let display = match &literal.kind {
+                EnvLiteralKind::Absent => "absent".to_string(),
+                EnvLiteralKind::Matches(vs) => {
+                    snapshot.version_sets.get(*vs).unwrap().display.clone()
+                }
+            };
+            let package_entry = match axis.iter_mut().find(|(p, _)| *p == literal.package) {
+                Some(entry) => entry,
+                None => {
+                    axis.push((literal.package, Vec::new()));
+                    axis.last_mut().unwrap()
+                }
+            };
+            match package_entry.1.iter_mut().find(|(d, _, _)| *d == display) {
+                Some((_, pos, neg)) => {
+                    if *sign {
+                        *pos += 1;
+                    } else {
+                        *neg += 1;
+                    }
+                }
+                None => package_entry.1.push((
+                    display,
+                    if *sign { 1 } else { 0 },
+                    if *sign { 0 } else { 1 },
+                )),
+            }
+        }
+    }
+    for (package, literals) in &axis {
+        writeln!(
+            out,
+            "{}: {} distinct literals",
+            provider.display_name(*package),
+            literals.len()
+        )
+        .unwrap();
+        for (display, pos, neg) in literals {
+            writeln!(out, "  {display}: pos in {pos} cells, neg in {neg} cells").unwrap();
+        }
+    }
+
+    // Per-group details: size, cells, simplified count, diff vs group 0.
+    writeln!(out, "\n=== solvable-set groups ===").unwrap();
+    let baseline = groups.first().map(|(set, _)| set.clone()).unwrap_or_default();
+    for (gid, (set, cells)) in groups.iter().enumerate() {
+        let added: Vec<String> = set
+            .iter()
+            .filter(|s| !baseline.contains(s))
+            .map(|&s| provider.display_solvable(s).to_string())
+            .collect();
+        let removed: Vec<String> = baseline
+            .iter()
+            .filter(|s| !set.contains(s))
+            .map(|&s| provider.display_solvable(s).to_string())
+            .collect();
+        writeln!(
+            out,
+            "group {gid}: {} records, {} cells, simplified to {} cell(s); \
+             vs group 0: +{} -{}",
+            set.len(),
+            cells.len(),
+            group_simplified[gid],
+            added.len(),
+            removed.len(),
+        )
+        .unwrap();
+        if gid > 0 {
+            writeln!(out, "  added: {}", added.join(", ")).unwrap();
+            writeln!(out, "  removed: {}", removed.join(", ")).unwrap();
+        }
+    }
+
+    // Full per-cell listing.
+    writeln!(out, "\n=== cells ===").unwrap();
+    let group_of = |idx: usize| {
+        groups
+            .iter()
+            .position(|(_, cells)| cells.contains(&idx))
+            .unwrap()
+    };
+    for (idx, (condition, _)) in solution.cells.iter().enumerate() {
+        writeln!(
+            out,
+            "cell {idx} (group {}): {}",
+            group_of(idx),
+            condition.display(provider)
+        )
+        .unwrap();
+    }
+
+    eprintln!(
+        "cells dump: {} cells, {} distinct solvable sets, simplified partition \
+         size {} -> {}",
+        solution.cells.len(),
+        groups.len(),
+        total_simplified,
+        path.display()
+    );
 }
 
 /// Truncates an error message to keep the CSV readable.
@@ -456,6 +676,9 @@ fn main() {
                         record.records = Some(distinct.len());
                         record.cells = Some(solution.cells.len());
                         record.env_literals = Some(literals.len());
+                        if let Some(path) = &opts.cells_dump {
+                            dump_cell_stats(path, i, &solution, solver.provider(), &snapshot);
+                        }
                         if opts.project {
                             let projected = solution.project(|literal| {
                                 let package = snapshot.packages.get(literal.package).unwrap();

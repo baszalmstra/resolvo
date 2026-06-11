@@ -168,6 +168,55 @@ enum EnumerationOutcome<Id, N> {
 /// tail.
 const TRAIL_RESHAPE_ORDINARY_LEVELS: u32 = 8;
 
+/// The number of cell literals each pinning rule contributed to one recorded
+/// cell of a universal enumeration (a diagnostics observation point, see
+/// [`Solver::universal_cell_pins`]).
+///
+/// Every literal of a recorded cell is attributed to exactly one rule: the
+/// rule that first pushed it during cell extraction or disjointness repair.
+/// The split separates honest load-bearing extraction (the first five
+/// fields) from the disjointness-repair appends, which is the load-bearing
+/// distinction when investigating condition fragmentation: repair literals
+/// do not create cells, they only specialize the conditions of solutions
+/// that generalization would otherwise overlap with earlier cells.
+#[derive(Default, Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub struct CellPinCounts {
+    /// Environment literals installed as requirement candidates (a
+    /// requirement on an environment package satisfied by the literal).
+    pub req_env: u32,
+    /// Guards of an active conditional requirement with an installed target
+    /// (recorded positively).
+    pub guard: u32,
+    /// True environment literals skipped by the support scan (pinned
+    /// positively).
+    pub support_skip: u32,
+    /// Condition complement literals carrying a clause's support (recorded
+    /// negatively).
+    pub support_neg: u32,
+    /// `EnvConstrains` absent/matches pins.
+    pub constrains: u32,
+    /// Agreement pins added by the disjointness repair scan.
+    pub repair_agreement: u32,
+    /// Distinguishing literals appended by the disjointness repair.
+    pub repair_distinguishing: u32,
+}
+
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+impl CellPinCounts {
+    /// The total number of literals attributed across all rules; equals the
+    /// recorded cell's literal count.
+    pub fn total(&self) -> u32 {
+        self.req_env
+            + self.guard
+            + self.support_skip
+            + self.support_neg
+            + self.constrains
+            + self.repair_agreement
+            + self.repair_distinguishing
+    }
+}
+
 /// Returns true when the variable represents an environment literal (either
 /// a matches or an absent literal).
 fn is_env_variable<D: DependencyProvider>(state: &SolverState<D>, variable: VariableId) -> bool {
@@ -793,8 +842,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // solution actually depends on, so a stale over-specific
                     // seed heals (the repair step still re-specializes where
                     // needed to keep cells disjoint).
-                    let mut cell = self.extract_cell();
-                    self.repair_disjointness(&mut cell, &cell_assignments);
+                    let (mut cell, mut pins) = self.extract_cell();
+                    self.repair_disjointness(&mut cell, &cell_assignments, &mut pins);
+                    #[cfg(feature = "diagnostics")]
+                    self.state.propagation_counters.cell_pins.push(pins);
 
                     let condition = self.cell_to_condition(&cell);
                     let solvables = self.chosen_solvables_canonical();
@@ -995,6 +1046,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     #[cfg(feature = "diagnostics")]
     pub fn universal_cell_retracts(&self) -> &[(u32, u32)] {
         &self.state.propagation_counters.cell_retracts
+    }
+
+    /// Returns, for each cell recorded by the last [`Self::solve_universal`]
+    /// call, the number of cell literals each pinning rule contributed (see
+    /// [`CellPinCounts`]). The entries are parallel to the solution's cells;
+    /// each entry's [`CellPinCounts::total`] equals the cell's condition
+    /// length.
+    ///
+    /// This is a diagnostics-only observation point: it attributes condition
+    /// fragmentation to load-bearing extraction versus disjointness-repair
+    /// appends when investigating high-cell-count outliers.
+    #[cfg(feature = "diagnostics")]
+    pub fn universal_cell_pins(&self) -> &[CellPinCounts] {
+        &self.state.propagation_counters.cell_pins
     }
 
     /// Performs a scoped re-solve to produce a conflict that is tightly
@@ -1348,22 +1413,34 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// tautologies over the modeled environment space and the latter are
     /// handled by the disjointness repair. Learnt clauses are implied by the
     /// other clauses and never contribute either.
-    fn extract_cell(&self) -> Vec<(VariableId, bool)> {
+    ///
+    /// Also returns, per pinning rule, how many literals the rule
+    /// contributed (a [`CellPinCounts`]; the disjointness repair adds its
+    /// own counts afterwards).
+    fn extract_cell(&self) -> (Vec<(VariableId, bool)>, CellPinCounts) {
         let state = &self.state;
         let decision_map = state.decision_tracker.map();
         let mut cell: Vec<(VariableId, bool)> = Vec::new();
+        let mut pins = CellPinCounts::default();
 
-        let record =
-            |cell: &mut Vec<(VariableId, bool)>, variable: VariableId, value: bool| match cell
-                .iter()
-                .find(|&&(v, _)| v == variable)
-            {
-                Some(&(_, existing)) => debug_assert_eq!(
-                    existing, value,
-                    "bug: a cell literal was recorded with both signs"
-                ),
-                None => cell.push((variable, value)),
-            };
+        let record = |cell: &mut Vec<(VariableId, bool)>,
+                      variable: VariableId,
+                      value: bool|
+         -> bool {
+            match cell.iter().find(|&&(v, _)| v == variable) {
+                Some(&(_, existing)) => {
+                    debug_assert_eq!(
+                        existing, value,
+                        "bug: a cell literal was recorded with both signs"
+                    );
+                    false
+                }
+                None => {
+                    cell.push((variable, value));
+                    true
+                }
+            }
+        };
 
         for &clause_id in &state.env_support_clauses {
             match state.clauses.kinds[clause_id.to_index()] {
@@ -1388,8 +1465,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             if matches!(
                                 state.variable_map.origin(candidate),
                                 VariableOrigin::EnvMatches(_)
-                            ) {
-                                record(&mut cell, candidate, true);
+                            ) && record(&mut cell, candidate, true)
+                            {
+                                pins.req_env += 1;
                             }
                             satisfied = true;
                             break;
@@ -1413,10 +1491,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             });
                             if condition_holds {
                                 for literal in literals {
-                                    if is_env_variable(state, literal.variable()) {
+                                    if is_env_variable(state, literal.variable())
+                                        && record(&mut cell, literal.variable(), true)
+                                    {
                                         // The complement literal is false, so
                                         // the guard variable is assigned true.
-                                        record(&mut cell, literal.variable(), true);
+                                        pins.guard += 1;
                                     }
                                 }
                             }
@@ -1474,7 +1554,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             return false;
                         }
                         if state.decision_tracker.assigned_value(literal.variable()) == Some(true) {
-                            record(&mut cell, literal.variable(), true);
+                            if record(&mut cell, literal.variable(), true) {
+                                pins.support_skip += 1;
+                            }
                             return false;
                         }
                         true
@@ -1491,7 +1573,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         literal.negate(),
                         "bug: condition complements of env literals are negative literals"
                     );
-                    record(&mut cell, literal.variable(), false);
+                    if record(&mut cell, literal.variable(), false) {
+                        pins.support_neg += 1;
+                    }
                 }
                 Clause::EnvConstrains(env_constrains_id) => {
                     let payload = state.env_constrains[env_constrains_id];
@@ -1509,13 +1593,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                          are both true"
                     );
                     if absent_true {
-                        record(
+                        if record(
                             &mut cell,
                             payload.absent_var.expect("checked by absent_true"),
                             true,
-                        );
+                        ) {
+                            pins.constrains += 1;
+                        }
                     } else if matches_true {
-                        record(&mut cell, payload.matches_var, true);
+                        if record(&mut cell, payload.matches_var, true) {
+                            pins.constrains += 1;
+                        }
                     } else {
                         debug_assert!(
                             false,
@@ -1531,7 +1619,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
 
         cell.sort_by_key(|&(variable, _)| variable.to_index());
-        cell
+        (cell, pins)
     }
 
     /// Counts the decision levels above `target` whose level-starting
@@ -1600,10 +1688,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// the two cells complementary on it. The repair runs unconditionally,
     /// even when the solvable sets are identical, to keep the documented
     /// pairwise-disjoint invariant.
+    ///
+    /// `pins` is the literal-attribution record started by
+    /// [`Self::extract_cell`]; the repair adds its agreement pins and
+    /// distinguishing appends to it.
     fn repair_disjointness(
         &self,
         cell: &mut Vec<(VariableId, bool)>,
         earlier_cells: &[Vec<(VariableId, bool)>],
+        pins: &mut CellPinCounts,
     ) {
         for earlier in earlier_cells {
             if self.provably_disjoint(cell, earlier) {
@@ -1627,6 +1720,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 // the cell, so this is always sound.
                 if !cell.iter().any(|&(v, _)| v == variable) {
                     cell.push((variable, current));
+                    pins.repair_agreement += 1;
                 }
             }
             let (variable, value) = distinguishing.expect(
@@ -1636,6 +1730,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // The current assignment's value for the variable is the opposite
             // of the earlier cell's sign.
             cell.push((variable, !value));
+            pins.repair_distinguishing += 1;
             cell.sort_by_key(|&(v, _)| v.to_index());
 
             debug_assert!(self.provably_disjoint(cell, earlier));
