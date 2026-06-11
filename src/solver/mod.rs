@@ -1,6 +1,7 @@
 use std::{any::Any, fmt::Display, ops::ControlFlow};
 
 use ahash::{HashMap, HashSet};
+use assertion_watermark::{AssertionWatermark, GROUP_ENV, GROUP_LEARNT, GROUP_NEGATIVE};
 pub use cache::SolverCache;
 use clause::{Clause, EnvClause, EnvClauseKind, EnvConstrainsClause, Literal, WatchedLiterals};
 use conditions::{Disjunction, DisjunctionId};
@@ -30,6 +31,7 @@ use crate::{
     utils::{IndexedSet, Mapping},
 };
 
+mod assertion_watermark;
 mod binary_encoding;
 mod cache;
 pub(crate) mod clause;
@@ -429,6 +431,12 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// the encoder, and with the assignment trail by lazy sync.
     decide_queue: DecideQueue<D::NameId>,
 
+    /// Incremental tracking for the per-propagate assertion scans over
+    /// [`Self::negative_assertions`], [`Self::learnt_clause_ids`] and
+    /// [`Self::env_clause_ids`]: only entries appended since the last
+    /// propagation round or invalidated by backtracking are visited.
+    assertion_watermark: AssertionWatermark,
+
     #[cfg(feature = "diagnostics")]
     propagation_counters: PropagationCounters,
 }
@@ -469,6 +477,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             name_activity: Default::default(),
             max_activity: 0.0,
             decide_queue: Default::default(),
+            assertion_watermark: Default::default(),
             #[cfg(feature = "diagnostics")]
             propagation_counters: Default::default(),
         }
@@ -2190,6 +2199,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             return Err(PropagationError::Cancelled(value));
         };
 
+        // Catch the assertion watermark up with any backtracking that
+        // happened since the previous propagation round: assertions whose
+        // verifying assignment was popped become pending again. Together
+        // with the per-list cursors over the (append-only) assertion lists
+        // this makes the scans below visit only the entries on which the
+        // historical full rescan would not have been a no-op.
+        let assert_floor = self.state.decision_tracker.take_assert_floor();
+        self.state.assertion_watermark.sync(assert_floor);
+
         // Add decisions from assertions and learned clauses. If any of these cause a
         // conflict, we will return an error.
         self.decide_assertions(level)?;
@@ -2413,112 +2431,213 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Add decisions for negative assertions derived from other rules
     /// (assertions are clauses that consist of a single literal, and
     /// therefore do not have watches).
+    ///
+    /// Only entries flagged by the assertion watermark are visited:
+    /// assertions invalidated by backtracking (in index order, which is
+    /// the historical scan order: pending indices always sit below the
+    /// cursor) followed by assertions appended since the previous scan.
+    /// Every skipped entry still holds its asserted value, so the
+    /// historical full rescan would have no-opped on it.
     fn decide_assertions(&mut self, level: u32) -> Result<(), PropagationError> {
-        for &(solvable_id, clause_id) in &self.state.negative_assertions {
-            let value = false;
-            let decided = self
-                .state
-                .decision_tracker
-                .try_add_decision(Decision::new(solvable_id, value, clause_id), level)
-                .map_err(|_| PropagationError::Conflict(solvable_id, value, clause_id))?;
-
-            if decided {
-                tracing::trace!(
-                    "Negative assertions derived from other rules: Propagate assertion {} = {}",
-                    solvable_id.display(&self.state.variable_map, self.provider()),
-                    value
-                );
-            }
+        while let Some(index) = self.state.assertion_watermark.first_pending(GROUP_NEGATIVE) {
+            // A conflict (`?`) leaves the entry pending for the rescan
+            // after the conflict is handled, like every entry after it.
+            let position = self.apply_negative_assertion(index, level)?;
+            self.state
+                .assertion_watermark
+                .verify_pending(GROUP_NEGATIVE, index, position);
+        }
+        while let Some(index) = self
+            .state
+            .assertion_watermark
+            .next_unscanned(GROUP_NEGATIVE, self.state.negative_assertions.len())
+        {
+            let position = self.apply_negative_assertion(index, level)?;
+            self.state
+                .assertion_watermark
+                .verify_unscanned(GROUP_NEGATIVE, Some(position));
         }
         Ok(())
     }
 
-    /// Add decisions derived from learnt clauses.
+    /// Apply the negative assertion at `index`, exactly as the historical
+    /// full scan did per entry. Returns the trail position at (or above)
+    /// the assignment that satisfies the assertion.
+    fn apply_negative_assertion(
+        &mut self,
+        index: usize,
+        level: u32,
+    ) -> Result<usize, PropagationError> {
+        let (solvable_id, clause_id) = self.state.negative_assertions[index];
+        let value = false;
+        let decided = self
+            .state
+            .decision_tracker
+            .try_add_decision(Decision::new(solvable_id, value, clause_id), level)
+            .map_err(|_| PropagationError::Conflict(solvable_id, value, clause_id))?;
+
+        if decided {
+            tracing::trace!(
+                "Negative assertions derived from other rules: Propagate assertion {} = {}",
+                solvable_id.display(&self.state.variable_map, self.provider()),
+                value
+            );
+        }
+        // The variable is assigned (a fresh decision sits on top of the
+        // stack; an existing assignment sits at or below the top), so the
+        // stack is non-empty and `len - 1` bounds the assignment position.
+        Ok(self.state.decision_tracker.stack_len() - 1)
+    }
+
+    /// Add decisions derived from single-literal learnt clauses. Visits
+    /// only the entries flagged by the assertion watermark (see
+    /// [`Self::decide_assertions`]); multi-literal learnt clauses are
+    /// inspected once and never again (their literal lists are immutable
+    /// and watches handle them).
     fn decide_learned(&mut self, level: u32) -> Result<(), PropagationError> {
-        // Assertions derived from learnt rules
-        for learn_clause_idx in 0..self.state.learnt_clause_ids.len() {
-            let clause_id = self.state.learnt_clause_ids[learn_clause_idx];
-            let clause = self.state.clauses.kinds[clause_id.to_index()];
-            let Clause::Learnt(learnt_index) = clause else {
-                unreachable!();
-            };
-
-            let literals = &self.state.learnt_clauses[learnt_index];
-            if literals.len() > 1 {
-                continue;
-            }
-
-            debug_assert!(!literals.is_empty());
-
-            let literal = literals[0];
-            let decision = literal.satisfying_value();
-
-            let decided = self
-                .state
-                .decision_tracker
-                .try_add_decision(
-                    Decision::new(literal.variable(), decision, clause_id),
-                    level,
-                )
-                .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
-
-            if decided {
-                tracing::trace!(
-                    "├─ Propagate assertion {} = {}",
-                    literal
-                        .variable()
-                        .display(&self.state.variable_map, self.provider()),
-                    decision
-                );
-            }
+        while let Some(index) = self.state.assertion_watermark.first_pending(GROUP_LEARNT) {
+            let position = self
+                .apply_learnt_assertion(index, level)?
+                .expect("a multi-literal learnt clause is never pending");
+            self.state
+                .assertion_watermark
+                .verify_pending(GROUP_LEARNT, index, position);
+        }
+        while let Some(index) = self
+            .state
+            .assertion_watermark
+            .next_unscanned(GROUP_LEARNT, self.state.learnt_clause_ids.len())
+        {
+            let position = self.apply_learnt_assertion(index, level)?;
+            self.state
+                .assertion_watermark
+                .verify_unscanned(GROUP_LEARNT, position);
         }
 
         Ok(())
+    }
+
+    /// Apply the single-literal learnt clause at `index` of
+    /// `learnt_clause_ids`, exactly as the historical full scan did per
+    /// entry. Returns the trail position at (or above) the satisfying
+    /// assignment, or `None` for a multi-literal clause.
+    fn apply_learnt_assertion(
+        &mut self,
+        index: usize,
+        level: u32,
+    ) -> Result<Option<usize>, PropagationError> {
+        let clause_id = self.state.learnt_clause_ids[index];
+        let clause = self.state.clauses.kinds[clause_id.to_index()];
+        let Clause::Learnt(learnt_index) = clause else {
+            unreachable!();
+        };
+
+        let literals = &self.state.learnt_clauses[learnt_index];
+        if literals.len() > 1 {
+            return Ok(None);
+        }
+
+        debug_assert!(!literals.is_empty());
+
+        let literal = literals[0];
+        let decision = literal.satisfying_value();
+
+        let decided = self
+            .state
+            .decision_tracker
+            .try_add_decision(
+                Decision::new(literal.variable(), decision, clause_id),
+                level,
+            )
+            .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
+
+        if decided {
+            tracing::trace!(
+                "├─ Propagate assertion {} = {}",
+                literal
+                    .variable()
+                    .display(&self.state.variable_map, self.provider()),
+                decision
+            );
+        }
+
+        Ok(Some(self.state.decision_tracker.stack_len() - 1))
     }
 
     /// Add decisions derived from single-literal environment model/blocking
     /// clauses. Such clauses have no watches (like single-literal learnt
-    /// clauses) so their assertions must be (re-)applied on every propagation
-    /// round.
+    /// clauses) so their assertions must hold on every propagation round.
+    /// Visits only the entries flagged by the assertion watermark (see
+    /// [`Self::decide_assertions`]). A re-applied assertion records the
+    /// current level, exactly as the historical full rescan did.
     fn decide_env_assertions(&mut self, level: u32) -> Result<(), PropagationError> {
-        for idx in 0..self.state.env_clause_ids.len() {
-            let clause_id = self.state.env_clause_ids[idx];
-            let clause = self.state.clauses.kinds[clause_id.to_index()];
-            let Clause::EnvClause(env_clause_id) = clause else {
-                unreachable!();
-            };
-
-            let literals = &self.state.env_clauses[env_clause_id].literals;
-            if literals.len() > 1 {
-                continue;
-            }
-
-            debug_assert!(!literals.is_empty());
-
-            let literal = literals[0];
-            let decision = literal.satisfying_value();
-
-            let decided = self
-                .state
-                .decision_tracker
-                .try_add_decision(
-                    Decision::new(literal.variable(), decision, clause_id),
-                    level,
-                )
-                .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
-
-            if decided {
-                tracing::trace!(
-                    "├─ Propagate env assertion {} = {}",
-                    literal
-                        .variable()
-                        .display(&self.state.variable_map, self.provider()),
-                    decision
-                );
-            }
+        while let Some(index) = self.state.assertion_watermark.first_pending(GROUP_ENV) {
+            let position = self
+                .apply_env_assertion(index, level)?
+                .expect("a multi-literal env clause is never pending");
+            self.state
+                .assertion_watermark
+                .verify_pending(GROUP_ENV, index, position);
+        }
+        while let Some(index) = self
+            .state
+            .assertion_watermark
+            .next_unscanned(GROUP_ENV, self.state.env_clause_ids.len())
+        {
+            let position = self.apply_env_assertion(index, level)?;
+            self.state
+                .assertion_watermark
+                .verify_unscanned(GROUP_ENV, position);
         }
 
         Ok(())
+    }
+
+    /// Apply the single-literal environment clause at `index` of
+    /// `env_clause_ids`, exactly as the historical full scan did per
+    /// entry. Returns the trail position at (or above) the satisfying
+    /// assignment, or `None` for a multi-literal clause.
+    fn apply_env_assertion(
+        &mut self,
+        index: usize,
+        level: u32,
+    ) -> Result<Option<usize>, PropagationError> {
+        let clause_id = self.state.env_clause_ids[index];
+        let clause = self.state.clauses.kinds[clause_id.to_index()];
+        let Clause::EnvClause(env_clause_id) = clause else {
+            unreachable!();
+        };
+
+        let literals = &self.state.env_clauses[env_clause_id].literals;
+        if literals.len() > 1 {
+            return Ok(None);
+        }
+
+        debug_assert!(!literals.is_empty());
+
+        let literal = literals[0];
+        let decision = literal.satisfying_value();
+
+        let decided = self
+            .state
+            .decision_tracker
+            .try_add_decision(
+                Decision::new(literal.variable(), decision, clause_id),
+                level,
+            )
+            .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
+
+        if decided {
+            tracing::trace!(
+                "├─ Propagate env assertion {} = {}",
+                literal
+                    .variable()
+                    .display(&self.state.variable_map, self.provider()),
+                decision
+            );
+        }
+
+        Ok(Some(self.state.decision_tracker.stack_len() - 1))
     }
 
     /// Adds the clause with `clause_id` to the current [`Conflict`]
