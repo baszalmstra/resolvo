@@ -415,6 +415,25 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// not paying for itself.
     prefix_cumulative_budget: u64,
 
+    /// Conflicts learnt since the last restart (or since entry) of the
+    /// current `run_sat` call. Compared against [`Self::restart_limit`].
+    conflicts_since_restart: u64,
+
+    /// The number of restarts performed by the current `run_sat` call;
+    /// indexes the Luby sequence that paces [`Self::restart_limit`].
+    restarts_performed: u64,
+
+    /// The conflict count at which the next restart fires (see
+    /// [`Solver::maybe_restart`]).
+    restart_limit: u64,
+
+    /// The `starting_level` of the current `run_sat` call. A restart
+    /// backtracks to `restart_floor + 1` (the root install level of the
+    /// run): everything at or below the floor is preserved prior state
+    /// (assumption decisions of a seeded cell, the previous solution under
+    /// a soft requirement) that a restart must never undo.
+    restart_floor: u32,
+
     /// Activity score per package.
     name_activity: <D::NameId as SolverId>::Map<f32>,
 
@@ -466,6 +485,10 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             fresh_solve_cost: 0,
             prefix_spent: 0,
             prefix_cumulative_budget: 0,
+            conflicts_since_restart: 0,
+            restarts_performed: 0,
+            restart_limit: u64::MAX,
+            restart_floor: 0,
             name_activity: Default::default(),
             max_activity: 0.0,
             decide_queue: Default::default(),
@@ -492,6 +515,32 @@ const PREFIX_BUDGET_FLOOR: u64 = 10_000;
 /// intercepts it before it can escape to the caller.
 pub(crate) struct PrefixBudgetExhausted;
 
+/// Base interval, in learnt conflicts, of the Luby restart sequence: the
+/// n-th restart of a `run_sat` call fires after `luby(n) *
+/// RESTART_BASE_INTERVAL` conflicts. Classic CDCL restarts keep all learnt
+/// clauses and activity scores but abandon the current partial assignment,
+/// so a search that walked into a hopeless subtree under stale heuristics
+/// re-descends under the post-conflict ones.
+const RESTART_BASE_INTERVAL: u64 = 128;
+
+/// The Luby sequence (1, 1, 2, 1, 1, 2, 4, 1, ...) for `x >= 0`, the
+/// textbook universally-optimal restart pacing: frequent short intervals
+/// with geometrically rarer long ones, so neither short- nor long-tailed
+/// conflict distributions degenerate.
+fn luby(mut x: u64) -> u64 {
+    let (mut size, mut seq) = (1u64, 0u32);
+    while size < x + 1 {
+        seq += 1;
+        size = 2 * size + 1;
+    }
+    while size - 1 != x {
+        size = (size - 1) >> 1;
+        seq -= 1;
+        x %= size;
+    }
+    1u64 << seq
+}
+
 /// Counters that track propagation loop behavior for performance analysis.
 #[cfg(feature = "diagnostics")]
 #[derive(Default)]
@@ -511,6 +560,8 @@ pub(crate) struct PropagationCounters {
     pub unwatched_calls_by_type: PropagationVisitsByType,
     pub propagate_calls: u64,
     pub conflicts: u64,
+    /// Times the Luby restart policy fired (see [`Solver::maybe_restart`]).
+    pub restarts: u64,
     /// For each recorded cell of a universal solve, the number of decisions
     /// propagated while solving that cell (the delta of
     /// [`Self::decisions_propagated`] between cell recordings). Empty for a
@@ -821,6 +872,16 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         );
         let mut new_solvables: Vec<(VariableId, ClauseId)> = Vec::new();
         let mut solvable_ids: Vec<SolvableIdOrRoot<D::SolvableId>> = Vec::new();
+
+        // Arm the restart policy for this run: the floor pins everything the
+        // caller wants preserved (see [`SolverState::restart_floor`]), and
+        // the Luby sequence restarts from its first interval. Each `run_sat`
+        // call is its own search episode; cross-cell knowledge transfers
+        // through the learnt clauses and activity scores, not the pacing.
+        self.state.restart_floor = starting_level;
+        self.state.conflicts_since_restart = 0;
+        self.state.restarts_performed = 0;
+        self.state.restart_limit = RESTART_BASE_INTERVAL * luby(0);
 
         // Arm the kept-prefix work budget (see the field docs). Only a free
         // universal solve enters with restartable decisions above the
@@ -2035,6 +2096,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         attempted_value,
                         conflicting_clause,
                     )?;
+                    level = self.maybe_restart(level);
                 }
             }
         }
@@ -2139,6 +2201,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
         let (new_level, learned_clause_id, literal) =
             self.analyze(level, conflicting_solvable, conflicting_clause);
+        self.state.conflicts_since_restart += 1;
         let old_level = level;
         level = new_level;
 
@@ -2167,6 +2230,49 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
 
         Ok(level)
+    }
+
+    /// Fires a classic CDCL restart when the current `run_sat` call has
+    /// accumulated enough conflicts since the previous one (Luby pacing,
+    /// see [`RESTART_BASE_INTERVAL`]).
+    ///
+    /// A restart undoes every decision above the restart floor's root
+    /// install level while keeping all learnt clauses and activity scores:
+    /// the search re-descends guided by what the conflicts taught it
+    /// instead of staying committed to early decisions that predate that
+    /// knowledge. Everything at or below the floor (assumption decisions
+    /// of a seeded universal cell, a preserved prior solution) survives by
+    /// construction; a kept trail prefix of the universal free phase sits
+    /// above the floor and is restartable scratch state, so discarding it
+    /// is sound. Backtracking is the only effect, which the incremental
+    /// decide queue already handles through its sync floor; assertions of
+    /// single-literal learnt clauses are re-applied by `decide_learned` on
+    /// the next propagation round.
+    fn maybe_restart(&mut self, level: u32) -> u32 {
+        if self.state.conflicts_since_restart < self.state.restart_limit {
+            return level;
+        }
+
+        self.state.conflicts_since_restart = 0;
+        self.state.restarts_performed += 1;
+        self.state.restart_limit = RESTART_BASE_INTERVAL * luby(self.state.restarts_performed);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state.propagation_counters.restarts += 1;
+        }
+
+        let root_level = self.state.restart_floor + 1;
+        if level <= root_level {
+            // Already at (or below) the restart target: only reschedule.
+            return level;
+        }
+
+        tracing::debug!(
+            "├─ Restart {}: backtracking from level {level} to {root_level}",
+            self.state.restarts_performed
+        );
+        self.state.decision_tracker.undo_until(root_level);
+        root_level
     }
 
     /// The propagate step of the CDCL algorithm
@@ -2812,6 +2918,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // identical value, so the tracked maximum stays bit-exact with the
         // largest stored activity.
         self.state.max_activity *= self.activity_decay;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::luby;
+
+    #[test]
+    fn luby_produces_the_textbook_sequence() {
+        let observed: Vec<u64> = (0..15).map(luby).collect();
+        assert_eq!(observed, vec![1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8]);
     }
 }
 
