@@ -1617,33 +1617,65 @@ fn find_witness_indexed(
             .all(|&(index, _)| index < variable_count),
         "every clause literal must reference a variable below `variable_count`"
     );
-    let mut assignment: Vec<Option<bool>> = vec![None; variable_count];
-    if search_indexed(clauses, &mut assignment) {
-        Some(
-            assignment
-                .into_iter()
-                .map(|value| value.expect("the search assigns every variable"))
-                .collect(),
-        )
-    } else {
-        None
+
+    // First decide satisfiability with a most-constrained-first decision
+    // order (most clause occurrences first, index as tie break). The
+    // refutation case is the common one (every successful universal solve
+    // ends with exactly one refuted witness search proving coverage), its
+    // result is order independent, and deciding frequently-occurring
+    // variables first prunes the hundreds of accumulated blocking clauses
+    // orders of magnitude faster than ascending index order.
+    let mut occurrences = vec![0usize; variable_count];
+    for &(index, _) in clauses.iter().flatten() {
+        occurrences[index] += 1;
     }
+    let mut order: Vec<usize> = (0..variable_count).collect();
+    order.sort_by_key(|&index| (std::cmp::Reverse(occurrences[index]), index));
+
+    let mut assignment: Vec<Option<bool>> = vec![None; variable_count];
+    if !search_indexed(clauses, &mut assignment, &order) {
+        return None;
+    }
+
+    // A witness exists. Re-run in ascending index order to return the
+    // canonical lexicographically smallest witness (false first), keeping
+    // the reported cell of an unsolvable region deterministic and as close
+    // to the baseline machine as before. Witness-producing searches happen
+    // on failure paths where few blocking clauses have accumulated, so the
+    // cost of the second search is negligible.
+    let identity: Vec<usize> = (0..variable_count).collect();
+    let mut assignment: Vec<Option<bool>> = vec![None; variable_count];
+    let found = search_indexed(clauses, &mut assignment, &identity);
+    debug_assert!(found, "a satisfiable formula stays satisfiable");
+    if !found {
+        return None;
+    }
+    Some(
+        assignment
+            .into_iter()
+            .map(|value| value.expect("the search assigns every variable"))
+            .collect(),
+    )
 }
 
 /// Recursive helper of [`find_witness_indexed`]: tries to extend the partial
 /// `assignment` to a satisfying total assignment. Returns true when one was
 /// found (left in `assignment`).
 ///
-/// The search interleaves decisions (ascending variable index, `false`
-/// first) with unit propagation. Propagation only assigns values entailed by
-/// the current partial assignment, so the first satisfying assignment found
-/// is still the lexicographically smallest one, exactly as the previous
-/// propagation-free exhaustive search returned: the witness semantics are
-/// unchanged. Propagation is what keeps the coverage check tractable when
-/// hundreds of blocking clauses have accumulated (a high-cell-count solve
-/// used to spend minutes here, orders of magnitude longer than the
-/// enumeration itself).
-fn search_indexed(clauses: &[Vec<IndexedLiteral>], assignment: &mut [Option<bool>]) -> bool {
+/// The search interleaves decisions (`false` first, variables in the given
+/// decision `order`) with unit propagation. Propagation only assigns values
+/// entailed by the current partial assignment, so with the identity order
+/// the first satisfying assignment found is the lexicographically smallest
+/// one, exactly as the original propagation-free exhaustive search
+/// returned. Propagation and the caller-chosen decision order are what keep
+/// the coverage check tractable when hundreds of blocking clauses have
+/// accumulated (a high-cell-count solve used to spend minutes here, orders
+/// of magnitude longer than the enumeration itself).
+fn search_indexed(
+    clauses: &[Vec<IndexedLiteral>],
+    assignment: &mut [Option<bool>],
+    order: &[usize],
+) -> bool {
     // Propagate the consequences of the current assignment, recording what
     // was assigned so it can be undone on backtrack.
     let mut propagated: Vec<usize> = Vec::new();
@@ -1654,13 +1686,13 @@ fn search_indexed(clauses: &[Vec<IndexedLiteral>], assignment: &mut [Option<bool
         return false;
     }
 
-    let Some(unassigned) = assignment.iter().position(Option::is_none) else {
+    let Some(&unassigned) = order.iter().find(|&&index| assignment[index].is_none()) else {
         return true;
     };
 
     for value in [false, true] {
         assignment[unassigned] = Some(value);
-        if search_indexed(clauses, assignment) {
+        if search_indexed(clauses, assignment, order) {
             return true;
         }
     }
