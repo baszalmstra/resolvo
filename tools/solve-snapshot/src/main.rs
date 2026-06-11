@@ -647,6 +647,31 @@ fn main() {
                     .requirements(requirements)
                     .environment_model(model.clone());
                 let mut solver = Solver::new(provider);
+                // Sweep override for the refutation switch (see
+                // docs/design/universal-refutation-ordering.md); the
+                // compiled-in default applies when the variable is unset.
+                #[cfg(feature = "diagnostics")]
+                if let Ok(limit) = std::env::var("RESOLVO_ENV_ORDERING_CONFLICT_LIMIT") {
+                    solver.set_env_ordering_conflict_limit(
+                        limit
+                            .parse()
+                            .expect("RESOLVO_ENV_ORDERING_CONFLICT_LIMIT must be an integer"),
+                    );
+                }
+                #[cfg(feature = "diagnostics")]
+                if let (Ok(factor), Ok(floor)) = (
+                    std::env::var("RESOLVO_ENV_ORDERING_WORK_FACTOR"),
+                    std::env::var("RESOLVO_ENV_ORDERING_WORK_FLOOR"),
+                ) {
+                    solver.set_env_ordering_work_budget(
+                        factor
+                            .parse()
+                            .expect("RESOLVO_ENV_ORDERING_WORK_FACTOR must be an integer"),
+                        floor
+                            .parse()
+                            .expect("RESOLVO_ENV_ORDERING_WORK_FLOOR must be an integer"),
+                    );
+                }
                 let result = solver.solve_universal(problem);
                 record.duration = start.elapsed().as_secs_f64();
                 match result {
@@ -737,6 +762,31 @@ fn main() {
                             .red()
                         );
                         record.outcome = "timeout";
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    eprintln!(
+                        "    counters: {} conflicts, {} propagated, {} luby restarts, \
+                         {} ordering suspensions, {} ordering restarts, {} budget aborts",
+                        solver.conflict_count(),
+                        solver.decisions_propagated(),
+                        solver.restart_count(),
+                        solver.env_ordering_suspensions(),
+                        solver.env_ordering_restarts(),
+                        solver.prefix_budget_aborts(),
+                    );
+                    let mut cell_decisions = solver.universal_cell_decisions().to_vec();
+                    if !cell_decisions.is_empty() {
+                        cell_decisions.sort_unstable();
+                        let total: u64 = cell_decisions.iter().sum();
+                        eprintln!(
+                            "    cells recorded: {} (decisions total {}, median {}, max {})",
+                            cell_decisions.len(),
+                            total,
+                            cell_decisions[cell_decisions.len() / 2],
+                            cell_decisions.last().unwrap(),
+                        );
                     }
                 }
             }

@@ -3155,6 +3155,123 @@ fn test_universal_env_literals_decided_last() {
         "{deep_transitions} transitions retracted far below the trail depth; environment \
          literals keep landing mid-trail (all retracts: {retracts:?})"
     );
+
+    // A mechanical enumeration needs only a handful of conflicts per cell,
+    // so the refutation switch must never trip and take the ordering (and
+    // with it the cheap transitions above) away.
+    assert_eq!(
+        solver.env_ordering_suspensions(),
+        0,
+        "the refutation switch tripped on a conflict-light mechanical enumeration"
+    );
+}
+
+/// The refutation switch: a `run_sat` call that crosses the per-run
+/// conflict limit suspends the env-literals-last ordering for the rest of
+/// that run (refutations want env conflicts early, the deferral postpones
+/// them; see docs/design/universal-refutation-ordering.md).
+///
+/// The universe couples an env-dependent package `v` (so environment
+/// literals exist and the ordering is active) with an env-independent
+/// unsatisfiable core: every version of `a` needs a different exclusive
+/// version of `m` than every version of `b`, so refuting the formula takes
+/// one real conflict per candidate pairing. With the limit lowered to 2 the
+/// free-phase run must trip the switch, and the verdict must still be the
+/// correct unsolvable-region failure.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_refutation_switch_trips_and_keeps_verdict() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("v", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("v", Pack::new(1), &[], &[]);
+    for i in 1..=4u32 {
+        let a_dep = format!("m {i}..{}", i + 1);
+        let b_dep = format!("m {}..{}", i + 4, i + 5);
+        provider.add_package("a", Pack::new(i), &[a_dep.as_str()], &[]);
+        provider.add_package("b", Pack::new(i), &[b_dep.as_str()], &[]);
+        provider.add_package("m", Pack::new(i), &[], &[]);
+        provider.add_package("m", Pack::new(i + 4), &[], &[]);
+    }
+
+    let requirements = provider.requirements(&["v", "a", "b"]);
+    let environment_model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 11..100"),
+    ]];
+
+    let mut solver = Solver::new(provider);
+    solver.set_env_ordering_conflict_limit(2);
+    let result = solver.solve_universal(
+        UniversalProblem::new()
+            .requirements(requirements)
+            .environment_model(environment_model),
+    );
+
+    assert!(
+        matches!(result, Err(UniversalFailure::Unsolvable { .. })),
+        "the a/b/m core is unsolvable in every region"
+    );
+    assert!(
+        solver.env_ordering_suspensions() >= 1,
+        "a conflict-heavy refutation run must trip the refutation switch \
+         (got {} suspensions)",
+        solver.env_ordering_suspensions()
+    );
+}
+
+/// Stage 2 of the refutation switch: with the conflict limit out of reach,
+/// a run that keeps propagating after its first conflict must cross the
+/// work deadline and escalate to a restart with an activity reset, and the
+/// verdict must still be the correct unsolvable-region failure. Uses the
+/// same universe as the stage-1 test with a one-propagation work budget so
+/// the deadline trips immediately after the first conflict.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_refutation_switch_work_deadline_restarts() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("v", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("v", Pack::new(1), &[], &[]);
+    for i in 1..=4u32 {
+        let a_dep = format!("m {i}..{}", i + 1);
+        let b_dep = format!("m {}..{}", i + 4, i + 5);
+        provider.add_package("a", Pack::new(i), &[a_dep.as_str()], &[]);
+        provider.add_package("b", Pack::new(i), &[b_dep.as_str()], &[]);
+        provider.add_package("m", Pack::new(i), &[], &[]);
+        provider.add_package("m", Pack::new(i + 4), &[], &[]);
+    }
+
+    let requirements = provider.requirements(&["v", "a", "b"]);
+    let environment_model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 11..100"),
+    ]];
+
+    let mut solver = Solver::new(provider);
+    solver.set_env_ordering_conflict_limit(u64::MAX);
+    solver.set_env_ordering_work_budget(0, 1);
+    let result = solver.solve_universal(
+        UniversalProblem::new()
+            .requirements(requirements)
+            .environment_model(environment_model),
+    );
+
+    assert!(
+        matches!(result, Err(UniversalFailure::Unsolvable { .. })),
+        "the a/b/m core is unsolvable in every region"
+    );
+    assert_eq!(
+        solver.env_ordering_suspensions(),
+        0,
+        "the conflict limit must be unreachable in this configuration"
+    );
+    assert!(
+        solver.env_ordering_restarts() >= 1,
+        "crossing the work deadline after a conflict must escalate to a \
+         rescoring restart (got {} restarts)",
+        solver.env_ordering_restarts()
+    );
 }
 
 /// A cell whose condition is a single literal (assigned mid-trail by the
