@@ -711,6 +711,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         problem: Problem<D::SolvableId, impl IntoIterator<Item = D::SolvableId>>,
     ) -> Result<Vec<D::SolvableId>, UnsolvableOrCancelled> {
+        let result = self.solve_impl(problem);
+        // Report after every outcome: unsolvable and cancelled solves are
+        // exactly the ones whose counters matter when hunting pathological
+        // search behavior.
+        #[cfg(feature = "diagnostics")]
+        self.report_diagnostics();
+        result
+    }
+
+    fn solve_impl(
+        &mut self,
+        problem: Problem<D::SolvableId, impl IntoIterator<Item = D::SolvableId>>,
+    ) -> Result<Vec<D::SolvableId>, UnsolvableOrCancelled> {
         // Re-initialize the solver state.
         self.state = SolverState::default();
 
@@ -750,8 +763,6 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
-        #[cfg(feature = "diagnostics")]
-        self.report_diagnostics();
         Ok(self.state.chosen_solvables().collect())
     }
 

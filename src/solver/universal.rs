@@ -656,6 +656,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         problem: UniversalProblem<D::SolvableId, D::NameId>,
     ) -> Result<UniversalSolution<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
+        let result = self.solve_universal_impl(problem);
+        // Report after every outcome (mirroring `solve`). Note: a rebuild
+        // after an abandoned trail-reuse attempt resets the solver state, so
+        // the report covers only the final enumeration.
+        #[cfg(feature = "diagnostics")]
+        self.report_diagnostics();
+        result
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn solve_universal_impl(
+        &mut self,
+        problem: UniversalProblem<D::SolvableId, D::NameId>,
+    ) -> Result<UniversalSolution<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
         let UniversalProblem {
             requirements,
             constraints,
