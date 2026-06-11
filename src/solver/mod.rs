@@ -257,6 +257,25 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// clauses are never support.
     env_support_clauses: Vec<ClauseId>,
 
+    /// For every solvable variable whose install adds or activates clauses
+    /// that assign environment literals, the environment literal variables
+    /// those clauses assign: the env candidates of its `Requires` clauses
+    /// and the absent/matches literals of its `EnvConstrains` clauses.
+    /// Populated at clause creation in the encoder and persistent across the
+    /// cells of a universal enumeration, which is what gives the
+    /// env-literals-last ordering cross-cell knowledge: a candidate's
+    /// clauses are encoded only after its first install, so the first cell
+    /// treats it like any other candidate, and every later cell defers it
+    /// while one of its literals is unassigned (see
+    /// [`SolverState::env_install_pending`] and
+    /// docs/design/universal-env-literals-last.md).
+    env_sensitive_parents: HashMap<VariableId, Vec<VariableId>>,
+
+    /// Whether any environment literal variable has been interned. Gates the
+    /// env-literals-last classification in `decide()`: a plain concrete
+    /// solve never interns one, so its decision order is untouched.
+    env_ordering_active: bool,
+
     watches: WatchMap,
 
     /// A mapping from requirements to the variables that represent the
@@ -353,6 +372,8 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_clause_ids: Default::default(),
             blocking_clauses: Default::default(),
             env_support_clauses: Default::default(),
+            env_sensitive_parents: Default::default(),
+            env_ordering_active: false,
             watches: Default::default(),
             requirement_to_sorted_candidates: Default::default(),
             variable_map: Default::default(),
@@ -421,6 +442,12 @@ pub(crate) struct PropagationCounters {
     /// [`Self::decisions_propagated`] between cell recordings). Empty for a
     /// plain solve.
     pub cell_decisions: Vec<u64>,
+    /// For each recorded free-phase cell of a universal solve with trail
+    /// reuse, the retract target chosen before adding the cell's blocking
+    /// clause (clamped to the trail depth; an unfalsified blocking clause
+    /// needs no retraction) and the trail depth at that point. Empty for a
+    /// plain solve and for seeded cells.
+    pub cell_retracts: Vec<(u32, u32)>,
     /// Times the kept-prefix conflict budget aborted a trail-reuse attempt.
     pub prefix_budget_aborts: u64,
     /// Time spent adding clauses from the dependency provider.
@@ -1101,7 +1128,49 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             decision: (VariableId, VariableId, ClauseId),
         }
 
+        /// Applies the decision-selection heuristics (explicit requirements
+        /// first, then package activity, then fewest candidates) to one
+        /// candidate decision within its class slot.
+        fn consider(slot: &mut Option<PossibleDecision>, new: PossibleDecision) {
+            match slot {
+                None => *slot = Some(new),
+                Some(best) => {
+                    // Prefer decisions on explicit requirements over
+                    // non-explicit requirements. This optimizes direct
+                    // dependencies over transitive dependencies.
+                    if best.is_explicit_requirement && !new.is_explicit_requirement {
+                        return;
+                    }
+
+                    // Prefer decisions with a higher package activity score
+                    // to root out conflicts faster.
+                    if best.package_activity >= new.package_activity {
+                        return;
+                    }
+
+                    if best.candidate_count <= new.candidate_count {
+                        return;
+                    }
+
+                    *slot = Some(new);
+                }
+            }
+        }
+
         let mut best_decision: Option<PossibleDecision> = None;
+
+        // The env-literals-last ordering (universal solving only, see
+        // docs/design/universal-env-literals-last.md): decisions that would
+        // assign environment literals are deferred so that env literals land
+        // at the top of the trail and the trail-reuse retract target stays
+        // near the trail depth. Two deferral classes, decided only when no
+        // ordinary decision remains: candidates whose install adds or
+        // activates env-literal-assigning clauses (`env_sensitive_parents`,
+        // cross-cell knowledge), and candidates that are environment
+        // literals themselves, which are decided after everything else.
+        let env_ordering = self.state.env_ordering_active;
+        let mut best_env_parent: Option<PossibleDecision> = None;
+        let mut best_env_literal: Option<PossibleDecision> = None;
         for (&solvable_id, requirements) in self.state.requires_clauses.iter() {
             let is_explicit_requirement = solvable_id == VariableId::root();
             if let Some(best_decision) = &best_decision {
@@ -1226,40 +1295,28 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         package_activity,
                     ))) => {
                         let decision = (candidate, solvable_id, *clause_id);
-                        best_decision = Some(match &best_decision {
-                            None => PossibleDecision {
+                        let slot = if !env_ordering {
+                            &mut best_decision
+                        } else if matches!(
+                            self.state.variable_map.origin(candidate),
+                            variable_map::VariableOrigin::EnvMatches(_)
+                                | variable_map::VariableOrigin::EnvAbsent(_)
+                        ) {
+                            &mut best_env_literal
+                        } else if self.state.env_install_pending(candidate) {
+                            &mut best_env_parent
+                        } else {
+                            &mut best_decision
+                        };
+                        consider(
+                            slot,
+                            PossibleDecision {
                                 is_explicit_requirement,
                                 package_activity,
                                 candidate_count,
                                 decision,
                             },
-                            Some(best_decision) => {
-                                // Prefer decisions on explicit requirements over non-explicit
-                                // requirements. This optimizes direct dependencies over transitive
-                                // dependencies.
-                                if best_decision.is_explicit_requirement && !is_explicit_requirement
-                                {
-                                    continue;
-                                }
-
-                                // Prefer decisions with a higher package activity score to root out
-                                // conflicts faster.
-                                if best_decision.package_activity >= package_activity {
-                                    continue;
-                                }
-
-                                if best_decision.candidate_count <= candidate_count {
-                                    continue;
-                                }
-
-                                PossibleDecision {
-                                    is_explicit_requirement,
-                                    package_activity,
-                                    candidate_count,
-                                    decision,
-                                }
-                            }
-                        })
+                        );
                     }
                 }
             }
@@ -1269,110 +1326,117 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // matches)` and need `decide()` to pick the absent or matches literal.
         // We model them like requires clauses with the ordered candidate list
         // `[absent, matches]` (absent first per split policy: absent branch
-        // explored before the matches branch).
-        for (&parent_var, entries) in self.state.env_constrains_clauses.iter() {
-            let is_explicit_requirement = parent_var == VariableId::root();
-            if let Some(best_decision) = &best_decision {
-                if best_decision.is_explicit_requirement && !is_explicit_requirement {
+        // explored before the matches branch). Their decisions assign
+        // environment literals, so they belong to the env-literal class and
+        // the scan is needed only when the higher classes came up empty.
+        if best_decision.is_none() && best_env_parent.is_none() {
+            for (&parent_var, entries) in self.state.env_constrains_clauses.iter() {
+                let is_explicit_requirement = parent_var == VariableId::root();
+
+                // Only act when the parent solvable is actually installed.
+                if self.state.decision_tracker.assigned_value(parent_var) != Some(true) {
                     continue;
                 }
-            }
 
-            // Only act when the parent solvable is actually installed.
-            if self.state.decision_tracker.assigned_value(parent_var) != Some(true) {
-                continue;
-            }
+                for entry in entries {
+                    let EnvConstrainsClause {
+                        absent_var,
+                        matches_var,
+                        version_set,
+                        ..
+                    } = self.state.env_constrains[entry.env_constrains_id];
 
-            for entry in entries {
-                let EnvConstrainsClause {
-                    absent_var,
-                    matches_var,
-                    version_set,
-                    ..
-                } = self.state.env_constrains[entry.env_constrains_id];
-
-                // Ordered candidates: absent first, then matches.
-                let candidates: &[VariableId] = match absent_var {
-                    Some(ab) => &[ab, matches_var],
-                    None => &[matches_var],
-                };
-                // Temporarily we work with a slice of VariableIds.
-                // Reuse the same ControlFlow logic as the requires loop.
-                let mut candidate = ControlFlow::Break(());
-                for &c in candidates {
-                    let assigned = self.state.decision_tracker.assigned_value(c);
-                    candidate = match assigned {
-                        Some(true) => {
-                            // Clause already satisfied.
-                            candidate = ControlFlow::Break(());
-                            break;
-                        }
-                        Some(false) => {
-                            // This candidate was ruled out, continue.
-                            match candidate {
-                                ControlFlow::Continue(x) => ControlFlow::Continue(x),
-                                _ => ControlFlow::Continue(None),
-                            }
-                        }
-                        None => {
-                            // Undecided -- first undecided candidate.
-                            match candidate {
-                                ControlFlow::Continue(None) | ControlFlow::Break(()) => {
-                                    let package_name =
-                                        self.provider().version_set_name(version_set);
-                                    let package_activity =
-                                        self.state.name_activity.get(package_name);
-                                    ControlFlow::Continue(Some((c, 1u32, package_activity)))
-                                }
-                                ControlFlow::Continue(Some((fc, count, act))) => {
-                                    ControlFlow::Continue(Some((fc, count + 1, act)))
-                                }
-                            }
-                        }
+                    // Ordered candidates: absent first, then matches.
+                    let candidates: &[VariableId] = match absent_var {
+                        Some(ab) => &[ab, matches_var],
+                        None => &[matches_var],
                     };
-                }
-
-                match candidate {
-                    ControlFlow::Break(_) => continue, // already satisfied
-                    ControlFlow::Continue(None) => {
-                        // All candidates false -- propagation should have
-                        // handled this.
-                        unreachable!(
-                            "all env_constrains candidates assigned false; \
-                             propagation should have caught this"
-                        )
+                    // Temporarily we work with a slice of VariableIds.
+                    // Reuse the same ControlFlow logic as the requires loop.
+                    let mut candidate = ControlFlow::Break(());
+                    for &c in candidates {
+                        let assigned = self.state.decision_tracker.assigned_value(c);
+                        candidate = match assigned {
+                            Some(true) => {
+                                // Clause already satisfied.
+                                candidate = ControlFlow::Break(());
+                                break;
+                            }
+                            Some(false) => {
+                                // This candidate was ruled out, continue.
+                                match candidate {
+                                    ControlFlow::Continue(x) => ControlFlow::Continue(x),
+                                    _ => ControlFlow::Continue(None),
+                                }
+                            }
+                            None => {
+                                // Undecided -- first undecided candidate.
+                                match candidate {
+                                    ControlFlow::Continue(None) | ControlFlow::Break(()) => {
+                                        let package_name =
+                                            self.provider().version_set_name(version_set);
+                                        let package_activity =
+                                            self.state.name_activity.get(package_name);
+                                        ControlFlow::Continue(Some((c, 1u32, package_activity)))
+                                    }
+                                    ControlFlow::Continue(Some((fc, count, act))) => {
+                                        ControlFlow::Continue(Some((fc, count + 1, act)))
+                                    }
+                                }
+                            }
+                        };
                     }
-                    ControlFlow::Continue(Some((c, candidate_count, package_activity))) => {
-                        let decision = (c, parent_var, entry.clause_id);
-                        best_decision = Some(match &best_decision {
-                            None => PossibleDecision {
-                                is_explicit_requirement,
-                                package_activity,
-                                candidate_count,
-                                decision,
-                            },
-                            Some(best) => {
-                                if best.is_explicit_requirement && !is_explicit_requirement {
-                                    continue;
-                                }
-                                if best.package_activity >= package_activity {
-                                    continue;
-                                }
-                                if best.candidate_count <= candidate_count {
-                                    continue;
-                                }
+
+                    match candidate {
+                        ControlFlow::Break(_) => continue, // already satisfied
+                        ControlFlow::Continue(None) => {
+                            // All candidates false -- propagation should have
+                            // handled this.
+                            unreachable!(
+                                "all env_constrains candidates assigned false; \
+                             propagation should have caught this"
+                            )
+                        }
+                        ControlFlow::Continue(Some((c, candidate_count, package_activity))) => {
+                            consider(
+                                &mut best_env_literal,
                                 PossibleDecision {
                                     is_explicit_requirement,
                                     package_activity,
                                     candidate_count,
-                                    decision,
-                                }
-                            }
-                        });
+                                    decision: (c, parent_var, entry.clause_id),
+                                },
+                            );
+                        }
                     }
                 }
             }
         }
+
+        // Deferred decisions (and blocking-clause completions below) are
+        // only taken when the encoder has nothing pending: clauses are
+        // encoded in batches when the decision loop runs dry, so a batch
+        // boundary can leave only deferred candidates visible even though
+        // the not-yet-encoded solvables will reveal more ordinary
+        // decisions. Returning no decision hands control back to `run_sat`,
+        // which encodes the pending solvables and re-enters the loop;
+        // without this, the encode cadence would force environment literals
+        // onto the trail mid-solve, defeating the env-literals-last
+        // ordering.
+        if env_ordering
+            && best_decision.is_none()
+            && (best_env_parent.is_some()
+                || best_env_literal.is_some()
+                || !self.state.blocking_clauses.is_empty())
+            && self.has_pending_clause_encodes()
+        {
+            return None;
+        }
+
+        // Resolve the classes in order: ordinary decisions first, then
+        // candidates whose install would assign environment literals, then
+        // the environment literals themselves.
+        let mut best_decision = best_decision.or(best_env_parent).or(best_env_literal);
 
         // Finally, make progress on blocking clauses (universal solving
         // only; the list is empty in a plain solve). A blocking clause is a
@@ -1457,6 +1521,25 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                  ..
              }| { (candidate, required_by, via) },
         )
+    }
+
+    /// Returns true when a solvable chosen by the current assignment still
+    /// has its clauses pending encoding (the `new_solvables` scan of
+    /// [`Solver::run_sat`] would find it). Used by [`Solver::decide`] to
+    /// postpone deferred env decisions until the formula for every chosen
+    /// solvable is present.
+    fn has_pending_clause_encodes(&self) -> bool {
+        self.state.decision_tracker.stack().any(|d| {
+            d.value
+                && d.variable
+                    .as_solvable_or_root(&self.state.variable_map)
+                    .is_some_and(|solvable_or_root| {
+                        !self
+                            .state
+                            .clauses_added_for_solvable
+                            .contains(solvable_or_root)
+                    })
+        })
     }
 
     /// Executes one iteration of the CDCL loop
@@ -1796,6 +1879,50 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     }
                     // Update the watch to point to the new literal
                     next_cursor = cursor.update(literal);
+                } else if self.state.env_ordering_active
+                    && matches!(clause, Clause::Requires(..))
+                    && other_watched_literal.satisfying_value()
+                    && self
+                        .state
+                        .decision_tracker
+                        .assigned_value(other_watched_literal.variable())
+                        .is_none()
+                    // Inlined `SolverState::env_install_pending` (a method
+                    // call would borrow the whole state struct, which the
+                    // watch cursor partially borrows mutably).
+                    && self
+                        .state
+                        .env_sensitive_parents
+                        .get(&other_watched_literal.variable())
+                        .is_some_and(|literals| {
+                            literals.iter().any(|&literal| {
+                                self.state
+                                    .decision_tracker
+                                    .assigned_value(literal)
+                                    .is_none()
+                            })
+                        })
+                {
+                    // Env-literals-last: a `Requires` clause that became
+                    // unit on a solvable whose install would assign a still
+                    // unassigned environment literal (a variant parent such
+                    // as a microarch-level or sysroot build) is NOT
+                    // propagated here. Propagating it would install the
+                    // parent, and with it the environment literal, at the
+                    // level of whatever package required it, mid-trail;
+                    // `decide()` installs it instead, after every ordinary
+                    // decision (the deferred classes), so the literal lands
+                    // at the top of the trail. Soundness: the clause stays
+                    // watched, so if the skipped candidate is later
+                    // assigned false by another clause, this clause's watch
+                    // fires and reports the conflict through the (already
+                    // false) other watched literal; and `decide()` is
+                    // guaranteed to see the clause because `Requires`
+                    // clauses are indexed by their installed parent.
+                    // Skipping a forced assignment merely turns it into a
+                    // later decision, which conflict analysis treats like
+                    // any other decision.
+                    next_cursor = cursor.next();
                 } else {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2238,6 +2365,29 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 }
 
 impl<D: DependencyProvider> SolverState<D> {
+    /// Returns true when installing `variable` would assign at least one
+    /// currently unassigned environment literal (through unit propagation of
+    /// its `Requires` clauses on environment packages or a `decide()` pick
+    /// on its `EnvConstrains` clauses).
+    ///
+    /// This is the deferral test of the env-literals-last ordering, and it
+    /// is deliberately dynamic: a parent whose env literals are all assigned
+    /// is ordinary (installing it assigns nothing), which keeps the ordering
+    /// selective on corpora where a baseline literal such as
+    /// `__glibc >=2.17` is required by nearly every package. Once the first
+    /// deferred parent assigns that literal, the rest of its cone stops
+    /// being deferred; only parents of literals that still discriminate
+    /// between environment regions stay at the top of the trail.
+    fn env_install_pending(&self, variable: VariableId) -> bool {
+        self.env_sensitive_parents
+            .get(&variable)
+            .is_some_and(|literals| {
+                literals
+                    .iter()
+                    .any(|&literal| self.decision_tracker.assigned_value(literal).is_none())
+            })
+    }
+
     /// Allocate a clause and, if it has watched literals, register them in
     /// the [`WatchMap`].
     pub(crate) fn add_clause(
@@ -2351,6 +2501,7 @@ impl<D: DependencyProvider> SolverState<D> {
         &mut self,
         package_name: D::NameId,
     ) -> VariableId {
+        self.env_ordering_active = true;
         let (ab_var, is_new, prior_matches) = self.variable_map.intern_env_absent(package_name);
         if is_new {
             for prior_vs in &prior_matches {
@@ -2380,6 +2531,7 @@ impl<D: DependencyProvider> SolverState<D> {
         version_set_id: VersionSetId,
         package_name: D::NameId,
     ) -> VariableId {
+        self.env_ordering_active = true;
         let (new_var, prior_vsets, absent_var) = self
             .variable_map
             .intern_env_matches(version_set_id, package_name);

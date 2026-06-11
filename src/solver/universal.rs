@@ -158,6 +158,16 @@ enum EnumerationOutcome<Id, N> {
     ReuseAbandoned,
 }
 
+/// The number of ordinary decision levels (decisions on variables that are
+/// neither environment literals nor env-sensitive parents) a cell-to-cell
+/// retraction may pop before the enumeration prefers a full retraction that
+/// rebuilds the trail in the env-literals-last shape (see the trail-reshape
+/// comment in `enumerate_universal`). Small enough to catch a buried
+/// env-independent suffix early, large enough to tolerate the dependency
+/// subtree that installing a deferred variant parent drags above the env
+/// tail.
+const TRAIL_RESHAPE_ORDINARY_LEVELS: u32 = 8;
+
 /// Returns true when the variable represents an environment literal (either
 /// a matches or an absent literal).
 fn is_env_variable<D: DependencyProvider>(state: &SolverState<D>, variable: VariableId) -> bool {
@@ -829,8 +839,46 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     let retract_target = if self.state.assumption_levels > 0 || !reuse_trail {
                         0
                     } else {
-                        self.blocking_clause_retract_target(&cell)
+                        let target = self.blocking_clause_retract_target(&cell);
+                        // Trail reshape: when the retraction would pop more
+                        // than a handful of ordinary decision levels, the
+                        // kept prefix has env-sensitive state buried under
+                        // env-independent packages (the shape the trail was
+                        // given before the env-literals-last knowledge
+                        // existed). A partial retraction would re-derive
+                        // that suffix on EVERY later transition and the
+                        // shape would never heal, because the cascade of
+                        // the new blocking clause re-assigns the env
+                        // literals at the bottom of the re-derived range.
+                        // Retract fully instead: the rebuild orders the
+                        // trail with the current knowledge (env literals on
+                        // top), which collapses subsequent transitions to
+                        // the env tail. With a well-shaped trail only env
+                        // literals and env-sensitive parents sit above the
+                        // target, so this triggers at most once per
+                        // knowledge change.
+                        if self.state.env_ordering_active
+                            && self.ordinary_levels_above(target) > TRAIL_RESHAPE_ORDINARY_LEVELS
+                        {
+                            0
+                        } else {
+                            target
+                        }
                     };
+
+                    // Observe the retract target relative to the trail depth
+                    // (diagnostics): how much of the trail each transition
+                    // keeps is the load-bearing metric of the
+                    // env-literals-last decision ordering.
+                    #[cfg(feature = "diagnostics")]
+                    if self.state.assumption_levels == 0 && reuse_trail {
+                        let depth = self.state.decision_tracker.deepest_level();
+                        self.state
+                            .propagation_counters
+                            .cell_retracts
+                            .push((retract_target.min(depth), depth));
+                    }
+
                     self.state.assumption_levels = 0;
                     self.state.decision_tracker.undo_until(retract_target);
 
@@ -933,6 +981,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     #[cfg(feature = "diagnostics")]
     pub fn universal_cell_decisions(&self) -> &[u64] {
         &self.state.propagation_counters.cell_decisions
+    }
+
+    /// Returns, for each free-phase cell recorded with trail reuse by the
+    /// last [`Self::solve_universal`] call, the retract target chosen before
+    /// adding the cell's blocking clause (clamped to the trail depth) and
+    /// the trail depth at that point.
+    ///
+    /// This is a diagnostics-only observation point: tests use it to verify
+    /// that the env-literals-last decision ordering keeps the retract target
+    /// within a few levels of the trail depth, which is what makes trail
+    /// reuse collapse per-cell costs.
+    #[cfg(feature = "diagnostics")]
+    pub fn universal_cell_retracts(&self) -> &[(u32, u32)] {
+        &self.state.propagation_counters.cell_retracts
     }
 
     /// Performs a scoped re-solve to produce a conflict that is tightly
@@ -1470,6 +1532,36 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
         cell.sort_by_key(|&(variable, _)| variable.to_index());
         cell
+    }
+
+    /// Counts the decision levels above `target` whose level-starting
+    /// decision is ordinary: neither an environment literal nor an
+    /// env-sensitive parent (a variable in
+    /// `SolverState::env_sensitive_parents`). With a trail in the
+    /// env-literals-last shape this is at most the dependency subtree of a
+    /// deferred parent; a larger count means env-independent packages are
+    /// stacked above the retract target and every transition would re-derive
+    /// them (see the trail-reshape logic in `enumerate_universal`).
+    fn ordinary_levels_above(&self, target: u32) -> u32 {
+        let state = &self.state;
+        let tracker = &state.decision_tracker;
+        let mut count = 0;
+        let mut previous_level = 0;
+        for decision in tracker.stack() {
+            let level = tracker.level(decision.variable);
+            let starts_level = level > previous_level;
+            previous_level = previous_level.max(level);
+            if !starts_level || level <= target {
+                continue;
+            }
+            if is_env_variable(state, decision.variable)
+                || state.env_sensitive_parents.contains_key(&decision.variable)
+            {
+                continue;
+            }
+            count += 1;
+        }
+        count
     }
 
     /// The level to retract the trail to before adding the blocking clause

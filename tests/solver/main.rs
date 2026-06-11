@@ -3042,6 +3042,103 @@ fn test_universal_trail_reuse_second_cell_decides_less() {
     );
 }
 
+/// Environment literals must be decided at the top of the trail so that the
+/// retract target of every cell transition sits within a few levels of the
+/// trail depth (the env-literals-last decision ordering, see
+/// docs/design/universal-env-literals-last.md). Without the ordering, env
+/// literals are assigned at the level where the package requiring them is
+/// installed, and every transition that flips one re-derives the entire
+/// trail above that mid-trail level.
+///
+/// The universe is a two-axis variant grid: `v` has one build per `osver`
+/// region and `w` one build per `arch` region, plus a chain `c1..c8` of
+/// env-independent packages (two versions each, so each link is a real
+/// decision) that must end up below the env-sensitive tail of the trail.
+/// The variant parents exercise the cross-cell knowledge class (a build's
+/// requirement on an env package is only known after its clauses were
+/// encoded once), and the env literals themselves exercise the env-literal
+/// class (deferrable on sight, so even the first cell keeps them at the
+/// top).
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_env_literals_decided_last() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("osver", false);
+    provider.add_environment_package("arch", false);
+    provider.add_package("v", Pack::new(2), &["osver 2..3"], &[]);
+    provider.add_package("v", Pack::new(1), &["osver 1..2"], &[]);
+    provider.add_package("w", Pack::new(2), &["arch 2..3"], &[]);
+    provider.add_package("w", Pack::new(1), &["arch 1..2"], &[]);
+    for i in 1..8 {
+        let name = format!("c{i}");
+        let dep = format!("c{}", i + 1);
+        provider.add_package(&name, Pack::new(2), &[dep.as_str()], &[]);
+        provider.add_package(&name, Pack::new(1), &[dep.as_str()], &[]);
+    }
+    provider.add_package("c8", Pack::new(2), &[], &[]);
+    provider.add_package("c8", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["v", "w", "c1"]);
+    let environment_model = vec![
+        vec![
+            parse_env_literal(&mut provider, "osver 1..2"),
+            parse_env_literal(&mut provider, "osver 2..3"),
+        ],
+        vec![
+            parse_env_literal(&mut provider, "arch 1..2"),
+            parse_env_literal(&mut provider, "arch 2..3"),
+        ],
+    ];
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(environment_model),
+        )
+        .expect("solvable");
+    solution.verify(solver.provider()).unwrap();
+    assert_eq!(
+        solution.cells.len(),
+        4,
+        "one cell per osver x arch region of the model"
+    );
+
+    let retracts = solver.universal_cell_retracts();
+    assert_eq!(
+        retracts.len(),
+        4,
+        "one retract observation per free-phase cell"
+    );
+    // The first cell's env literals are decided last even without
+    // cross-cell knowledge (they are deferrable on sight), so its retract
+    // target must already sit at the top of the trail. Without the ordering
+    // they are decided right after the variant parents install, far below
+    // the chain, and the first retract throws most of the trail away.
+    let (first_target, first_depth) = retracts[0];
+    assert!(
+        first_target + 2 >= first_depth,
+        "cell 0: retract target {first_target} is far below the trail depth {first_depth}; \
+         an environment literal was assigned mid-trail (all retracts: {retracts:?})"
+    );
+
+    // At most one transition may retract deep: the first conflict against a
+    // variant parent that was positioned before its env-sensitivity was
+    // known rebuilds the trail in the deferred shape, and every transition
+    // after that keeps everything but the env-sensitive tail. Without the
+    // ordering every transition that flips an axis retracts deep.
+    let deep_transitions = retracts
+        .iter()
+        .filter(|&&(target, depth)| target + 2 < depth)
+        .count();
+    assert!(
+        deep_transitions <= 1,
+        "{deep_transitions} transitions retracted far below the trail depth; environment \
+         literals keep landing mid-trail (all retracts: {retracts:?})"
+    );
+}
+
 /// A cell whose condition is a single literal (assigned mid-trail by the
 /// requires clause of `a=2`): the blocking clause is a single-literal
 /// assertion. After the partial retraction it must propagate immediately and

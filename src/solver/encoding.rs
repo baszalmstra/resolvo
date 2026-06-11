@@ -526,6 +526,33 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 self.state.env_support_clauses.push(clause_id);
             }
 
+            // Installing this parent makes the clause assign an environment
+            // literal (by unit propagation for a single candidate, by a
+            // `decide()` pick otherwise): record which literals, so that
+            // installs of this parent are deferred while one of them is
+            // still unassigned (env-literals-last ordering). Condition-only
+            // env involvement is excluded: it does not assign env literals
+            // on install.
+            if has_env {
+                let entry = self
+                    .state
+                    .env_sensitive_parents
+                    .entry(variable)
+                    .or_default();
+                for (candidate_set, variables) in
+                    candidates.iter().zip(version_set_variables.iter())
+                {
+                    if !matches!(candidate_set, RequirementCandidates::Environment(_)) {
+                        continue;
+                    }
+                    for &env_var in variables {
+                        if !entry.contains(&env_var) {
+                            entry.push(env_var);
+                        }
+                    }
+                }
+            }
+
             self.state
                 .requires_clauses
                 .entry(variable)
@@ -638,8 +665,21 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         );
         let clause_id = self.state.add_clause(watched_literals, kind);
 
-        // EnvConstrains clauses always contribute to cell support.
+        // EnvConstrains clauses always contribute to cell support, and their
+        // parent's install activates an env-literal decision: record the
+        // literals so the parent is deferred while one of them is still
+        // unassigned (env-literals-last ordering).
         self.state.env_support_clauses.push(clause_id);
+        let entry = self
+            .state
+            .env_sensitive_parents
+            .entry(parent_var)
+            .or_default();
+        for env_var in absent_var.into_iter().chain([matches_var]) {
+            if !entry.contains(&env_var) {
+                entry.push(env_var);
+            }
+        }
 
         self.state
             .env_constrains_clauses
