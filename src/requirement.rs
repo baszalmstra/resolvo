@@ -111,6 +111,14 @@ impl<V> RequirementMap<V> {
     }
 
     #[inline]
+    pub fn get_mut(&mut self, key: Requirement) -> Option<&mut V> {
+        match key {
+            Requirement::Single(id) => self.singles.get_mut(id),
+            Requirement::Union(id) => self.unions.get_mut(id),
+        }
+    }
+
+    #[inline]
     pub fn insert(&mut self, key: Requirement, value: V) -> Option<V> {
         match key {
             Requirement::Single(id) => self.singles.insert(id, value),

@@ -553,11 +553,39 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 }
             }
 
-            self.state
-                .requires_clauses
-                .entry(variable)
-                .or_default()
-                .push((requirement.requirement, condition, clause_id));
+            let entry = self.state.requires_clauses.entry(variable);
+            let parent_pos = entry.index();
+            let clauses = entry.or_default();
+            let clause_pos = clauses.len();
+            clauses.push((requirement.requirement, condition, clause_id));
+
+            // Mirror the clause in the incremental decide queue. The
+            // condition variables are collected up front to keep the
+            // borrows of the solver state disjoint; conditions are rare.
+            let condition_variables: Vec<VariableId> = condition
+                .map(|id| {
+                    self.state.disjunctions[id]
+                        .literals
+                        .iter()
+                        .map(|literal| literal.variable())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let provider = self.cache.provider();
+            self.state.decide_queue.add_requires_item(
+                parent_pos,
+                clause_pos,
+                variable,
+                requirement.requirement,
+                condition,
+                condition_variables.into_iter(),
+                requirement
+                    .requirement
+                    .version_sets(provider)
+                    .map(|version_set| provider.version_set_name(version_set)),
+                clause_id,
+                &self.state.decision_tracker,
+            );
 
             if conflict {
                 self.conflicting_clauses.push(clause_id);
@@ -681,14 +709,25 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             }
         }
 
-        self.state
-            .env_constrains_clauses
-            .entry(parent_var)
-            .or_default()
-            .push(EnvConstrainsEntry {
-                env_constrains_id,
-                clause_id,
-            });
+        let entry = self.state.env_constrains_clauses.entry(parent_var);
+        let parent_pos = entry.index();
+        let entries = entry.or_default();
+        let clause_pos = entries.len();
+        entries.push(EnvConstrainsEntry {
+            env_constrains_id,
+            clause_id,
+        });
+        self.state.decide_queue.add_env_constrains_item(
+            parent_pos,
+            clause_pos,
+            parent_var,
+            env_constrains_id,
+            absent_var,
+            matches_var,
+            package_name,
+            clause_id,
+            &self.state.decision_tracker,
+        );
 
         if conflict {
             self.conflicting_clauses.push(clause_id);
