@@ -228,6 +228,44 @@ machinery overhead.
   universal overhead observed on linux-64 comes from genuinely covering
   more environments (more cells), never from the mechanism.
 
+### Variant: win-64 with a symbolic cuda axis
+
+CSVs: `bench-universal/full-win-64-cuda-universal.csv`,
+`bench-universal/full-win-64-cuda-concrete.csv`, snapshot
+`snapshot-win-64-cuda.json`, model `model-win-64-cuda.json`.
+
+The control win-64 runs deliberately excluded cuda (neither symbolic nor
+a machine candidate), so cuda-requiring packages were uninstallable in
+both modes there. Real Windows machines do have CUDA, and win-64
+repodata carries 34 distinct `__cuda` version sets (vs 38 on linux-64).
+This variant regenerates the snapshot with `__cuda` symbolic
+(absentable, machine candidate 12.4) and adds the
+`absent OR >=11,<14.0a0` clause to the model. Note the corpus is
+freshly drawn for this snapshot (env-targeting version sets leave the
+pick pool), so rows do not join against the control win-64 runs; the
+universal/concrete pairing within the variant is exact as always.
+
+|                      | universal | concrete |
+|----------------------|-----------|----------|
+| ok                   | 567       | 599      |
+| unsolvable           | 430       | 397      |
+| timeout (60 s)       | 3         | 4        |
+| median duration      | 0.35 s    | 0.33 s   |
+| p95                  | 1.85 s    | 1.54 s   |
+
+- **Paired ratio** (567 ok in both): median **1.03x**, p90 1.26x, p95
+  1.47x, p99 2.69x, max 43x (a single outlier). Adding the full cuda
+  axis on Windows costs a few percent at the median and keeps a far
+  smaller tail than linux-64: cells stay at median 1, p95 7, max 21,
+  because the GPU stacks that explode into hundreds of cells are mostly
+  linux-only builds.
+- 32 problems are universal-unsolvable but concrete-ok (15 in cuda
+  version corners, 13 in the cuda-absent region, 4 other): the expected
+  total-model semantics, now visible on Windows because cuda-requiring
+  packages must work on cuda-less machines to satisfy the model.
+- One problem times out concretely while universal *proves it
+  unsolvable* within the timeout. All 567 universal solutions verify.
+
 ### Model-bounds variant: glibc floor 2.28 (linux-64)
 
 CSV: `bench-universal/full-linux-64-glibc228.csv`. Same corpus and model
