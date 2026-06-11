@@ -13,12 +13,13 @@
 //!   *order key* equal to its position in the original scan order.
 //! - A sorted queue holds the items that may currently be *eligible*
 //!   (parent installed, condition met, clause not yet satisfied). The
-//!   queue is a superset of the eligible items: items are only removed
-//!   when an inspection proves them ineligible, and every state change
-//!   that could make an item eligible again re-inserts it.
+//!   queue is a superset of the eligible items whose parent is installed:
+//!   items are only removed when an inspection proves them ineligible,
+//!   and every state change that could make an item eligible re-inserts
+//!   it.
 //! - Wake-ups are driven by the assignment trail. The queue keeps a mirror
 //!   of the trail and catches up lazily at the start of each `decide()`
-//!   call (see [`DecisionTracker::take_sync_floor`]), routing each changed
+//!   call (see `DecisionTracker::take_sync_floor`), routing each changed
 //!   variable through occurrence lists to the affected items.
 //! - The candidate walk of a requirement (first undecided candidate,
 //!   candidate count, satisfying candidate) is cached per *requirement*
@@ -27,6 +28,18 @@
 //!   satisfying candidate still true?), which makes the frequent case,
 //!   propagation forbidding candidates of already-satisfied clauses, a
 //!   no-op.
+//!
+//! The fold itself exploits a property of the replacement rule: a later
+//! clause only ever replaces the running best with a strictly *higher*
+//! package activity, and activities are non-negative, so only clauses
+//! whose package was ever involved in a conflict (a *hot* name) can
+//! replace anything. The fold therefore visits the first eligible item
+//! (the initial best) and then only the eligible *hot* items after it,
+//! which the queue tracks in a second, much smaller sorted set. Names
+//! become hot when [`DecideQueue::mark_name_hot`] is called from the
+//! conflict-analysis activity bump and never become cold again (uniform
+//! decay can underflow an activity back to zero, which only makes the hot
+//! set a conservative superset).
 //!
 //! Because the queue iterates eligible items in exactly the original scan
 //! order and the fold applies exactly the original replacement rule, the
@@ -40,6 +53,7 @@ use crate::{
     DenseIndex, Interner, Requirement, VariableId, VersionSetId,
     internal::id::{ClauseId, EnvConstrainsId},
     requirement::RequirementMap,
+    solver_id::SolverId,
 };
 
 use super::{conditions::DisjunctionId, decision_tracker::DecisionTracker};
@@ -65,26 +79,6 @@ fn pack_key(segment: u64, parent_pos: usize, clause_pos: usize) -> u64 {
         | clause_pos as u64
 }
 
-/// The first possible key of a parent's items in a segment.
-pub(crate) fn requires_segment_start(parent_pos: usize) -> u64 {
-    pack_key(SEGMENT_REQUIRES, parent_pos, 0)
-}
-
-/// The last possible key of a parent's items in the requires segment.
-pub(crate) fn requires_segment_end(parent_pos: usize) -> u64 {
-    pack_key(SEGMENT_REQUIRES, parent_pos, (1 << CLAUSE_BITS) - 1)
-}
-
-/// The first possible key of a parent's items in the env-constrains segment.
-pub(crate) fn env_segment_start(parent_pos: usize) -> u64 {
-    pack_key(SEGMENT_ENV_CONSTRAINS, parent_pos, 0)
-}
-
-/// The last possible key of a parent's items in the env-constrains segment.
-pub(crate) fn env_segment_end(parent_pos: usize) -> u64 {
-    pack_key(SEGMENT_ENV_CONSTRAINS, parent_pos, (1 << CLAUSE_BITS) - 1)
-}
-
 /// One clause that `decide()` may act on.
 pub(crate) struct DecideItem {
     /// The item's position in the original scan order.
@@ -96,6 +90,10 @@ pub(crate) struct DecideItem {
     pub(crate) kind: DecideItemKind,
     /// Whether the item is currently in [`DecideQueue::queue`].
     queued: bool,
+    /// Whether any package name of the item's requirement was ever bumped
+    /// (see [`DecideQueue::mark_name_hot`]). Hot queued items are mirrored
+    /// in [`DecideQueue::hot_queue`].
+    hot: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -138,12 +136,20 @@ pub(crate) enum ReqState {
     AllFalse,
 }
 
-/// Incremental queue of `decide()` items. See the module docs.
-#[derive(Default)]
-pub(crate) struct DecideQueue {
+/// Incremental queue of `decide()` items, generic over the provider's
+/// package name id (used to track hot names). See the module docs.
+pub(crate) struct DecideQueue<N: SolverId> {
     items: Vec<DecideItem>,
     /// Items that may be eligible, ordered by scan position.
     queue: BTreeSet<(u64, ItemId)>,
+    /// The queued items whose requirement mentions a hot package name:
+    /// the only items that can replace a non-trivial running best.
+    hot_queue: BTreeSet<(u64, ItemId)>,
+    /// Package names whose activity was ever bumped.
+    hot_names: ahash::HashSet<N>,
+    /// Package name -> items whose requirement mentions the name, for the
+    /// cold-to-hot migration when the name is first bumped.
+    name_items: ahash::HashMap<N, Vec<ItemId>>,
     /// Cached candidate walks, keyed by requirement.
     reqs: RequirementMap<ReqEntry>,
     /// Variable -> items whose clause parent is the variable.
@@ -160,6 +166,25 @@ pub(crate) struct DecideQueue {
     undone_scratch: Vec<VariableId>,
 }
 
+impl<N: SolverId> Default for DecideQueue<N> {
+    fn default() -> Self {
+        Self {
+            items: Default::default(),
+            queue: Default::default(),
+            hot_queue: Default::default(),
+            hot_names: Default::default(),
+            name_items: Default::default(),
+            reqs: Default::default(),
+            parent_occ: Default::default(),
+            cand_occ: Default::default(),
+            cond_occ: Default::default(),
+            env_occ: Default::default(),
+            shadow: Default::default(),
+            undone_scratch: Default::default(),
+        }
+    }
+}
+
 fn occ_push<T>(occ: &mut Vec<Vec<T>>, var: VariableId, value: T) {
     let index = var.to_index();
     if index >= occ.len() {
@@ -172,15 +197,29 @@ fn occ_get<T>(occ: &[Vec<T>], var: VariableId) -> &[T] {
     occ.get(var.to_index()).map_or(&[], Vec::as_slice)
 }
 
-fn enqueue(items: &mut [DecideItem], queue: &mut BTreeSet<(u64, ItemId)>, id: ItemId) {
+/// Queues an item unless its parent is not installed: an item is only
+/// eligible while its parent is assigned true, and the parent-occurrence
+/// wake-up re-attempts the insertion when the parent becomes true. The
+/// filter keeps the constant churn of parent variables being assigned
+/// false (forbid propagation) away from the queue.
+fn enqueue(
+    items: &mut [DecideItem],
+    queue: &mut BTreeSet<(u64, ItemId)>,
+    hot_queue: &mut BTreeSet<(u64, ItemId)>,
+    tracker: &DecisionTracker,
+    id: ItemId,
+) {
     let item = &mut items[id as usize];
-    if !item.queued {
+    if !item.queued && tracker.assigned_value(item.parent) == Some(true) {
         item.queued = true;
         queue.insert((item.key, id));
+        if item.hot {
+            hot_queue.insert((item.key, id));
+        }
     }
 }
 
-impl DecideQueue {
+impl<N: SolverId> DecideQueue<N> {
     /// Registers a requires clause. Must be called when the clause is added
     /// to `requires_clauses`, with the parent's map position and the
     /// clause's position in the parent's clause list.
@@ -193,11 +232,20 @@ impl DecideQueue {
         requirement: Requirement,
         condition: Option<DisjunctionId>,
         condition_variables: impl Iterator<Item = VariableId>,
+        package_names: impl Iterator<Item = N>,
         sorted_candidates: &[Vec<VariableId>],
         clause_id: ClauseId,
+        tracker: &DecisionTracker,
     ) {
         let id: ItemId = self.items.len().try_into().expect("decide item overflow");
         let key = pack_key(SEGMENT_REQUIRES, parent_pos, clause_pos);
+
+        let mut hot = false;
+        for name in package_names {
+            hot |= self.hot_names.contains(&name);
+            self.name_items.entry(name).or_default().push(id);
+        }
+
         self.items.push(DecideItem {
             key,
             parent,
@@ -207,6 +255,7 @@ impl DecideQueue {
                 condition,
             },
             queued: false,
+            hot,
         });
 
         occ_push(&mut self.parent_occ, parent, id);
@@ -235,8 +284,14 @@ impl DecideQueue {
         }
 
         // The parent may already be installed (clauses are encoded after
-        // their parent was selected), so the item starts queued.
-        enqueue(&mut self.items, &mut self.queue, id);
+        // their parent was selected), so the item may start queued.
+        enqueue(
+            &mut self.items,
+            &mut self.queue,
+            &mut self.hot_queue,
+            tracker,
+            id,
+        );
     }
 
     /// Registers an env-constrains clause, mirroring the original second
@@ -250,16 +305,23 @@ impl DecideQueue {
         env_constrains_id: EnvConstrainsId,
         absent_var: Option<VariableId>,
         matches_var: VariableId,
+        package_name: N,
         clause_id: ClauseId,
+        tracker: &DecisionTracker,
     ) {
         let id: ItemId = self.items.len().try_into().expect("decide item overflow");
         let key = pack_key(SEGMENT_ENV_CONSTRAINS, parent_pos, clause_pos);
+
+        let hot = self.hot_names.contains(&package_name);
+        self.name_items.entry(package_name).or_default().push(id);
+
         self.items.push(DecideItem {
             key,
             parent,
             clause_id,
             kind: DecideItemKind::EnvConstrains { env_constrains_id },
             queued: false,
+            hot,
         });
 
         occ_push(&mut self.parent_occ, parent, id);
@@ -268,7 +330,34 @@ impl DecideQueue {
         }
         occ_push(&mut self.env_occ, matches_var, id);
 
-        enqueue(&mut self.items, &mut self.queue, id);
+        enqueue(
+            &mut self.items,
+            &mut self.queue,
+            &mut self.hot_queue,
+            tracker,
+            id,
+        );
+    }
+
+    /// Marks a package name as hot because its activity was bumped. The
+    /// queued items of the name migrate into the hot queue; future
+    /// enqueues of its items insert into both queues.
+    pub(crate) fn mark_name_hot(&mut self, name: N) {
+        if !self.hot_names.insert(name) {
+            return;
+        }
+        let Some(item_ids) = self.name_items.get(&name) else {
+            return;
+        };
+        for &id in item_ids {
+            let item = &mut self.items[id as usize];
+            if !item.hot {
+                item.hot = true;
+                if item.queued {
+                    self.hot_queue.insert((item.key, id));
+                }
+            }
+        }
     }
 
     /// Catches the queue up with every assignment made or undone since the
@@ -305,6 +394,7 @@ impl DecideQueue {
         let DecideQueue {
             items,
             queue,
+            hot_queue,
             reqs,
             parent_occ,
             cand_occ,
@@ -317,29 +407,69 @@ impl DecideQueue {
             let entry = reqs
                 .get_mut(requirement)
                 .expect("touched requirement is registered");
-            if let ReqState::Satisfied { by } = entry.state {
-                // A clause satisfied by a candidate that is still true
-                // stays satisfied (and ineligible) regardless of the other
-                // candidates; skip the wake-up entirely. This keeps the
-                // common case, propagation forbidding candidates of
-                // already-satisfied clauses, O(1).
-                if !entry.dirty && tracker.assigned_value(by) == Some(true) {
-                    continue;
+            // An already-dirty requirement was processed when it became
+            // dirty; until the fold cleans it again there is nothing new
+            // to do.
+            if entry.dirty {
+                continue;
+            }
+            match entry.state {
+                ReqState::Satisfied { by } => {
+                    // A clause satisfied by a candidate that is still true
+                    // stays satisfied (and ineligible) regardless of the
+                    // other candidates; skip the wake-up entirely. This
+                    // keeps the common case, propagation forbidding
+                    // candidates of already-satisfied clauses, O(1).
+                    if tracker.assigned_value(by) == Some(true) {
+                        continue;
+                    }
+                    // The satisfaction broke: items that were dequeued as
+                    // satisfied may be eligible again and must re-enter
+                    // the queue.
+                    entry.dirty = true;
+                    for &item in &entry.items {
+                        enqueue(items, queue, hot_queue, tracker, item);
+                    }
+                }
+                _ => {
+                    // A frontier requirement's heuristic tuple changed,
+                    // but its eligible items never left the queue (the
+                    // fold only dequeues an item of a *satisfied*
+                    // requirement, and parent/condition dequeues are woken
+                    // by their own occurrence lists), so marking the entry
+                    // for re-evaluation is enough.
+                    entry.dirty = true;
                 }
             }
-            entry.dirty = true;
-            for &item in &entry.items {
-                enqueue(items, queue, item);
+        }
+        // The remaining wake-ups are filtered by the variable's current
+        // value: a wake-up is only needed when the new value could turn an
+        // unqueued item eligible. Queued items never need waking, and
+        // ineligible-making transitions are discovered lazily by the fold.
+        let value = tracker.assigned_value(variable);
+        if value == Some(true) {
+            // A parent became installed: its items may now be eligible.
+            // (Any other value keeps them ineligible.)
+            for &item in occ_get(parent_occ, variable) {
+                enqueue(items, queue, hot_queue, tracker, item);
             }
         }
-        for &item in occ_get(parent_occ, variable) {
-            enqueue(items, queue, item);
-        }
+        // Condition literals carry a polarity (a negated literal evaluates
+        // to false when its variable is true), so any change of a
+        // condition variable can complete the all-false condition of a
+        // conditional requirement: wake unconditionally. Conditions are
+        // rare, so this stays cheap.
         for &item in occ_get(cond_occ, variable) {
-            enqueue(items, queue, item);
+            enqueue(items, queue, hot_queue, tracker, item);
         }
-        for &item in occ_get(env_occ, variable) {
-            enqueue(items, queue, item);
+        if value != Some(true) {
+            // An env-constrains candidate stopped being true (undo, or a
+            // net true-to-false flip between two syncs): an item that was
+            // dequeued as satisfied by it may be eligible again. (A
+            // true assignment can only satisfy, never unsatisfy.)
+            for &item in occ_get(env_occ, variable) {
+                enqueue(items, queue, hot_queue, tracker, item);
+            }
         }
     }
 
@@ -357,6 +487,16 @@ impl DecideQueue {
         }
     }
 
+    /// The first queued *hot* item whose key is strictly greater than
+    /// `cursor`.
+    pub(crate) fn next_hot_after(&self, cursor: u64) -> Option<(u64, ItemId)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.hot_queue
+            .range((Excluded((cursor, ItemId::MAX)), Unbounded))
+            .next()
+            .copied()
+    }
+
     pub(crate) fn item(&self, id: ItemId) -> &DecideItem {
         &self.items[id as usize]
     }
@@ -369,6 +509,9 @@ impl DecideQueue {
         if item.queued {
             item.queued = false;
             self.queue.remove(&(item.key, id));
+            if item.hot {
+                self.hot_queue.remove(&(item.key, id));
+            }
         }
     }
 
@@ -426,6 +569,10 @@ impl DecideQueue {
             },
             (None, None) => ReqState::AllFalse,
         };
+        let entry = self
+            .reqs
+            .get_mut(requirement)
+            .expect("evaluated requirement is registered");
         entry.state = state;
         entry.dirty = false;
         state

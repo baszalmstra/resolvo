@@ -544,6 +544,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let provider = self.cache.provider();
             self.state.decide_queue.add_requires_item(
                 parent_pos,
                 clause_pos,
@@ -551,8 +552,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 requirement.requirement,
                 condition,
                 condition_variables.into_iter(),
+                requirement
+                    .requirement
+                    .version_sets(provider)
+                    .map(|version_set| provider.version_set_name(version_set)),
                 &version_set_variables,
                 clause_id,
+                &self.state.decision_tracker,
             );
 
             if conflict {
@@ -679,7 +685,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             env_constrains_id,
             absent_var,
             matches_var,
+            package_name,
             clause_id,
+            &self.state.decision_tracker,
         );
 
         if conflict {
