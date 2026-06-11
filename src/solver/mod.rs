@@ -4,6 +4,7 @@ use ahash::{HashMap, HashSet};
 pub use cache::SolverCache;
 use clause::{Clause, EnvClause, EnvClauseKind, EnvConstrainsClause, Literal, WatchedLiterals};
 use conditions::{Disjunction, DisjunctionId};
+use decide_queue::{DecideItemKind, DecideQueue, ReqState};
 use decision::Decision;
 use decision_tracker::DecisionTracker;
 use encoding::Encoder;
@@ -33,6 +34,7 @@ mod binary_encoding;
 mod cache;
 pub(crate) mod clause;
 mod conditions;
+mod decide_queue;
 mod decision;
 mod decision_map;
 mod decision_tracker;
@@ -338,6 +340,17 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// Activity score per package.
     name_activity: <D::NameId as SolverId>::Map<f32>,
 
+    /// The maximum activity score over all packages. Maintained alongside
+    /// [`Self::name_activity`] (bumps take the max, the uniform decay
+    /// scales it by the same factor) so that `decide()` can stop scanning
+    /// once no remaining clause could replace the current best decision.
+    max_activity: f32,
+
+    /// Incremental work queue for `decide()`; kept in lockstep with
+    /// [`Self::requires_clauses`] and [`Self::env_constrains_clauses`] by
+    /// the encoder, and with the assignment trail by lazy sync.
+    decide_queue: DecideQueue,
+
     #[cfg(feature = "diagnostics")]
     propagation_counters: PropagationCounters,
 }
@@ -374,6 +387,8 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             prefix_spent: 0,
             prefix_cumulative_budget: 0,
             name_activity: Default::default(),
+            max_activity: 0.0,
+            decide_queue: Default::default(),
             #[cfg(feature = "diagnostics")]
             propagation_counters: Default::default(),
         }
@@ -1084,7 +1099,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ///    with the least amount of possible candidates requires less
     ///    backtracking to determine unsatisfiability than a requirement with
     ///    more possible candidates.
-    fn decide(&mut self) -> Option<(VariableId, VariableId, ClauseId)> {
+    ///
+    /// The selection is computed incrementally by [`Self::decide`] using the
+    /// [`DecideQueue`]; this reference implementation is the original full
+    /// rescan, kept as a debug-build oracle: debug builds assert that the
+    /// incremental result matches it on every call.
+    #[cfg(debug_assertions)]
+    fn decide_reference(&self) -> Option<(VariableId, VariableId, ClauseId)> {
         struct PossibleDecision {
             /// The activity of the package that is selected
             package_activity: f32,
@@ -1433,6 +1454,285 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
+        // Could not find a requirement that needs satisfying.
+        best_decision.map(
+            |PossibleDecision {
+                 decision: (candidate, required_by, via),
+                 ..
+             }| { (candidate, required_by, via) },
+        )
+    }
+
+    /// Selects the next decision incrementally. See [`Self::decide_reference`]
+    /// for the heuristics; this method computes the identical result by
+    /// folding the same replacement rule over only the *eligible* clauses
+    /// (parent installed, condition met, clause unsatisfied), iterated in
+    /// the original scan order by the [`DecideQueue`].
+    ///
+    /// Two facts allow the fold to stop early without changing the result:
+    /// a fold step only ever replaces the current best with a strictly
+    /// higher package activity AND a strictly lower candidate count, so the
+    /// rest of the queue is irrelevant as soon as the best has a candidate
+    /// count of 1 or an activity equal to the global maximum; and once the
+    /// best decision is an explicit requirement, only other explicit
+    /// requirements (clauses with the root as parent) can replace it.
+    fn decide(&mut self) -> Option<(VariableId, VariableId, ClauseId)> {
+        struct PossibleDecision {
+            package_activity: f32,
+            is_explicit_requirement: bool,
+            candidate_count: u32,
+            decision: (VariableId, VariableId, ClauseId),
+        }
+
+        let provider = self.cache.provider();
+        let state = &mut self.state;
+        state.decide_queue.sync(&mut state.decision_tracker);
+
+        // The key ranges that hold explicit requirements (root-parent
+        // clauses) in the two queue segments, for the explicit fast path.
+        let root_requires_range = state
+            .requires_clauses
+            .get_index_of(&VariableId::root())
+            .map(|pos| {
+                (
+                    decide_queue::requires_segment_start(pos),
+                    decide_queue::requires_segment_end(pos),
+                )
+            });
+        let root_env_range = state
+            .env_constrains_clauses
+            .get_index_of(&VariableId::root())
+            .map(|pos| {
+                (
+                    decide_queue::env_segment_start(pos),
+                    decide_queue::env_segment_end(pos),
+                )
+            });
+
+        let mut best_decision: Option<PossibleDecision> = None;
+        let mut cursor: Option<u64> = None;
+        loop {
+            // Stop as soon as no remaining item could replace the best.
+            if let Some(best) = &best_decision {
+                if best.candidate_count <= 1 || best.package_activity >= state.max_activity {
+                    break;
+                }
+            }
+
+            let Some((key, item_id)) = state.decide_queue.next_after(cursor) else {
+                break;
+            };
+            cursor = Some(key);
+
+            if let Some(best) = &best_decision {
+                if best.is_explicit_requirement {
+                    // Only explicit items can replace an explicit best;
+                    // jump to the root's env-constrains entries (the only
+                    // explicit items left after the root's requires
+                    // entries) or stop.
+                    let in_root_requires =
+                        root_requires_range.is_some_and(|(start, end)| key >= start && key <= end);
+                    let in_root_env =
+                        root_env_range.is_some_and(|(start, end)| key >= start && key <= end);
+                    if !in_root_requires && !in_root_env {
+                        match root_env_range {
+                            Some((start, _)) if key < start => {
+                                cursor = Some(start - 1);
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+
+            let item = state.decide_queue.item(item_id);
+            let parent = item.parent;
+            let clause_id = item.clause_id;
+            let kind = item.kind;
+
+            // Consider only clauses whose parent we have decided to install.
+            if state.decision_tracker.assigned_value(parent) != Some(true) {
+                state.decide_queue.unqueue(item_id);
+                continue;
+            }
+
+            let is_explicit_requirement = parent == VariableId::root();
+            let (candidate, candidate_count, package_activity) = match kind {
+                DecideItemKind::Requires {
+                    requirement,
+                    condition,
+                } => {
+                    // If the clause has a condition that is not yet
+                    // satisfied we need to skip it.
+                    if let Some(condition) = condition {
+                        let literals = &state.disjunctions[condition].literals;
+                        if !literals
+                            .iter()
+                            .all(|c| c.eval(state.decision_tracker.map()) == Some(false))
+                        {
+                            state.decide_queue.unqueue(item_id);
+                            continue;
+                        }
+                    }
+
+                    match state.decide_queue.eval_requirement(
+                        requirement,
+                        &state.requirement_to_sorted_candidates,
+                        provider,
+                        &state.decision_tracker,
+                    ) {
+                        ReqState::Satisfied { .. } => {
+                            // A candidate is already true: the clause needs
+                            // no decision. The queue re-inserts the item
+                            // when the satisfying assignment is undone.
+                            state.decide_queue.unqueue(item_id);
+                            continue;
+                        }
+                        ReqState::AllFalse => {
+                            unreachable!(
+                                "when we get here it means that all candidates have been assigned false. This should not be able to happen at this point because during propagation the solvable should have been assigned false as well."
+                            )
+                        }
+                        ReqState::Frontier {
+                            candidate,
+                            version_set,
+                            count,
+                        } => {
+                            let package_activity = state
+                                .name_activity
+                                .get(provider.version_set_name(version_set));
+                            (candidate, count, package_activity)
+                        }
+                    }
+                }
+                DecideItemKind::EnvConstrains { env_constrains_id } => {
+                    let EnvConstrainsClause {
+                        absent_var,
+                        matches_var,
+                        version_set,
+                        ..
+                    } = state.env_constrains[env_constrains_id];
+
+                    // Ordered candidates: absent first, then matches (the
+                    // split policy of the original env-constrains pass).
+                    let mut satisfied = false;
+                    let mut frontier: Option<(VariableId, u32)> = None;
+                    for candidate in absent_var.into_iter().chain([matches_var]) {
+                        match state.decision_tracker.assigned_value(candidate) {
+                            Some(true) => {
+                                satisfied = true;
+                                break;
+                            }
+                            Some(false) => {}
+                            None => match &mut frontier {
+                                Some((_, count)) => *count += 1,
+                                None => frontier = Some((candidate, 1)),
+                            },
+                        }
+                    }
+                    if satisfied {
+                        state.decide_queue.unqueue(item_id);
+                        continue;
+                    }
+                    let Some((candidate, count)) = frontier else {
+                        unreachable!(
+                            "all env_constrains candidates assigned false; \
+                             propagation should have caught this"
+                        )
+                    };
+                    let package_activity = state
+                        .name_activity
+                        .get(provider.version_set_name(version_set));
+                    (candidate, count, package_activity)
+                }
+            };
+
+            // The exact replacement rule of the reference scan.
+            let decision = (candidate, parent, clause_id);
+            best_decision = Some(match &best_decision {
+                None => PossibleDecision {
+                    is_explicit_requirement,
+                    package_activity,
+                    candidate_count,
+                    decision,
+                },
+                Some(best_decision) => {
+                    if best_decision.is_explicit_requirement && !is_explicit_requirement {
+                        continue;
+                    }
+                    if best_decision.package_activity >= package_activity {
+                        continue;
+                    }
+                    if best_decision.candidate_count <= candidate_count {
+                        continue;
+                    }
+                    PossibleDecision {
+                        is_explicit_requirement,
+                        package_activity,
+                        candidate_count,
+                        decision,
+                    }
+                }
+            });
+        }
+
+        // Finally, make progress on blocking clauses (universal solving
+        // only; the list is empty in a plain solve). A blocking clause is a
+        // disjunction of signed environment literals. Watches alone do not
+        // guarantee that the undecided-counts-as-false completion of a
+        // solution satisfies a clause with two or more positive literals
+        // (all of them can simply stay undecided), which would let the
+        // enumeration loop rediscover an already-blocked cell and break the
+        // disjointness-repair invariant. Whenever nothing else is left to
+        // decide and a blocking clause is not yet satisfied under the
+        // completion, decide its first undecided positive literal to true.
+        if best_decision.is_none() {
+            'blocking: for &(env_clause_id, clause_id) in &state.blocking_clauses {
+                debug_assert_eq!(
+                    state.env_clauses[env_clause_id].kind,
+                    EnvClauseKind::Blocking,
+                    "only blocking clauses are registered for decide()"
+                );
+                let literals = &state.env_clauses[env_clause_id].literals;
+                if literals.len() <= 1 {
+                    // Single-literal blocking clauses are assertions, applied
+                    // during propagation.
+                    continue;
+                }
+
+                let mut first_undecided_positive = None;
+                for &literal in literals {
+                    let assigned = state.decision_tracker.assigned_value(literal.variable());
+                    // The literal's value under the undecided-counts-as-false
+                    // completion: an undecided variable evaluates positive
+                    // literals to false and negative literals to true.
+                    let completed =
+                        assigned.map_or(literal.negate(), |value| value != literal.negate());
+                    if completed {
+                        // The clause is already satisfied under completion.
+                        continue 'blocking;
+                    }
+                    if !literal.negate() && assigned.is_none() && first_undecided_positive.is_none()
+                    {
+                        first_undecided_positive = Some(literal.variable());
+                    }
+                }
+
+                let candidate = first_undecided_positive.expect(
+                    "an unsatisfied blocking clause must have an undecided positive literal; \
+                     a fully-false clause would have conflicted during propagation",
+                );
+                best_decision = Some(PossibleDecision {
+                    is_explicit_requirement: false,
+                    package_activity: 0.0,
+                    candidate_count: 1,
+                    decision: (candidate, VariableId::root(), clause_id),
+                });
+                break;
+            }
+        }
+
         if let Some(PossibleDecision {
             candidate_count,
             package_activity,
@@ -1450,13 +1750,23 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             );
         }
 
-        // Could not find a requirement that needs satisfying.
-        best_decision.map(
+        let decision = best_decision.map(
             |PossibleDecision {
                  decision: (candidate, required_by, via),
                  ..
              }| { (candidate, required_by, via) },
-        )
+        );
+
+        // In debug builds, cross-check the incremental selection against
+        // the original full rescan on every call.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            decision,
+            self.decide_reference(),
+            "incremental decide() diverged from the reference scan"
+        );
+
+        decision
     }
 
     /// Executes one iteration of the CDCL loop
@@ -2184,10 +2494,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .as_solvable(&self.state.variable_map)
                 .map(|s| self.provider().solvable_name(s));
             if let Some(name_id) = name_id {
-                let activity = self.state.name_activity.get(name_id);
-                self.state
-                    .name_activity
-                    .set(name_id, activity + self.activity_add);
+                let activity = self.state.name_activity.get(name_id) + self.activity_add;
+                self.state.name_activity.set(name_id, activity);
+                // Keep the global maximum in lockstep so that decide() can
+                // stop scanning early (see `SolverState::max_activity`).
+                self.state.max_activity = self.state.max_activity.max(activity);
             }
         }
 
@@ -2234,6 +2545,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.name_activity.for_each_mut(|activity| {
             *activity *= self.activity_decay;
         });
+        // The decay is uniform, so the maximum scales by the same factor.
+        // The multiplication is the identical f32 operation applied to the
+        // identical value, so the tracked maximum stays bit-exact with the
+        // largest stored activity.
+        self.state.max_activity *= self.activity_decay;
     }
 }
 

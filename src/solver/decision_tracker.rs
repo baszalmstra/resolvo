@@ -143,7 +143,11 @@ mod tests {
     use crate::DenseIndex;
 
     fn decision(index: usize, value: bool) -> Decision {
-        Decision::new(VariableId::from_index(index), value, ClauseId::install_root())
+        Decision::new(
+            VariableId::from_index(index),
+            value,
+            ClauseId::install_root(),
+        )
     }
 
     #[test]
@@ -152,7 +156,9 @@ mod tests {
         assert_eq!(tracker.take_sync_floor(), 0);
 
         for i in 1..=4 {
-            tracker.try_add_decision(decision(i, true), i as u32).unwrap();
+            tracker
+                .try_add_decision(decision(i, true), i as u32)
+                .unwrap();
         }
         // Nothing was undone: the floor is the previous snapshot point.
         assert_eq!(tracker.take_sync_floor(), 0);
