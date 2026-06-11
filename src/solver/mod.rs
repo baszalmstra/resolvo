@@ -356,6 +356,11 @@ pub(crate) struct PropagationCounters {
     pub unwatched_calls_by_type: PropagationVisitsByType,
     pub propagate_calls: u64,
     pub conflicts: u64,
+    /// For each recorded cell of a universal solve, the number of decisions
+    /// propagated while solving that cell (the delta of
+    /// [`Self::decisions_propagated`] between cell recordings). Empty for a
+    /// plain solve.
+    pub cell_decisions: Vec<u64>,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -561,7 +566,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         assert_eq!(root_clause, ClauseId::install_root());
 
         assert!(
-            self.run_sat(SolvableIdOrRoot::root(), &root_dependencies)?,
+            self.run_sat(SolvableIdOrRoot::root(), &root_dependencies, 0)?,
             "bug: Since root is the first requested solvable, \
                   should have returned Err instead of Ok(false) if root is unsolvable"
         );
@@ -575,7 +580,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .assigned_value(additional_var)
                 .is_none()
             {
-                self.run_sat(additional.into(), &root_dependencies)?;
+                // The solution found so far is prior state: an unsolvable
+                // soft requirement reports `Ok(false)` and is left out.
+                let starting_level = self.state.decision_tracker.deepest_level();
+                self.run_sat(additional.into(), &root_dependencies, starting_level)?;
             }
         }
 
@@ -608,11 +616,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ///
     /// The solver loop can be found in [`Solver::resolve_dependencies`].
     ///
+    /// `starting_level` declares which part of the pre-existing decision
+    /// stack the caller wants preserved: everything at levels
+    /// `1..=starting_level` is prior state that the search must not destroy
+    /// (the previous solution under a soft requirement, or the assumption
+    /// decisions of a seeded universal cell), while decisions above it are
+    /// restartable scratch state (a trail prefix kept from a previous
+    /// universal cell, see `docs/design/universal-trail-reuse.md`) that
+    /// conflicts and resets may undo.
+    ///
     /// Returns `Ok(true)` if a solution was found for `solvable`. If a solution
-    /// was not found, returns `Ok(false)` if some decisions have already
-    /// been made by the solver (i.e. the decision tracker stack is not
-    /// empty). Otherwise, returns [`UnsolvableOrCancelled::Unsolvable`] as
-    /// an `Err` on no solution.
+    /// was not found, returns `Ok(false)` if `starting_level > 0` (the
+    /// problem is unsolvable on top of the preserved prior decisions).
+    /// Otherwise, returns [`UnsolvableOrCancelled::Unsolvable`] as an `Err`
+    /// on no solution.
     ///
     /// If the solution process is cancelled (see
     /// [`DependencyProvider::should_cancel_with_value`]),
@@ -621,16 +638,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         root_solvable: SolvableIdOrRoot<D::SolvableId>,
         root_deps: &Dependencies,
+        starting_level: u32,
     ) -> Result<bool, UnsolvableOrCancelled> {
-        let starting_level = self
-            .state
-            .decision_tracker
-            .stack()
-            .next_back()
-            .map(|decision| self.state.decision_tracker.level(decision.variable))
-            .unwrap_or(0);
-
-        let mut level = starting_level;
+        let mut level = self.state.decision_tracker.deepest_level();
+        debug_assert!(
+            level >= starting_level,
+            "bug: the preserved decisions must be on the stack when entering run_sat"
+        );
         let mut new_solvables: Vec<(VariableId, ClauseId)> = Vec::new();
         let mut solvable_ids: Vec<SolvableIdOrRoot<D::SolvableId>> = Vec::new();
 
@@ -745,7 +759,6 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         self.state.assumption_levels > 0,
                         "bug: an assumption conflict was reported without active assumptions"
                     );
-                    debug_assert_eq!(starting_level, self.state.assumption_levels);
                     self.state.decision_tracker.undo_until(starting_level);
                     return Ok(false);
                 }
@@ -2121,12 +2134,14 @@ impl<D: DependencyProvider> SolverState<D> {
     /// of signed environment literals) and register it for propagation.
     ///
     /// A clause with two or more literals participates in watching like any
-    /// other clause; the initial watches are the first and last literal, so
-    /// this must only be called when the decision tracker holds no decisions
-    /// on the involved variables (model clauses are added before the first
-    /// solve, blocking clauses after `undo_until(0)`). A single-literal
-    /// clause is an assertion that is (re-)applied on every propagation
-    /// round, mirroring single-literal learnt clauses.
+    /// other clause. The clause may be added under a partial trail (a
+    /// blocking clause after trail-prefix retraction): the watches are
+    /// chosen among the literals that are not false under the current
+    /// assignment, and a clause that is unit under the trail propagates its
+    /// remaining literal immediately, mirroring clause learning. The caller
+    /// must retract the trail far enough that at least one literal is not
+    /// false. A single-literal clause is an assertion that is (re-)applied
+    /// on every propagation round, mirroring single-literal learnt clauses.
     pub(crate) fn add_env_clause(
         &mut self,
         mut literals: Vec<Literal>,
@@ -2140,7 +2155,7 @@ impl<D: DependencyProvider> SolverState<D> {
 
         // Defensively drop exact duplicate literals (a caller-supplied model
         // disjunction may repeat a literal) while preserving order; the watch
-        // initialization below assumes the first and last literal differ.
+        // initialization below assumes the watched literals differ.
         let mut deduped = Vec::with_capacity(literals.len());
         for literal in literals.drain(..) {
             if !deduped.contains(&literal) {
@@ -2152,15 +2167,31 @@ impl<D: DependencyProvider> SolverState<D> {
             literals: deduped,
             kind,
         });
-        let (watched_literals, clause_kind) = WatchedLiterals::env_clause::<D::NameId>(
+        let (watched_literals, clause_kind, assertion) = WatchedLiterals::env_clause::<D::NameId>(
             env_clause_id,
             &self.env_clauses[env_clause_id].literals,
+            &self.decision_tracker,
         );
         let clause_id = self.add_clause(watched_literals, clause_kind);
         self.env_clause_ids.push(clause_id);
         if kind == EnvClauseKind::Blocking {
             self.blocking_clauses.push((env_clause_id, clause_id));
         }
+
+        // Propagate a clause that is unit under the current trail right away
+        // (the next propagation round picks the decision up from the stack).
+        // The assignment must succeed: the asserted literal is unassigned by
+        // construction.
+        if let Some(literal) = assertion {
+            let level = self.decision_tracker.deepest_level();
+            self.decision_tracker
+                .try_add_decision(
+                    Decision::new(literal.variable(), literal.satisfying_value(), clause_id),
+                    level,
+                )
+                .expect("bug: the unit literal of an environment clause is unassigned");
+        }
+
         clause_id
     }
 

@@ -369,20 +369,60 @@ impl<N: SolverId> Clause<N> {
     /// Build an env model/blocking clause from a payload that has already
     /// been allocated in the side arena. Mirrors [`Clause::learnt`]: a
     /// single-literal clause is an assertion and gets no watches.
+    ///
+    /// Returns `(clause, watched_literals, assertion)`.
+    ///
+    /// The clause may be added under a partial trail (a blocking clause after
+    /// trail-prefix retraction, see `docs/design/universal-trail-reuse.md`),
+    /// so the watches are chosen among the literals that are not false under
+    /// the current assignment: the first and the last such literal (on an
+    /// empty trail this degenerates to the first and last literal). When
+    /// exactly one literal is non-false the clause is unit (or already
+    /// satisfied): the second watch falls back to the deepest false literal,
+    /// and the unit literal is returned as `assertion` so the caller can
+    /// propagate it immediately, mirroring clause learning.
+    ///
+    /// The caller must guarantee at least one non-false literal by retracting
+    /// the trail far enough before adding the clause.
     fn env_clause(
         env_clause_id: EnvClauseId,
         literals: &[Literal],
-    ) -> (Self, Option<[Literal; 2]>) {
+        decision_tracker: &DecisionTracker,
+    ) -> (Self, Option<[Literal; 2]>, Option<Literal>) {
         debug_assert!(!literals.is_empty());
-        (
-            Clause::EnvClause(env_clause_id),
-            if literals.len() == 1 {
-                // No need for watches, this is an assertion.
-                None
-            } else {
-                Some([*literals.first().unwrap(), *literals.last().unwrap()])
-            },
-        )
+        let kind = Clause::EnvClause(env_clause_id);
+        if literals.len() == 1 {
+            // No need for watches, this is an assertion.
+            return (kind, None, None);
+        }
+
+        let decision_map = decision_tracker.map();
+        let non_false = |literal: &&Literal| literal.eval(decision_map) != Some(false);
+        let first = literals
+            .iter()
+            .position(|l| non_false(&l))
+            .expect("an environment clause must have a non-false literal when added");
+        let last = literals
+            .iter()
+            .rposition(|l| non_false(&l))
+            .expect("a non-false literal was found scanning forward");
+        if first != last {
+            return (kind, Some([literals[first], literals[last]]), None);
+        }
+
+        // Exactly one non-false literal: watch it together with the deepest
+        // false literal and report it for immediate propagation (skipped by
+        // the caller when it is already true).
+        let unit = literals[first];
+        let deepest_false = literals
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != first)
+            .max_by_key(|&(_, literal)| decision_tracker.level(literal.variable()))
+            .map(|(_, &literal)| literal)
+            .expect("the clause has at least two literals");
+        let assertion = unit.eval(decision_map).is_none().then_some(unit);
+        (kind, Some([unit, deepest_false]), assertion)
     }
 
     /// Build an `EnvConstrains` clause from a payload that has already been
@@ -693,13 +733,22 @@ impl WatchedLiterals {
     ///
     /// A single-literal clause is an assertion: it gets no watches and must
     /// be applied during propagation (see `Solver::decide_env_assertions`),
-    /// exactly like a single-literal learnt clause.
+    /// exactly like a single-literal learnt clause. A multi-literal clause
+    /// watches two non-false literals; the returned literal, if any, is unit
+    /// under the current trail and must be propagated by the caller (see
+    /// [`Clause::env_clause`]).
     pub fn env_clause<N: SolverId>(
         env_clause_id: EnvClauseId,
         literals: &[Literal],
-    ) -> (Option<Self>, Clause<N>) {
-        let (kind, watched_literals) = Clause::env_clause(env_clause_id, literals);
-        (Self::from_kind_and_initial_watches(watched_literals), kind)
+        decision_tracker: &DecisionTracker,
+    ) -> (Option<Self>, Clause<N>, Option<Literal>) {
+        let (kind, watched_literals, assertion) =
+            Clause::env_clause(env_clause_id, literals, decision_tracker);
+        (
+            Self::from_kind_and_initial_watches(watched_literals),
+            kind,
+            assertion,
+        )
     }
 
     /// Construct an `EnvConstrains` clause from a payload that has already

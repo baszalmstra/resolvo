@@ -1674,7 +1674,7 @@ fn test_universal_candidate_split_generalization() {
     assert_snapshot!(result, @r"
     cell: glibc in >=228, <1000
       pkg=2
-    cell: glibc in >=217, <1000 AND not (glibc in >=228, <1000)
+    cell: not (glibc in >=228, <1000) AND glibc in >=217, <1000
       pkg=1
     ");
 }
@@ -1692,7 +1692,7 @@ fn test_universal_constrains_split_unsolvable_gap() {
     provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
 
     let result = universal_solve_snapshot(provider, &["a"], &[&["cuda absent", "cuda 10..100"]]);
-    assert_snapshot!(result, @"unsolvable in cell: not (cuda absent) AND cuda in >=10, <100 AND not (cuda in >=11, <100)");
+    assert_snapshot!(result, @"unsolvable in cell: cuda in >=10, <100 AND not (cuda in >=11, <100) AND not (cuda absent)");
 }
 
 /// Scenario (d): non-fragmentation. An environment package that is declared
@@ -1722,7 +1722,7 @@ fn test_universal_unsolvable_region() {
     provider.add_package("a", Pack::new(1), &["glibc 228..1000"], &[]);
 
     let result = universal_solve_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
-    assert_snapshot!(result, @"unsolvable in cell: glibc in >=217, <228 AND not (glibc in >=228, <1000)");
+    assert_snapshot!(result, @"unsolvable in cell: not (glibc in >=228, <1000) AND glibc in >=217, <228");
 }
 
 /// Two independent conditional dependencies on different environment
@@ -1833,8 +1833,12 @@ fn test_universal_cancellation() {
 /// `(not L_cuda or not L_rocm)` and the baseline solution has
 /// `L_rocm = true` (model assertion) and `L_cuda` undecided: the clause is
 /// supported by `not L_cuda` ALONE. The rocm literal must not be recorded
-/// (its complement is false and contributes nothing); recording it would
-/// claim the solution is valid where rocm does not match, which is wrong.
+/// NEGATIVELY (its complement is false and contributes nothing); recording
+/// it would claim the solution is valid where rocm does not match, which is
+/// wrong. In the second cell the condition holds and `b` is installed, so
+/// both guards are recorded POSITIVELY (the rocm pin is redundant within
+/// this model, but keeps the cell a faithful record of the guards the
+/// solution relied on).
 #[test]
 fn test_universal_and_condition_with_forced_literal() {
     let mut provider = BundleBoxProvider::new();
@@ -1852,7 +1856,7 @@ fn test_universal_and_condition_with_forced_literal() {
     assert_snapshot!(result, @r"
     cell: not (cuda in >=11, <100)
       a=1
-    cell: cuda in >=11, <100
+    cell: rocm in >=5, <100 AND cuda in >=11, <100
       a=1
       b=1
     ");
@@ -2388,7 +2392,7 @@ fn test_universal_seed_reproduces_candidate_split_partition() {
     assert_snapshot!(format_universal_result(&solver, &Ok(second)), @r"
     cell: glibc in >=228, <1000
       pkg=2
-    cell: glibc in >=217, <1000 AND not (glibc in >=228, <1000)
+    cell: not (glibc in >=228, <1000) AND glibc in >=217, <1000
       pkg=1
     ");
 }
@@ -2684,7 +2688,7 @@ fn test_m5_conflict_display_requires_env_package() {
 
     let result = universal_failure_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
     assert_snapshot!(result, @r"
-    cell: glibc in >=217, <228 AND not (glibc in >=228, <1000)
+    cell: not (glibc in >=228, <1000) AND glibc in >=217, <228
     The following packages are incompatible
     └─ a * cannot be installed because there are no viable options:
        └─ a 1 would require
@@ -2732,7 +2736,7 @@ fn test_m5_conflict_display_env_constrains_scoped() {
 
     let result = universal_failure_snapshot(provider, &["a"], &[&["cuda absent", "cuda 10..100"]]);
     assert_snapshot!(result, @r"
-    cell: not (cuda absent) AND cuda in >=10, <100 AND not (cuda in >=11, <100)
+    cell: cuda in >=10, <100 AND not (cuda in >=11, <100) AND not (cuda absent)
     The following packages are incompatible
     └─ a * cannot be installed because there are no viable options:
        └─ a 1 would constrain
@@ -2987,4 +2991,109 @@ fn test_snapshot_environment_serde_roundtrip() {
             VersionSetRelation::Superset,
         )]
     );
+}
+
+// ===========================================================================
+// Trail-prefix preservation across universal cells
+// (docs/design/universal-trail-reuse.md)
+// ===========================================================================
+
+/// After recording a cell, the solver retracts the trail only far enough
+/// that the new blocking clause is no longer falsified and continues from
+/// the surviving prefix. The environment-independent part of the solution
+/// (the chain below `a`) is decided once and reused, so the second cell
+/// propagates strictly fewer decisions than the first.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_trail_reuse_second_cell_decides_less() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["c1", "b 1..2; if cuda 11..100"], &[]);
+    for i in 1..10 {
+        let name = format!("c{i}");
+        let dep = format!("c{}", i + 1);
+        provider.add_package(&name, Pack::new(1), &[dep.as_str()], &[]);
+    }
+    provider.add_package("c10", Pack::new(1), &[], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(UniversalProblem::new().requirements(requirements))
+        .expect("solvable");
+    solution.verify(solver.provider()).unwrap();
+
+    let cell_decisions = solver.universal_cell_decisions();
+    assert_eq!(
+        cell_decisions.len(),
+        solution.cells.len(),
+        "one counter entry per recorded cell"
+    );
+    assert_eq!(
+        cell_decisions.len(),
+        2,
+        "the conditional dependency splits the space in two"
+    );
+    assert!(
+        cell_decisions[1] < cell_decisions[0],
+        "the second cell must reuse the kept trail prefix and decide strictly \
+         fewer variables than the first (got {cell_decisions:?})"
+    );
+}
+
+/// A cell whose condition is a single literal (assigned mid-trail by the
+/// requires clause of `a=2`): the blocking clause is a single-literal
+/// assertion. After the partial retraction it must propagate immediately and
+/// flip the literal, steering the next solve to `a=1` instead of
+/// rediscovering the blocked cell (which would break the disjointness-repair
+/// invariant and loop forever).
+#[test]
+fn test_universal_trail_reuse_unit_blocking_clause_flips_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("a", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    cell: cuda in >=11, <100
+      a=2
+    cell: not (cuda in >=11, <100)
+      a=1
+    ");
+}
+
+/// A blocking clause that forces a different build of a package decided in
+/// the kept prefix: enumerating the cross product of two env-dependent
+/// version choices eventually requires flipping the cuda literal while `x=2`
+/// (which requires it) sits in the kept prefix. The conflict must backjump
+/// through the prefix like through any ordinary decision (the prefix is NOT
+/// an assumption), re-deciding `x=1`; the enumeration completes with a full
+/// disjoint cover instead of reporting unsolvable.
+#[test]
+fn test_universal_trail_reuse_conflict_backjumps_through_prefix() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package("x", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("x", Pack::new(1), &[], &[]);
+    provider.add_package("y", Pack::new(2), &["rocm 5..100"], &[]);
+    provider.add_package("y", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["x", "y"], &[]);
+    assert_snapshot!(result, @r"
+    cell: cuda in >=11, <100 AND rocm in >=5, <100
+      x=2
+      y=2
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <100)
+      x=2
+      y=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <100
+      x=1
+      y=2
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <100)
+      x=1
+      y=1
+    ");
 }

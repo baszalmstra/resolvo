@@ -38,6 +38,15 @@ impl DecisionTracker {
         self.map.level(variable_id)
     }
 
+    /// The decision level of the deepest decision on the stack, or 0 when no
+    /// decisions have been made.
+    pub(crate) fn deepest_level(&self) -> u32 {
+        self.stack
+            .last()
+            .map(|decision| self.map.level(decision.variable))
+            .unwrap_or(0)
+    }
+
     // Find the clause that caused the assignment of the specified solvable. If no assignment has
     // been made to the solvable than `None` is returned.
     pub(crate) fn find_clause_for_assignment(&self, variable_id: VariableId) -> Option<ClauseId> {

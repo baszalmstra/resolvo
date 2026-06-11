@@ -672,6 +672,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // the seeds run out the loop continues as free enumeration.
         let mut pending_seeds = problem.seed_partition.into_iter();
 
+        // Snapshot of the propagated-decision counter at the previous cell
+        // recording, used to attribute propagation work to individual cells.
+        #[cfg(feature = "diagnostics")]
+        let mut decisions_at_last_cell = 0u64;
+
         loop {
             // Set up the assumptions of the next viable seed, if any remain.
             // Seeds that contribute no assumptions are skipped: an empty
@@ -686,7 +691,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 seeded = self.push_seed_assumptions(&seed)?;
             }
 
-            match self.run_sat(SolvableIdOrRoot::root(), &root_dependencies) {
+            // Assumption decisions of a seeded cell are preserved prior
+            // state (unsolvable surfaces as `Ok(false)`); a trail prefix
+            // kept by the free phase is restartable scratch state above
+            // `starting_level = 0`.
+            match self.run_sat(
+                SolvableIdOrRoot::root(),
+                &root_dependencies,
+                self.state.assumption_levels,
+            ) {
                 Ok(true) => {
                     // Extract the load-bearing environment literal
                     // assignments and restore provable disjointness against
@@ -706,11 +719,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     cell_edges.push(self.capture_cell_edges());
                     cell_assignments.push(cell.clone());
 
-                    // Retract all decisions (assumptions included) before
-                    // adding the blocking clause so that its watch
-                    // initialization sees no decisions.
-                    self.state.assumption_levels = 0;
-                    self.state.decision_tracker.undo_until(0);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let total = self.state.propagation_counters.decisions_propagated;
+                        self.state
+                            .propagation_counters
+                            .cell_decisions
+                            .push(total - decisions_at_last_cell);
+                        decisions_at_last_cell = total;
+                    }
 
                     if cell_is_empty {
                         // No environment literal was load bearing: the
@@ -719,6 +736,23 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         // cell; the repair step extends any later cell.)
                         break;
                     }
+
+                    // Retract the trail only as far as needed for the new
+                    // blocking clause to no longer be falsified, and continue
+                    // the next solve from the surviving prefix (trail-prefix
+                    // preservation, see docs/design/universal-trail-reuse.md).
+                    // The kept prefix is ordinary backtrackable state, not an
+                    // assumption: later conflicts may backjump through it. A
+                    // seeded cell still retracts fully: its trail starts with
+                    // assumption decisions, which must never leak into the
+                    // next solve.
+                    let retract_target = if self.state.assumption_levels > 0 {
+                        0
+                    } else {
+                        self.blocking_clause_retract_target(&cell)
+                    };
+                    self.state.assumption_levels = 0;
+                    self.state.decision_tracker.undo_until(retract_target);
 
                     // Block the recorded cell: the disjunction of the
                     // negations of the cell's signed literals. A cell literal
@@ -799,6 +833,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         })
     }
 
+    /// Returns, for each cell recorded by the last [`Self::solve_universal`]
+    /// call, the number of decisions propagated while solving that cell.
+    ///
+    /// This is a diagnostics-only observation point: tests use it to verify
+    /// that trail-prefix preservation makes later cells cheaper than a
+    /// restart-from-scratch enumeration would.
+    #[cfg(feature = "diagnostics")]
+    pub fn universal_cell_decisions(&self) -> &[u64] {
+        &self.state.propagation_counters.cell_decisions
+    }
+
     /// Performs a scoped re-solve to produce a conflict that is tightly
     /// bound to the witness region identified by `witness`.
     ///
@@ -837,7 +882,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
         // Re-solve. The formula is UNSAT in this region, so we expect an
         // Unsolvable result.
-        match self.run_sat(SolvableIdOrRoot::root(), root_dependencies) {
+        match self.run_sat(SolvableIdOrRoot::root(), root_dependencies, 0) {
             Err(UnsolvableOrCancelled::Unsolvable(scoped)) => scoped,
             // Unexpected: fall back to the unscoped conflict.
             _ => fallback,
@@ -1198,6 +1243,31 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         }
                     }
                     if satisfied {
+                        // A conditional clause whose condition HOLDS shaped
+                        // the solution: the installed candidate is only
+                        // required where the condition's env guards are true,
+                        // so those guards are load bearing and must pin the
+                        // cell. Without this, a candidate installed under a
+                        // kept trail prefix (trail-prefix preservation) could
+                        // be claimed by a cell that extends into regions
+                        // where its guard is false: still a valid solution,
+                        // but needlessly installed there and not reproducible
+                        // by a from-scratch re-solve of the cell.
+                        if let Some(disjunction) = disjunction {
+                            let literals = &state.disjunctions[disjunction].literals;
+                            let condition_holds = literals.iter().all(|literal| {
+                                !literal.eval(decision_map).unwrap_or(literal.negate())
+                            });
+                            if condition_holds {
+                                for literal in literals {
+                                    if is_env_variable(state, literal.variable()) {
+                                        // The complement literal is false, so
+                                        // the guard variable is assigned true.
+                                        record(&mut cell, literal.variable(), true);
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -1235,14 +1305,26 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // and must still be recorded (soundness critical: a later
                     // environment where `L` is true would activate the
                     // requirement, which this solution does not satisfy).
-                    // Env literals that are assigned TRUE must not be
-                    // recorded: their complement is false and contributes
-                    // nothing (e.g. an AND condition where another clause
-                    // forces one of the literals true).
+                    // Env literals that are assigned TRUE cannot carry the
+                    // support: their complement is false (e.g. an AND
+                    // condition where another clause forces one of the
+                    // literals true). Skipping one is itself a choice
+                    // conditioned on its truth, so the skipped literal is
+                    // recorded POSITIVELY: without that pin, a re-solve of
+                    // the cell under its own condition (where the skipped
+                    // variable is unassigned) would pick the skipped literal
+                    // as support and extract a different cell. Recording a
+                    // true literal only shrinks the cell, so this is always
+                    // sound.
                     let supporting = literals.iter().find(|literal| {
-                        is_env_variable(state, literal.variable())
-                            && state.decision_tracker.assigned_value(literal.variable())
-                                != Some(true)
+                        if !is_env_variable(state, literal.variable()) {
+                            return false;
+                        }
+                        if state.decision_tracker.assigned_value(literal.variable()) == Some(true) {
+                            record(&mut cell, literal.variable(), true);
+                            return false;
+                        }
+                        true
                     });
                     let Some(literal) = supporting else {
                         debug_assert!(
@@ -1299,6 +1381,29 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         cell
     }
 
+    /// The level to retract the trail to before adding the blocking clause
+    /// for `cell`, chosen so that the clause has at least one non-false
+    /// literal under the surviving prefix (the soundness requirement of
+    /// trail-prefix preservation): one below the deepest assignment level
+    /// among the cell's literals.
+    ///
+    /// A cell literal may be undecided on the trail (extraction and repair
+    /// record undecided-counts-as-false literals). Its blocking literal is
+    /// then already non-false, the blocking clause is not falsified by the
+    /// full trail, and nothing needs to be retracted at all: `u32::MAX`
+    /// makes `undo_until` a no-op.
+    fn blocking_clause_retract_target(&self, cell: &[(VariableId, bool)]) -> u32 {
+        let tracker = &self.state.decision_tracker;
+        let mut deepest_falsified = 0;
+        for &(variable, value) in cell {
+            if tracker.assigned_value(variable) != Some(value) {
+                return u32::MAX;
+            }
+            deepest_falsified = deepest_falsified.max(tracker.level(variable));
+        }
+        deepest_falsified.saturating_sub(1)
+    }
+
     /// Restores provable pairwise disjointness between `cell` and every
     /// previously recorded cell (design doc 5.6, "disjointness repair").
     ///
@@ -1322,11 +1427,26 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 continue;
             }
 
-            let distinguishing = earlier.iter().find(|&&(variable, value)| {
+            let mut distinguishing = None;
+            for &(variable, value) in earlier {
                 let current = self.state.decision_tracker.assigned_value(variable) == Some(true);
-                current != value
-            });
-            let &(variable, value) = distinguishing.expect(
+                if current != value {
+                    distinguishing = Some((variable, value));
+                    break;
+                }
+                // The scan relied on this agreement to move past the
+                // literal, so the agreement must pin the cell: without it, a
+                // re-solve of the cell under its own condition (where the
+                // variable may be unassigned and disagree under the
+                // undecided-counts-as-false completion) would pick an
+                // earlier distinguishing literal and repair to a different
+                // cell. Recording a trail-consistent literal only shrinks
+                // the cell, so this is always sound.
+                if !cell.iter().any(|&(v, _)| v == variable) {
+                    cell.push((variable, current));
+                }
+            }
+            let (variable, value) = distinguishing.expect(
                 "bug: the earlier cell's blocking clause is satisfied by the current \
                  assignment, so a distinguishing literal must exist",
             );
@@ -1394,24 +1514,48 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Converts a cell in solver variable space to the public
     /// [`CellCondition`] representation via the variable origins.
     fn cell_to_condition(&self, cell: &[(VariableId, bool)]) -> CellCondition<D::NameId> {
-        CellCondition(
-            cell.iter()
-                .map(|&(variable, value)| {
-                    let literal = match self.state.variable_map.origin(variable) {
-                        VariableOrigin::EnvMatches(version_set) => EnvLiteral {
-                            package: self.provider().version_set_name(version_set),
-                            kind: EnvLiteralKind::Matches(version_set),
-                        },
-                        VariableOrigin::EnvAbsent(package) => EnvLiteral {
-                            package,
-                            kind: EnvLiteralKind::Absent,
-                        },
-                        _ => unreachable!("cell literals are always environment literal variables"),
-                    };
-                    (literal, value)
-                })
-                .collect(),
-        )
+        let mut literals: Vec<(EnvLiteral<D::NameId>, bool)> = cell
+            .iter()
+            .map(|&(variable, value)| {
+                let literal = match self.state.variable_map.origin(variable) {
+                    VariableOrigin::EnvMatches(version_set) => EnvLiteral {
+                        package: self.provider().version_set_name(version_set),
+                        kind: EnvLiteralKind::Matches(version_set),
+                    },
+                    VariableOrigin::EnvAbsent(package) => EnvLiteral {
+                        package,
+                        kind: EnvLiteralKind::Absent,
+                    },
+                    _ => unreachable!("cell literals are always environment literal variables"),
+                };
+                (literal, value)
+            })
+            .collect();
+
+        // Order the condition canonically: by version set id, with absent
+        // literals (ordered by package name) at the end. Cell extraction
+        // orders literals by solver variable id, which depends on interning
+        // order and therefore on the enumeration path: the same cell reached
+        // through different seed partitions would render differently. The
+        // ids used here come from the dependency provider and are stable
+        // across solves.
+        literals.sort_by(|(a, _), (b, _)| {
+            use std::cmp::Ordering;
+            match (&a.kind, &b.kind) {
+                (EnvLiteralKind::Matches(vs_a), EnvLiteralKind::Matches(vs_b)) => {
+                    vs_a.to_index().cmp(&vs_b.to_index())
+                }
+                (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent) => Ordering::Less,
+                (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => Ordering::Greater,
+                (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => self
+                    .provider()
+                    .display_name(a.package)
+                    .to_string()
+                    .cmp(&self.provider().display_name(b.package).to_string()),
+            }
+        });
+
+        CellCondition(literals)
     }
 
     /// Searches for an assignment of the environment literal variables that
