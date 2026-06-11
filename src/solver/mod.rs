@@ -210,6 +210,21 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// the activity scores of each package are multiplied when a conflict is
     /// detected.
     activity_decay: f32,
+
+    /// Conflicts a single `run_sat` call may accumulate before the
+    /// env-literals-last ordering is suspended for the rest of that run (see
+    /// [`SolverState::env_ordering_suspended`]). Defaults to
+    /// [`ENV_ORDERING_CONFLICT_LIMIT`]; overridable for tests and
+    /// experiments through [`Solver::set_env_ordering_conflict_limit`].
+    env_ordering_conflict_limit: u64,
+
+    /// Work multiple of the refutation switch's work-based co-trigger (see
+    /// [`ENV_ORDERING_WORK_FACTOR`]); overridable for experiments.
+    env_ordering_work_factor: u64,
+
+    /// Floor of the work-based co-trigger (see
+    /// [`ENV_ORDERING_WORK_FLOOR`]); overridable for experiments.
+    env_ordering_work_floor: u64,
 }
 
 type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
@@ -337,6 +352,96 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// solve never interns one, so its decision order is untouched.
     env_ordering_active: bool,
 
+    /// Conflicts handled by the current `run_sat` call (reset on entry).
+    /// Drives the refutation switch below.
+    run_conflicts: u64,
+
+    /// Whether the env-literals-last ordering is suspended for the rest of
+    /// the current `run_sat` call. The ordering is optimal for FINDING a
+    /// solution (env literals land on top of the trail, so cell transitions
+    /// retract almost nothing), but anti-optimal for REFUTATIONS: deferring
+    /// env-sensitive installs makes the search exhaust concrete subtrees
+    /// before it can reach the env contradictions that prune them. The
+    /// refutation switch (see
+    /// docs/design/universal-refutation-ordering.md) flips this flag in
+    /// two stages:
+    ///
+    /// - Stage 1 ([`Solver::learn_from_conflict`]): a run that accumulated
+    ///   [`ENV_ORDERING_CONFLICT_LIMIT`] conflicts falls back to the plain
+    ///   decision order but keeps its trail (conflict-rich runs can still
+    ///   be marching to a solution).
+    /// - Stage 2 ([`Solver::propagate_impl`] via
+    ///   [`Self::env_ordering_work_deadline`]): a run that also burnt a
+    ///   real propagation budget after its first conflict is refuting;
+    ///   it suspends AND restarts with an activity reset
+    ///   ([`Self::env_ordering_restart_pending`]).
+    ///
+    /// Reset by `run_sat` on entry; never set while
+    /// [`Self::env_ordering_active`] is false, and irrelevant then
+    /// (`env_ordering_enabled` is gated on both).
+    env_ordering_suspended: bool,
+
+    /// Set by both stages of the refutation switch; makes
+    /// [`Solver::propagate_and_learn`] retract the trail to
+    /// [`Self::run_root_level`] (a classic CDCL restart: learnt clauses
+    /// and the root install survive, search decisions do not). Suspension
+    /// alone only changes FUTURE decisions, while the trail at trip time
+    /// is still shaped by the deferral (env literals undecided underneath
+    /// a deep concrete subtree); measurements show the rest of the
+    /// refutation pays for that shape long after the switch flipped. At
+    /// most two restarts per run (one per stage; each stage fires once).
+    env_ordering_restart_pending: bool,
+
+    /// Set by stage 2 only: the restart also resets the package activity
+    /// scores. The bumps accumulated under the deferral reflect conflicts
+    /// of an ordering the run has abandoned, and a long neutral refutation
+    /// otherwise keeps chasing them (measured 3x on the worst corpus
+    /// refutation outlier). Stage 1 keeps the scores: resetting them on
+    /// every conflict-limit trip wrecked an otherwise healthy mechanical
+    /// enumeration by 5x (problem 95), so the reset needs the stronger
+    /// work-deadline evidence.
+    env_ordering_reset_pending: bool,
+
+    /// The work-based co-trigger of the refutation switch: the value of
+    /// [`Self::propagated_total`] at which the current run suspends the
+    /// ordering even without crossing the conflict limit. Armed by the
+    /// FIRST conflict of a run at `max(ENV_ORDERING_WORK_FACTOR *
+    /// fresh_solve_cost, ENV_ORDERING_WORK_FLOOR)` propagated decisions
+    /// ahead, and deliberately never at run entry: a conflict-free run is
+    /// marching to a solution over a kept trail prefix and must not be
+    /// restarted (measured: tripping conflict-free runs reverts
+    /// refutation-heavy problems to their pre-trail-reuse cost). This
+    /// catches propagation-heavy, conflict-light refutations: under the
+    /// deferral, refuting a dead environment region means exhausting whole
+    /// concrete subtrees per conflict, so a run can burn orders of
+    /// magnitude more work than a fresh solve while staying under any
+    /// reasonable conflict limit. `None` when disarmed (no conflict yet,
+    /// no env literals, or already suspended).
+    env_ordering_work_deadline: Option<u64>,
+
+    /// The decision level of the root install of the current `run_sat`
+    /// call (`starting_level + 1`): everything at or below it is the
+    /// preserved prior state plus the root install, the restart retract
+    /// target of the refutation switch.
+    run_root_level: u32,
+
+    /// The stage-1 conflict limit in effect for the current run. Normally
+    /// the configured limit; the run directly after a stage-1 trip gets
+    /// [`ENV_ORDERING_COOLDOWN_FACTOR`] times that. A tripped run records
+    /// its cell with a neutral-shaped trail, so the next run re-derives
+    /// that trail with warm-up-like conflicts; without the cooldown the
+    /// rebuild itself re-trips at the limit and the enumeration locks into
+    /// a trip-rebuild-trip loop where every transition costs a fresh solve
+    /// (measured: 21 consecutive trips and a 2.5x regression on problem
+    /// 491).
+    run_conflict_limit: u64,
+
+    /// Set by a stage-1 trip; makes the next `run_sat` call raise its
+    /// conflict limit (see [`Self::run_conflict_limit`]). Cleared at every
+    /// run entry after being applied, so the cooldown lasts exactly one
+    /// run unless that run trips again.
+    env_ordering_cooldown: bool,
+
     watches: WatchMap,
 
     /// A mapping from requirements to the variables that represent the
@@ -446,6 +551,14 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_support_clauses: Default::default(),
             env_sensitive_parents: Default::default(),
             env_ordering_active: false,
+            run_conflicts: 0,
+            env_ordering_suspended: false,
+            env_ordering_restart_pending: false,
+            env_ordering_reset_pending: false,
+            env_ordering_work_deadline: None,
+            run_root_level: 0,
+            run_conflict_limit: ENV_ORDERING_CONFLICT_LIMIT,
+            env_ordering_cooldown: false,
             watches: Default::default(),
             requirement_to_sorted_candidates: Default::default(),
             variable_map: Default::default(),
@@ -487,6 +600,46 @@ const PREFIX_BUDGET_FACTOR: u64 = 16;
 /// do not abort transitions that are cheap in absolute terms.
 const PREFIX_BUDGET_FLOOR: u64 = 10_000;
 
+/// Conflicts a single `run_sat` call may accumulate before the
+/// env-literals-last ordering is suspended for the rest of that run (see
+/// [`SolverState::env_ordering_suspended`] and
+/// docs/design/universal-refutation-ordering.md). Mechanical cell
+/// transitions need a handful of conflicts (~3 on the benchmark corpus) and
+/// genuine solution searches stay well below this; a run that crosses it is
+/// almost certainly refuting, where the deferral only postpones the env
+/// contradictions that prune the search.
+const ENV_ORDERING_CONFLICT_LIMIT: u64 = 32;
+
+/// Work multiple for the refutation switch's work-based co-trigger, in
+/// units of the from-scratch solve cost (see
+/// [`SolverState::env_ordering_work_deadline`]). Legitimate cell
+/// transitions cost a fraction of a fresh solve; a run several fresh
+/// solves deep without completing is refuting. Deliberately far below
+/// [`PREFIX_BUDGET_FACTOR`]: suspending the ordering in-run is gentle
+/// (the run restarts and continues neutrally), while the budget abandons
+/// the whole reuse attempt, so the switch firing first keeps the budget
+/// machinery dormant.
+const ENV_ORDERING_WORK_FACTOR: u64 = 4;
+
+/// Lower bound for the work-based co-trigger, used directly while no
+/// fresh-solve cost has been recorded yet (the first run of an
+/// enumeration) and as a floor for trivially cheap first cells.
+const ENV_ORDERING_WORK_FLOOR: u64 = 2_000_000;
+
+/// Upper bound for the work-based co-trigger (clamped after the
+/// fresh-cost scaling, but never below the floor override): on problems
+/// whose first cell is itself expensive, `factor * fresh_solve_cost`
+/// grows past any per-run cost ever observed on a healthy run, and the
+/// trigger would go deaf exactly where it is needed (the measured
+/// refutation outliers all have expensive fresh solves).
+const ENV_ORDERING_WORK_CAP: u64 = 8_000_000;
+
+/// Conflict-limit multiplier for the run directly after a stage-1 trip
+/// (see [`SolverState::run_conflict_limit`]): the rebuild of a
+/// neutral-shaped trail must be able to finish ordered, or the trip
+/// chains into a permanent trip-rebuild loop.
+const ENV_ORDERING_COOLDOWN_FACTOR: u64 = 4;
+
 /// Cancellation sentinel raised by [`Solver::learn_from_conflict`] when a
 /// prefix-started run exhausts [`PREFIX_CONFLICT_LIMIT`]. `solve_universal`
 /// intercepts it before it can escape to the caller.
@@ -524,6 +677,13 @@ pub(crate) struct PropagationCounters {
     pub cell_retracts: Vec<(u32, u32)>,
     /// Times the kept-prefix conflict budget aborted a trail-reuse attempt.
     pub prefix_budget_aborts: u64,
+    /// Times the per-run conflict limit suspended the env-literals-last
+    /// ordering (stage 1 of the refutation switch, see
+    /// docs/design/universal-refutation-ordering.md).
+    pub env_ordering_suspensions: u64,
+    /// Times the work deadline escalated a run to a restart with an
+    /// activity reset (stage 2 of the refutation switch).
+    pub env_ordering_restarts: u64,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -569,6 +729,9 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             state: SolverState::default(),
             activity_add: 1.0,
             activity_decay: 0.95,
+            env_ordering_conflict_limit: ENV_ORDERING_CONFLICT_LIMIT,
+            env_ordering_work_factor: ENV_ORDERING_WORK_FACTOR,
+            env_ordering_work_floor: ENV_ORDERING_WORK_FLOOR,
         }
     }
 }
@@ -656,6 +819,58 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.clauses.kinds.len()
     }
 
+    /// Overrides the per-run conflict limit of the refutation switch (see
+    /// [`ENV_ORDERING_CONFLICT_LIMIT`]). Diagnostics-only: tests use a low
+    /// limit to exercise the switch on small universes, and benchmark
+    /// builds sweep candidate values.
+    #[cfg(feature = "diagnostics")]
+    pub fn set_env_ordering_conflict_limit(&mut self, limit: u64) {
+        self.env_ordering_conflict_limit = limit;
+    }
+
+    /// Overrides the work-based co-trigger of the refutation switch (see
+    /// [`ENV_ORDERING_WORK_FACTOR`] and [`ENV_ORDERING_WORK_FLOOR`]).
+    /// Diagnostics-only, for tests and benchmark sweeps.
+    #[cfg(feature = "diagnostics")]
+    pub fn set_env_ordering_work_budget(&mut self, factor: u64, floor: u64) {
+        self.env_ordering_work_factor = factor;
+        self.env_ordering_work_floor = floor;
+    }
+
+    /// The number of times the refutation switch suspended the
+    /// env-literals-last ordering for the rest of a `run_sat` call
+    /// (stage 1, the per-run conflict limit).
+    #[cfg(feature = "diagnostics")]
+    pub fn env_ordering_suspensions(&self) -> u64 {
+        self.state.propagation_counters.env_ordering_suspensions
+    }
+
+    /// The number of times the refutation switch escalated a run to a
+    /// restart with an activity reset (stage 2, the work deadline).
+    #[cfg(feature = "diagnostics")]
+    pub fn env_ordering_restarts(&self) -> u64 {
+        self.state.propagation_counters.env_ordering_restarts
+    }
+
+    /// Total conflicts handled by this solver, ever.
+    #[cfg(feature = "diagnostics")]
+    pub fn conflict_count(&self) -> u64 {
+        self.state.propagation_counters.conflicts
+    }
+
+    /// Total decisions propagated by this solver, ever.
+    #[cfg(feature = "diagnostics")]
+    pub fn decisions_propagated(&self) -> u64 {
+        self.state.propagation_counters.decisions_propagated
+    }
+
+    /// The number of times the kept-prefix work budget aborted a trail-reuse
+    /// attempt.
+    #[cfg(feature = "diagnostics")]
+    pub fn prefix_budget_aborts(&self) -> u64 {
+        self.state.propagation_counters.prefix_budget_aborts
+    }
+
     /// Set the runtime of the solver to `runtime`.
     #[must_use]
     pub fn with_runtime<RT2: AsyncRuntime>(self, runtime: RT2) -> Solver<D, RT2> {
@@ -665,6 +880,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             state: self.state,
             activity_decay: self.activity_decay,
             activity_add: self.activity_add,
+            env_ordering_conflict_limit: self.env_ordering_conflict_limit,
+            env_ordering_work_factor: self.env_ordering_work_factor,
+            env_ordering_work_floor: self.env_ordering_work_floor,
         }
     }
 
@@ -810,6 +1028,36 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         );
         let mut new_solvables: Vec<(VariableId, ClauseId)> = Vec::new();
         let mut solvable_ids: Vec<SolvableIdOrRoot<D::SolvableId>> = Vec::new();
+
+        // Re-arm the env-literals-last ordering for this run. The ordering
+        // is the right default (it is what collapses cell transitions), but
+        // a run that accumulates many conflicts is refuting, and refutation
+        // wants env conflicts EARLY; `learn_from_conflict` suspends the
+        // ordering for the rest of the run once the per-run conflict count
+        // crosses the limit.
+        self.state.run_conflicts = 0;
+        self.state.env_ordering_suspended = false;
+        self.state.env_ordering_restart_pending = false;
+        self.state.env_ordering_reset_pending = false;
+        self.state.run_root_level = starting_level + 1;
+        // The run after a stage-1 trip gets a raised conflict limit: it
+        // must be able to re-derive the neutral-shaped trail the tripped
+        // run left behind without immediately re-tripping (see
+        // `SolverState::run_conflict_limit`).
+        self.state.run_conflict_limit = if self.state.env_ordering_cooldown {
+            self.env_ordering_conflict_limit
+                .saturating_mul(ENV_ORDERING_COOLDOWN_FACTOR)
+        } else {
+            self.env_ordering_conflict_limit
+        };
+        self.state.env_ordering_cooldown = false;
+        // The work-based co-trigger is armed by the FIRST conflict of the
+        // run (see `learn_from_conflict`), never at entry: a run without
+        // conflicts is marching to a solution over a kept trail prefix,
+        // and restarting it would throw the prefix away (measured: tripping
+        // conflict-free runs reverts refutation-heavy problems to their
+        // pre-trail-reuse cost).
+        self.state.env_ordering_work_deadline = None;
 
         // Arm the kept-prefix work budget (see the field docs). Only a free
         // universal solve enters with restartable decisions above the
@@ -1248,7 +1496,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // activates env-literal-assigning clauses (`env_sensitive_parents`,
         // cross-cell knowledge), and candidates that are environment
         // literals themselves, which are decided after everything else.
-        let env_ordering = self.state.env_ordering_active;
+        // Suspended for the rest of the run once the refutation switch
+        // trips (`env_ordering_enabled`).
+        let env_ordering = self.state.env_ordering_enabled();
         let mut best_env_parent: Option<PossibleDecision> = None;
         let mut best_env_literal: Option<PossibleDecision> = None;
         for (&solvable_id, requirements) in self.state.requires_clauses.iter() {
@@ -1753,7 +2003,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let state = &mut self.state;
         state.decide_queue.sync(&mut state.decision_tracker);
 
-        let env_ordering = state.env_ordering_active;
+        let env_ordering = state.env_ordering_enabled();
 
         // Phase 1: the first eligible *ordinary* item in scan order is the
         // initial best (exactly like the reference scan, whose running
@@ -2008,6 +2258,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         loop {
             match self.propagate(level) {
                 Ok(()) => {
+                    // The work-based co-trigger can fire mid-propagation
+                    // without a conflict; consume the restart before
+                    // handing the level back to the decision loop.
+                    if self.take_env_ordering_restart(level) {
+                        level = self.state.run_root_level;
+                        continue;
+                    }
                     return Ok(level);
                 }
                 Err(PropagationError::Cancelled(value)) => {
@@ -2024,9 +2281,56 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         attempted_value,
                         conflicting_clause,
                     )?;
+                    if self.take_env_ordering_restart(level) {
+                        level = self.state.run_root_level;
+                    }
                 }
             }
         }
+    }
+
+    /// Consumes a pending refutation-switch restart (see
+    /// [`SolverState::env_ordering_restart_pending`]): suspension only
+    /// steers future decisions, but the trail at trip time is still shaped
+    /// by the deferral (a deep concrete subtree with the env literals
+    /// undecided at the bottom), and the rest of the run would keep paying
+    /// for that shape. Retracts to the root install; learnt clauses carry
+    /// over, exactly like a classic CDCL restart. Any tripping conflict
+    /// was analyzed and learnt before this runs, so knowledge grows
+    /// monotonically, and each stage trips at most once per run, which
+    /// bounds the restarts.
+    ///
+    /// A stage-2 trip additionally resets the package activity scores
+    /// (see [`SolverState::env_ordering_reset_pending`]). Zeroing is safe:
+    /// activity is a heuristic read fresh at every decision, the hot-set
+    /// tracking of the decide queue stays a conservative superset, and
+    /// the tracked maximum scales to zero with the scores.
+    ///
+    /// Returns true when the trail was retracted to
+    /// [`SolverState::run_root_level`].
+    fn take_env_ordering_restart(&mut self, level: u32) -> bool {
+        if !self.state.env_ordering_restart_pending {
+            return false;
+        }
+        self.state.env_ordering_restart_pending = false;
+        let reset = std::mem::take(&mut self.state.env_ordering_reset_pending);
+        if reset {
+            self.state.name_activity.for_each_mut(|activity| {
+                *activity = 0.0;
+            });
+            self.state.max_activity = 0.0;
+        }
+        if level <= self.state.run_root_level {
+            return false;
+        }
+        tracing::debug!(
+            "├ Restarting at level {} after suspending the env-literals-last ordering",
+            self.state.run_root_level
+        );
+        self.state
+            .decision_tracker
+            .undo_until(self.state.run_root_level);
+        true
     }
 
     fn learn_from_conflict(
@@ -2038,6 +2342,58 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ) -> Result<u32, ResolveError> {
         #[cfg(feature = "diagnostics")]
         let learn_start = std::time::Instant::now();
+
+        // Stage 1 of the refutation switch: once this run has conflicted
+        // often enough, it is probably proving unsolvability rather than
+        // finding a solution, and the env-literals-last deferral only
+        // delays the env contradictions a refutation needs early. Suspend
+        // the ordering for the rest of the run and restart it (without a
+        // restart the search keeps standing in the deferral-shaped trail;
+        // measured 2-20x on the refutation outliers). Stage 2 (the work
+        // deadline, armed below and consumed in `propagate_impl`)
+        // escalates with an activity reset once the run has also burnt
+        // real propagation work. The flags only ever flip here and in
+        // `propagate_impl`, between `decide()` calls, so the incremental
+        // queue and the debug-build reference scan always read the same
+        // value within one selection.
+        self.state.run_conflicts += 1;
+        if self.state.run_conflicts == 1
+            && self.state.env_ordering_active
+            && !self.state.env_ordering_suspended
+        {
+            // First conflict of the run: refutation work may be starting.
+            // Arm the work-based stage-2 trigger; from here the run has a
+            // bounded propagation budget to complete before the switch
+            // escalates to a restart (see
+            // `SolverState::env_ordering_work_deadline`). Never armed at
+            // run entry: a conflict-free run is marching to a solution
+            // over a kept trail prefix and must not be restarted.
+            let cap = self
+                .env_ordering_work_floor
+                .max(ENV_ORDERING_WORK_CAP);
+            let budget = (self.state.fresh_solve_cost * self.env_ordering_work_factor)
+                .max(self.env_ordering_work_floor)
+                .min(cap);
+            self.state.env_ordering_work_deadline = Some(self.state.propagated_total + budget);
+        }
+        if self.state.env_ordering_active
+            && !self.state.env_ordering_suspended
+            && self.state.run_conflicts >= self.state.run_conflict_limit
+        {
+            tracing::debug!(
+                "├ {} conflicts in this run: suspending the env-literals-last ordering \
+                 for the rest of it",
+                self.state.run_conflicts
+            );
+            self.state.env_ordering_suspended = true;
+            self.state.env_ordering_restart_pending = true;
+            self.state.env_ordering_cooldown = true;
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state.propagation_counters.env_ordering_suspensions += 1;
+            }
+        }
+
         {
             tracing::debug!(
                 "├┬ Propagation conflicted: could not set {solvable} to {attempted_value}",
@@ -2243,6 +2599,33 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 }
             }
 
+            // Stage 2 of the refutation switch (see
+            // `SolverState::env_ordering_work_deadline`): a run that has
+            // both conflicted and burnt a real propagation budget since
+            // its first conflict is refuting, even when its conflict count
+            // stays low. Suspend the ordering (if stage 1 has not already)
+            // and request the one-shot restart; propagation itself
+            // finishes normally (the restart is consumed by
+            // `propagate_and_learn`).
+            if self
+                .state
+                .env_ordering_work_deadline
+                .is_some_and(|deadline| self.state.propagated_total > deadline)
+            {
+                tracing::debug!(
+                    "├ The run crossed its work budget without completing: restarting \
+                     without the env-literals-last ordering"
+                );
+                self.state.env_ordering_work_deadline = None;
+                self.state.env_ordering_suspended = true;
+                self.state.env_ordering_restart_pending = true;
+                self.state.env_ordering_reset_pending = true;
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state.propagation_counters.env_ordering_restarts += 1;
+                }
+            }
+
             debug_assert!(
                 watched_literal.eval(self.state.decision_tracker.map()) == Some(false),
                 "we are only watching literals that are turning false"
@@ -2311,6 +2694,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // Update the watch to point to the new literal
                     next_cursor = cursor.update(literal);
                 } else if self.state.env_ordering_active
+                    // The refutation switch also stops the unit-propagation
+                    // deferral: a suspended run must install forced variant
+                    // parents immediately again (inlined
+                    // `SolverState::env_ordering_enabled`, see there).
+                    && !self.state.env_ordering_suspended
                     && matches!(clause, Clause::Requires(..))
                     && other_watched_literal.satisfying_value()
                     && self
@@ -2818,6 +3206,16 @@ impl<D: DependencyProvider> SolverState<D> {
     /// deferred parent assigns that literal, the rest of its cone stops
     /// being deferred; only parents of literals that still discriminate
     /// between environment regions stay at the top of the trail.
+    /// Returns true while the env-literals-last ordering steers the search:
+    /// environment literals were interned (a universal solve) AND the
+    /// refutation switch has not suspended the ordering for the current
+    /// `run_sat` call (see [`Self::env_ordering_suspended`]). All decision
+    /// deferral reads this; `propagate_impl` reads the two flags directly
+    /// because the watch cursor partially borrows the state.
+    fn env_ordering_enabled(&self) -> bool {
+        self.env_ordering_active && !self.env_ordering_suspended
+    }
+
     fn env_install_pending(&self, variable: VariableId) -> bool {
         self.env_sensitive_parents
             .get(&variable)
