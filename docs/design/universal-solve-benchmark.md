@@ -583,3 +583,100 @@ preference order:
 
 The branch implements option 2 (reuse on, protected); flipping to
 option 1 is a one-line change in `solve_universal`.
+
+## The two follow-up levers, researched and combined (2026-06-11)
+
+The trail-reuse verdict above named two levers. Both were researched,
+prototyped and corpus-validated the same night, then merged
+(`research-env-literals-last`, `research-decide-worklist`,
+`research-universal-combined`; design notes
+`universal-env-literals-last.md` and `decide-worklist.md`).
+
+### Env-literals-last ordering (`research-env-literals-last`)
+
+The naive design (statically defer env-touching packages in `decide()`)
+fails on conda-shaped data: `__glibc` is required by 6,942 packages, so
+the static test covers most of the trail, and the parents that pin the
+discriminating literals (microarch levels, sysroot glibc variants) are
+installed by unit propagation, which no decision heuristic sees. The
+shipped design defers dynamically (only installs that would assign a
+still-unassigned env literal), skips unit propagation of such pending
+variant parents (the clause stays watched, the skipped unit becomes an
+ordinary decision later), lets `decide()` yield to the encoder at batch
+boundaries, and heals badly shaped inherited trails with a one-shot
+full retraction. All of it is gated on env-literal interning: concrete
+solves are bit-for-bit unaffected.
+
+Corpus effect: total wall 3350 s to 2584 s, timeouts 23 to 15 (ten
+recovered, two near-cap lost), high-cell median 0.49x, and the paired
+universal/concrete median drops to 0.97: universal solving became
+cheaper than the concrete solve at the median. Median transition cost
+on problem 370 fell from 7,242 to 234 propagated decisions, and the
+prefix work budgets went fully dormant (zero aborts corpus-wide).
+
+### Incremental decide() queue (`research-decide-worklist`)
+
+`decide()`'s full rescan is not heap-shaped: the replacement rule
+(strictly higher activity AND strictly lower candidate count) is not a
+total order, so exact preservation requires replaying the fold in scan
+order. The queue keeps every potentially eligible item in a
+position-ordered set, syncs against the trail with a truncation
+watermark instead of undo hooks, caches candidate walks per
+requirement, and folds only the first eligible item plus the "hot"
+items (names whose activity was ever bumped; cold activity is zero and
+can never win a strict comparison). The original scan remains in debug
+builds as an oracle asserting tuple equality on every call.
+
+Corpus effect: identical cells and records to the protected trail-reuse
+run on every co-completed problem (exactness at corpus scale), total
+wall 3388 s to 2393 s, timeouts 25 to 15, decide time on problem 370
+from 6.5 s to 0.41 s (the scan-work counters drop four orders of
+magnitude). Concrete decide cost drops ~7x; concrete outcomes are
+identical.
+
+### Combined (`research-universal-combined`)
+
+The merge ports the three-class ordering into the oracle and teaches
+the queue per-class fold accumulators; the whole suite and the
+1000-seed property test run with the oracle asserting queue == scan on
+every call, with zero snapshot churn.
+
+Corpus results against the witness-fix baseline that opened this
+report's outlier section:
+
+| | baseline | + trail reuse (protected) | + env ordering | + decide queue | combined |
+|---|---|---|---|---|---|
+| total wall | 3350 s | 3388 s | 2584 s | 2393 s | **2267 s** |
+| timeouts | 23 | 25 | 15 | 15 | **12** |
+| p95 vs concrete | 4.4x | 4.3x | 2.8x | - | **2.1x** |
+
+Twelve baseline timeouts now complete (among them problem 34, the
+hard-corner poster child: 568 s unbounded at campaign time, 3.0 s
+combined; and problems 204 and 553, where the universal solver now
+returns verdicts the concrete solver cannot reach within the cap). One
+regression remains: problem 587 (34.3 s baseline, ok at 93 s with an
+extended cap), a heavy 30 s-concrete-base problem worth a targeted
+look. Of the twelve remaining timeouts, five are problems the concrete
+solver cannot finish either, leaving seven universal-only stragglers,
+down from sixteen. Spot highlights: problem 370 in 2.6-2.7 s (19.0 s at
+campaign time), 46 in 1.9 s (22.8 s), 95 in 4.0 s (33.2 s), 491 in
+10.3 s (was a hard timeout). All solutions verifier-clean throughout;
+per-cell cost on problem 370 is now ~7 ms with verification, ~25x below
+the campaign's 55 ms/cell honest-floor estimate.
+
+The earlier gating decision point is superseded: with both levers
+landed, trail reuse plus ordering plus the queue is a strict
+improvement over the campaign baseline on every aggregate, and the
+always-on recommendation stands stronger than when it was written.
+Remaining follow-ups: problem 587, the seeded-replay-at-scale hazard
+(unchanged), cherry-picking the decide queue to main independently of
+the universal work (it is a mainline win on its own), and re-running
+the win-64/osx-arm64 corpora on the combined head.
+
+Concrete-mode validation of the combined head over the full corpus:
+999 of 1000 problems produce outcomes and record counts identical to
+the campaign's concrete baseline; the one difference is problem 204,
+where the baseline timed out and the queue-powered build now completes
+the unsolvable verdict inside the cap. Total concrete wall drops from
+1736 s to 1563 s, making the decide queue a measured mainline win
+independent of universal solving.
