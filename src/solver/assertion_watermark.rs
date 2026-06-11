@@ -2,7 +2,7 @@
 //!
 //! An assertion (a single-literal clause) has no watches, so its decision
 //! must hold whenever propagation runs: `Solver::propagate` historically
-//! re-scanned all of `negative_assertions`, `learnt_clause_ids` and
+//! re-scanned all of `negative_assertions`, `unit_learnt_clause_ids` and
 //! `env_clause_ids` on every call, even though almost every entry is a
 //! no-op (`try_add_decision` on an already-decided variable). Between two
 //! propagate calls only two things can make an entry actionable again:
@@ -32,7 +32,8 @@ use std::collections::{BTreeSet, BinaryHeap};
 pub(crate) const GROUP_COUNT: usize = 3;
 /// `Solver::decide_assertions` (`SolverState::negative_assertions`).
 pub(crate) const GROUP_NEGATIVE: usize = 0;
-/// `Solver::decide_learned` (`SolverState::learnt_clause_ids`).
+/// `Solver::decide_learned` (`SolverState::unit_learnt_clause_ids`,
+/// already filtered to single-literal clauses at registration).
 pub(crate) const GROUP_LEARNT: usize = 1;
 /// `Solver::decide_env_assertions` (`SolverState::env_clause_ids`).
 pub(crate) const GROUP_ENV: usize = 2;

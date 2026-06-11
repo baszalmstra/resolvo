@@ -705,6 +705,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         problem: UniversalProblem<D::SolvableId, D::NameId>,
     ) -> Result<UniversalSolution<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
+        let result = self.solve_universal_impl(problem);
+        // Report after every outcome (mirroring `solve`). Note: a rebuild
+        // after an abandoned trail-reuse attempt resets the solver state, so
+        // the report covers only the final enumeration.
+        #[cfg(feature = "diagnostics")]
+        self.report_diagnostics();
+        result
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn solve_universal_impl(
+        &mut self,
+        problem: UniversalProblem<D::SolvableId, D::NameId>,
+    ) -> Result<UniversalSolution<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
         let UniversalProblem {
             requirements,
             constraints,
@@ -1423,24 +1437,22 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut cell: Vec<(VariableId, bool)> = Vec::new();
         let mut pins = CellPinCounts::default();
 
-        let record = |cell: &mut Vec<(VariableId, bool)>,
-                      variable: VariableId,
-                      value: bool|
-         -> bool {
-            match cell.iter().find(|&&(v, _)| v == variable) {
-                Some(&(_, existing)) => {
-                    debug_assert_eq!(
-                        existing, value,
-                        "bug: a cell literal was recorded with both signs"
-                    );
-                    false
+        let record =
+            |cell: &mut Vec<(VariableId, bool)>, variable: VariableId, value: bool| -> bool {
+                match cell.iter().find(|&&(v, _)| v == variable) {
+                    Some(&(_, existing)) => {
+                        debug_assert_eq!(
+                            existing, value,
+                            "bug: a cell literal was recorded with both signs"
+                        );
+                        false
+                    }
+                    None => {
+                        cell.push((variable, value));
+                        true
+                    }
                 }
-                None => {
-                    cell.push((variable, value));
-                    true
-                }
-            }
-        };
+            };
 
         for &clause_id in &state.env_support_clauses {
             match state.clauses.kinds[clause_id.to_index()] {

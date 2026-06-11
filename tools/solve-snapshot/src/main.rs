@@ -372,7 +372,10 @@ fn dump_cell_stats(
 
     // Per-group details: size, cells, simplified count, diff vs group 0.
     writeln!(out, "\n=== solvable-set groups ===").unwrap();
-    let baseline = groups.first().map(|(set, _)| set.clone()).unwrap_or_default();
+    let baseline = groups
+        .first()
+        .map(|(set, _)| set.clone())
+        .unwrap_or_default();
     for (gid, (set, cells)) in groups.iter().enumerate() {
         let added: Vec<String> = set
             .iter()
