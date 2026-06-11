@@ -302,7 +302,8 @@ pub(crate) struct SolverState<D: DependencyProvider> {
 
     /// The clause ids of all `Clause::EnvClause` clauses, iterated during
     /// propagation to apply single-literal clauses as assertions (mirrors
-    /// `learnt_clause_ids`).
+    /// `unit_learnt_clause_ids`, except env clauses are few enough that the
+    /// multi-literal ones are filtered during the scan).
     env_clause_ids: Vec<ClauseId>,
 
     /// The subset of `env_clauses` that are blocking clauses, iterated in
@@ -349,7 +350,13 @@ pub(crate) struct SolverState<D: DependencyProvider> {
 
     learnt_clauses: Arena<LearntClauseId, Vec<Literal>>,
     learnt_why: Mapping<LearntClauseId, Vec<ClauseId>>,
-    learnt_clause_ids: Vec<ClauseId>,
+
+    /// The clause ids of single-literal learnt clauses. They have no
+    /// watches, so `decide_learned` (re-)applies their assertions on every
+    /// propagation round; the scan length is a direct per-`propagate()`
+    /// cost, and multi-literal learnt clauses propagate through their
+    /// watches, so only the units belong here.
+    unit_learnt_clause_ids: Vec<ClauseId>,
 
     disjunctions: Arena<DisjunctionId, Disjunction>,
 
@@ -471,7 +478,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             negative_assertions: Default::default(),
             learnt_clauses: Default::default(),
             learnt_why: Default::default(),
-            learnt_clause_ids: Default::default(),
+            unit_learnt_clause_ids: Default::default(),
             disjunctions: Default::default(),
             clauses_added_for_package: Default::default(),
             clauses_added_for_solvable: Default::default(),
@@ -2550,22 +2557,23 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         Ok(())
     }
 
-    /// Add decisions derived from learnt clauses.
+    /// Add decisions derived from single-literal learnt clauses (which have
+    /// no watches; multi-literal learnt clauses propagate through theirs).
     fn decide_learned(&mut self, level: u32) -> Result<(), PropagationError> {
         // Assertions derived from learnt rules
-        for learn_clause_idx in 0..self.state.learnt_clause_ids.len() {
-            let clause_id = self.state.learnt_clause_ids[learn_clause_idx];
+        for learn_clause_idx in 0..self.state.unit_learnt_clause_ids.len() {
+            let clause_id = self.state.unit_learnt_clause_ids[learn_clause_idx];
             let clause = self.state.clauses.kinds[clause_id.to_index()];
             let Clause::Learnt(learnt_index) = clause else {
                 unreachable!();
             };
 
             let literals = &self.state.learnt_clauses[learnt_index];
-            if literals.len() > 1 {
-                continue;
-            }
-
-            debug_assert!(!literals.is_empty());
+            debug_assert_eq!(
+                literals.len(),
+                1,
+                "only single-literal learnt clauses are registered for decide_learned"
+            );
 
             let literal = literals[0];
             let decision = literal.satisfying_value();
@@ -2877,7 +2885,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let (watched_literals, kind) =
             WatchedLiterals::learnt(learnt_id, &self.state.learnt_clauses[learnt_id]);
         let clause_id = self.state.add_clause(watched_literals, kind);
-        self.state.learnt_clause_ids.push(clause_id);
+        if self.state.learnt_clauses[learnt_id].len() == 1 {
+            self.state.unit_learnt_clause_ids.push(clause_id);
+        }
 
         tracing::debug!("│├ Learnt disjunction:",);
         for lit in &self.state.learnt_clauses[learnt_id] {
