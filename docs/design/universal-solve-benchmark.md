@@ -1,7 +1,7 @@
 # Universal solve benchmark
 
-Status: in progress (2026-06-11). Numbers below are filled in as runs
-complete; this header is removed when the campaign is done.
+Status: campaign completed 2026-06-11 on branch
+`universal-solve-bench-fixes` (resolvo and rattler).
 
 This report benchmarks `Solver::solve_universal` at scale on real
 conda-forge repodata, characterizes its cost distribution against plain
@@ -228,14 +228,182 @@ machinery overhead.
   universal overhead observed on linux-64 comes from genuinely covering
   more environments (more cells), never from the mechanism.
 
+### Model-bounds variant: glibc floor 2.28 (linux-64)
+
+CSV: `bench-universal/full-linux-64-glibc228.csv`. Same corpus and model
+as linux-64, with the glibc clause raised from `>=2.17,<3.0a0` to
+`>=2.28,<3.0.a0`.
+
+|                          | floor 2.17 | floor 2.28 |
+|--------------------------|------------|------------|
+| ok                       | 725        | 737        |
+| timeout                  | 25         | 17         |
+| paired ratio median      | 1.06x      | 0.95x      |
+| paired ratio p95         | 4.46x      | 2.96x      |
+| cells median / p95       | 4 / 44     | 3 / 35     |
+
+Excluding the glibc [2.17, 2.28) corner removes most glibc-floor
+failures, converts several timeouts into completions, and shrinks both
+the cell counts and the paired-ratio tail. The remaining universal-only
+failures concentrate in the cuda [11, 12) corner (packages whose builds
+require `__cuda >=12`). The model bounds are therefore the single
+biggest lever over both the failure rate and the cost: the tighter the
+capability range a user actually supports, the cheaper and cleaner the
+universal solve.
+
 ## Outliers
 
-(to be filled in)
+Outlier set per the campaign data: all 25 universal timeouts on linux-64
+plus everything beyond 10x the universal median (83 problems, dominated
+by triple-digit cell counts), and the two win-64 concrete anomalies.
+
+### The win-64 concrete anomalies were environmental, not solver issues
+
+The win-64 concrete run was interrupted: Windows entered idle sleep at
+03:38 mid-problem-821 (benchmark CPU load does not count as user
+activity), woke at 05:11, and a Windows Update reboot followed one
+minute later, killing the run mid-problem-839. Supervised re-runs:
+problem 821 solves concretely in 84 ms (its recorded 5568 s "timeout"
+was the sleep gap), and problem 839 is a hard genuine conflict that
+both modes agree on (unsolvable: concrete 44.3 s, universal 44.9 s).
+No concrete-solver pathology exists; the benchmark scripts now disable
+idle sleep for the duration of a campaign.
+
+### Universal outliers: witness-search blowup, then per-cell re-solve cost
+
+Every large universal outlier is a cuda/torch-ecosystem problem (cupy,
+libcufft, pennylane-lightning-gpu, r-torch, lerobot, mattergen, pinned
+cuda builds, ...): the cuda axis carries 38 version sets in linux-64
+repodata, and deep GPU dependency trees legitimately fragment into many
+`(cuda interval) x (glibc interval) x (microarch level)` cells with
+genuinely different solutions per cell.
+
+Phase instrumentation of the worst completed solve (problem 370: 360
+cells, 78.1 s universal vs 1.31 s concrete) attributed the time:
+
+| phase                          | time |
+|--------------------------------|------|
+| 361 `run_sat` calls (solving)  | 19.9 s (55 ms/cell, max 1.2 s) |
+| extract + disjointness repair  | 0.1 s |
+| final witness coverage check   | 51.8 s |
+
+Two prototype fixes target the witness search, which dominated every
+high-cell outlier (it runs over model + oracle-consistency + all
+accumulated blocking clauses):
+
+1. **Unit propagation** in the backtracking search (commit
+   `perf(universal): unit propagation in the environment witness
+   search`). Before: the 196-cell problem 5 spent 108 of 115 s in the
+   witness check. After: 4.6 s end to end (25x), identical cells.
+2. **Most-constrained-first decision order** for the refutation case
+   (commit `perf(universal): most-constrained-first decisions in the
+   witness search`). The coverage-complete result is order independent,
+   so the search can decide dense variables first and only re-run in
+   canonical order when a witness actually exists. Before/after on
+   problem 370: witness check 51.8 s to 0.01 s; whole solve 78.1 s to
+   27.1 s, identical 360 cells.
+
+A full post-fix re-run of the linux-64 universal campaign
+(`bench-universal/full-linux-64-universal-fixed.csv`, identical corpus
+and cells) quantifies the shift: paired ratio median 1.06x to **1.00x**,
+p99 25.8x to 15.1x, max 65.6x to 46.3x; mean duration 3.64 s to 3.35 s;
+the 78 s worst completed solve now takes 19 s. Two of the 25 timeouts
+now finish (as unsolvable verdicts); the remaining 23 are
+enumeration-bound, not witness-bound.
+
+After both fixes the remaining cost of high-cell solves is the
+enumeration itself, about 55 ms of `run_sat` per cell on the worst
+problem: each cell re-decides the full solvable assignment after
+`undo_until(0)`. That cost is proportional to the number of cells,
+which is real output (distinct solutions per region), so it is the
+honest floor of the current architecture. Follow-up ideas, none
+prototyped here: freezing or resetting VSIDS activity between cells
+(design-doc watch item; decision order drift makes later cells explore
+more), warm-starting each cell from the shared prefix of the previous
+solution, and checking cancellation inside the witness search (today a
+pathological search cannot be cancelled; after the two fixes above the
+search is fast enough that this is latent rather than pressing).
 
 ## Gating recommendation
 
-(to be filled in)
+**Recommendation: pixi should always use the universal solve path, with
+the environment model derived from the manifest's system requirements:
+axes the manifest does not declare are pinned to the platform defaults,
+axes it declares ranges for become symbolic.** "Gating" then happens
+naturally per axis in the model, not as a separate code path.
+
+The reasoning, against the agreed thresholds:
+
+1. **The median ratio is at or below 1x on every subdir** (linux-64
+   1.00x with the richest model, osx-arm64 1.00x, win-64 1.00x), far
+   under the 2x always-on bar. Universal solving costs nothing for the
+   typical problem.
+2. **The floor overhead is 0.96x**: with every literal pinned (the
+   model a manifest without capability declarations produces), the
+   universal path is marginally *faster* than today's concrete solve
+   and produces identical outcomes on all 1000 problems. There is no
+   cost to route everyone through `solve_universal`; model richness
+   costs only those who ask for coverage.
+3. **The tail is real but bounded, explained, and steerable.** On
+   linux-64 with the full cuda axis, p95 is 4.4x and 1.6% of problems
+   (16 of 1000) time out at 60 s where the concrete solve succeeds; all
+   of them are GPU-ecosystem problems whose cuda x glibc x microarch
+   space genuinely fragments into dozens to hundreds of cells with
+   different solutions. That cost buys the actual product: one solve
+   whose lockfile serves cuda-less machines and every cuda 11-13
+   machine at once, which today would take several concrete solves and
+   still not compose into one lockfile. Narrowing the model bounds
+   shrinks the tail directly (glibc floor 2.28: p95 drops to 3.0x,
+   timeouts from 25 to 17).
+4. **Failure semantics need the model to be honest, not the feature to
+   be gated.** With a glibc floor of 2.17, 5% of problems are
+   universally unsolvable yet concretely solvable, almost all in the
+   [2.17, 2.28) corner that conda-forge has de-facto abandoned; with a
+   2.28 floor most of those disappear and the rest concentrate in the
+   cuda [11, 12) corner. These verdicts are correct answers to the
+   question the model asks ("must work on every covered machine"), and
+   the returned witness cell names the exact uncovered region, so pixi
+   can render "this set of packages cannot work on machines with cuda
+   11.x; raise system-requirements.cuda to 12" style errors. Defaults
+   should track ecosystem baselines (glibc >=2.28, osx >=11, win >=10,
+   cuda >=11 when declared, microarch level 1).
+5. **Soundness held up at scale**: the independent verifier accepted
+   all 4,204 universal solutions across every run (disjoint cells,
+   model coverage), and machine projection always selected exactly one
+   cell.
+
+What keeps this from being unconditional today are the two witness
+search fixes on `universal-solve-bench-fixes` (without them, high-cell
+solves spend minutes in the coverage check and overshoot timeouts);
+they are prerequisites for shipping and are reviewed-size, behavior
+preserving commits.
 
 ## Follow-up items
 
-(to be filled in)
+- **Cherry-pick the two mainline bugs to main** independently of the
+  universal work: the `SnapshotProvider::add_package_requirement` id
+  shadowing and the `MappingIter` sparse-mapping truncation.
+- **Per-cell re-solve cost** is the remaining tail driver (55 ms/cell
+  on the worst problem; 23 linux timeouts are enumeration-bound).
+  Ideas, in increasing order of invasiveness: freeze or reset VSIDS
+  activity between cells (design-doc watch item), warm-start each cell
+  from the previous solution's shared prefix, and bounding cell counts
+  per package via merge-aware generalization.
+- **Cancellation inside the witness search**: after the two fixes the
+  search is fast in practice, but it still cannot be cancelled
+  mid-flight; plumb `should_cancel_with_value` through for defense in
+  depth.
+- **pixi integration**: derive the model from system-requirements with
+  per-platform baseline defaults; render `UniversalFailure::Unsolvable`
+  witness cells as actionable "unsupported machine corner" errors;
+  consider exposing the per-axis cost intuition (declaring cuda ranges
+  is what costs) in docs.
+- **Bench infrastructure**: disable idle sleep for campaign duration
+  (one win-64 run was corrupted by sleep plus a Windows Update reboot);
+  the runner scripts in `bench-universal/` now do this manually.
+- **Oracle coverage**: archspec answers Unknown for 48% of same-family
+  pairs (non-ancestor microarchitectures), cuda for 12%; neither showed
+  up as a correctness or fragmentation problem in this campaign, but
+  the relation-table statistics printed by `create-resolvo-snapshot`
+  are worth watching when repodata gains more microarch-specific
+  builds.
