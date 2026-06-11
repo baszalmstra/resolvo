@@ -648,6 +648,34 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut new_solvables: Vec<(VariableId, ClauseId)> = Vec::new();
         let mut solvable_ids: Vec<SolvableIdOrRoot<D::SolvableId>> = Vec::new();
 
+        // A kept trail prefix (restartable decisions above `starting_level`)
+        // may contradict clauses added since the retraction: the blocking
+        // clause's unit assertion cascades through oracle consistency
+        // clauses into env literals assigned below the retract target.
+        // Propagate and LEARN before entering the decision loop so the
+        // conflict backjumps precisely through the prefix; the in-loop
+        // conflict handling below would instead restart from scratch and
+        // forfeit the prefix on every such cascade.
+        if level > starting_level {
+            level = match self.propagate_and_learn(level) {
+                Ok(level) => level,
+                Err(ResolveError::Unsolvable(conflict)) => {
+                    return Err(UnsolvableOrCancelled::Unsolvable(conflict));
+                }
+                Err(ResolveError::Cancelled(value)) => {
+                    return Err(UnsolvableOrCancelled::Cancelled(value));
+                }
+                Err(ResolveError::AssumptionConflict) => {
+                    // Only the free phase of a universal solve enters with a
+                    // prefix, and it holds no assumptions; mirror the
+                    // resolve_dependencies handling anyway.
+                    debug_assert!(false, "bug: a kept prefix never coexists with assumptions");
+                    self.state.decision_tracker.undo_until(starting_level);
+                    return Ok(false);
+                }
+            };
+        }
+
         loop {
             if level == starting_level {
                 tracing::trace!("Level {starting_level}: Resetting the decision loop");
