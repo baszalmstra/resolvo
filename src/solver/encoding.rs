@@ -710,6 +710,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// clauses for the packages that are reachable from a requirement as an
     /// optimization.
     fn add_pending_forbid_clauses(&mut self) {
+        let amo_encoding = self.state.amo_encoding;
         for (name_id, candidate_var) in
             self.pending_forbid_clauses
                 .drain(..)
@@ -719,6 +720,16 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         .map(move |candidate_var| (name_id, candidate_var))
                 })
         {
+            if matches!(amo_encoding, crate::AmoEncoding::Virtual) {
+                Self::register_virtual_candidate(
+                    self.state,
+                    &mut self.conflicting_clauses,
+                    name_id,
+                    candidate_var,
+                );
+                continue;
+            }
+
             // Add forbid constraints for this solvable on all other
             // solvables that have been visited already for the same
             // version set name.
@@ -727,7 +738,6 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 .at_most_one_trackers
                 .remove(&name_id)
                 .unwrap_or_default();
-            let amo_encoding = self.state.amo_encoding;
             let variable_is_new = other_solvables.add(
                 candidate_var,
                 amo_encoding,
@@ -795,6 +805,90 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 }
             }
         }
+    }
+
+    /// Registers a candidate for the virtual at-most-one encoding
+    /// ([`crate::AmoEncoding::Virtual`]). No clauses are emitted: the
+    /// candidate is recorded in the decision map's package registry, after
+    /// which a package selection makes it evaluate to false implicitly.
+    ///
+    /// This mirrors the late-clause handling of the clausal encodings: if a
+    /// selection for the package is already active, the candidate's watchers
+    /// must still observe the falsification (queued for the next propagation
+    /// round), and a candidate that is already true next to an existing
+    /// selection is a conflict.
+    fn register_virtual_candidate(
+        state: &mut SolverState<D>,
+        conflicting_clauses: &mut Vec<ClauseId>,
+        name_id: D::NameId,
+        candidate_var: VariableId,
+    ) {
+        let mut tracker = state
+            .at_most_one_trackers
+            .remove(&name_id)
+            .unwrap_or_default();
+        let variable_is_new = tracker.variables.insert(candidate_var);
+
+        if variable_is_new {
+            let package = match tracker.virtual_package {
+                Some(package) => package,
+                None => {
+                    let package = state.decision_tracker.map_mut().alloc_package();
+                    state.virtual_package_names.push(name_id);
+                    tracker.virtual_package = Some(package);
+                    package
+                }
+            };
+
+            let map = state.decision_tracker.map_mut();
+            map.register_package_member(package, candidate_var);
+
+            match map.explicit_value(candidate_var) {
+                Some(true) => match map.selection(package) {
+                    None => {
+                        // The candidate was decided before it was registered:
+                        // adopt it as the package selection and let the
+                        // watchers of all other members observe the
+                        // falsification.
+                        let level = map.level(candidate_var);
+                        map.set_selection(package, candidate_var, level);
+                        for index in 0..map.package_member_count(package) {
+                            let member = map.package_member(package, index);
+                            if member != candidate_var && map.explicit_value(member).is_none() {
+                                state.pending_virtual_falsifications.push(member.positive());
+                            }
+                        }
+                    }
+                    Some((selected, _)) if selected != candidate_var => {
+                        // Two candidates of the same package are true. This
+                        // parallels the (false, false) conflict case of the
+                        // clausal encodings: report a conflict through a
+                        // materialized pairwise clause.
+                        let clause_id = state.materialize_virtual_reason(selected, candidate_var);
+                        conflicting_clauses.push(clause_id);
+                    }
+                    Some(_) => {}
+                },
+                None => {
+                    if map.virtual_selection(candidate_var).is_some() {
+                        state
+                            .pending_virtual_falsifications
+                            .push(candidate_var.positive());
+                    }
+                }
+                // Explicitly false: the falsification was propagated when the
+                // assignment was made.
+                Some(false) => {}
+            }
+
+            if let Some(at_least_one_variable) = state.at_least_one_tracker.get(name_id) {
+                let (watched_literals, kind) =
+                    WatchedLiterals::any_of(at_least_one_variable, candidate_var);
+                state.add_clause(watched_literals, kind);
+            }
+        }
+
+        state.at_most_one_trackers.insert(name_id, tracker);
     }
 
     /// Adds clauses to track if at least one solvable for a particular package

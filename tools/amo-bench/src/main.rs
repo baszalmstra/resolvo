@@ -66,6 +66,112 @@ struct Opts {
     /// Per-solve timeout in seconds.
     #[clap(long, default_value = "30")]
     timeout: u64,
+
+    /// Generate a boto3-style backtracking storm instead of the layered
+    /// problem: package `a` has N versions, `a=v` pins `b=v` exactly, and
+    /// every `b=v` except `b=0` depends on an empty version set. The solver
+    /// walks all versions of `a`/`b` from newest to oldest, rebuilding the
+    /// trail each step, with only trivial conflicts and no real search.
+    #[clap(long)]
+    storm: bool,
+}
+
+/// Generates the backtracking-storm problem described on [`Opts::storm`].
+fn generate_storm(versions: usize) -> (DependencySnapshot, Vec<VersionSetId>) {
+    let mut snapshot = DependencySnapshot::default();
+    let a_name = NameId::from_index(0);
+    let b_name = NameId::from_index(1);
+    let a_solvable = |v: usize| SolvableId::from_index(v);
+    let b_solvable = |v: usize| SolvableId::from_index(versions + v);
+
+    let mut next_version_set = 0usize;
+    let mut alloc_version_set = |snapshot: &mut DependencySnapshot, vs: VersionSet| {
+        let id = VersionSetId::from_index(next_version_set);
+        next_version_set += 1;
+        snapshot.version_sets.insert(id, vs);
+        id
+    };
+
+    snapshot.packages.insert(
+        a_name,
+        Package {
+            name: "a".to_string(),
+            solvables: (0..versions).map(a_solvable).collect(),
+            excluded: Vec::new(),
+        },
+    );
+    snapshot.packages.insert(
+        b_name,
+        Package {
+            name: "b".to_string(),
+            solvables: (0..versions).map(b_solvable).collect(),
+            excluded: Vec::new(),
+        },
+    );
+
+    for v in 0..versions {
+        // a=v requires exactly b=v.
+        let pin = alloc_version_set(
+            &mut snapshot,
+            VersionSet {
+                name: b_name,
+                display: format!("b =={v}"),
+                matching_candidates: [b_solvable(v)].into_iter().collect(),
+            },
+        );
+        snapshot.solvables.insert(
+            a_solvable(v),
+            Solvable {
+                display: format!("a={v}"),
+                name: a_name,
+                order: (versions - 1 - v) as u32,
+                dependencies: Dependencies::Known(KnownDependencies {
+                    requirements: vec![pin.into()],
+                    constrains: Vec::new(),
+                }),
+                hint_dependencies_available: false,
+            },
+        );
+
+        // Every b except b=0 requires something that does not exist.
+        let requirements = if v == 0 {
+            Vec::new()
+        } else {
+            let void = alloc_version_set(
+                &mut snapshot,
+                VersionSet {
+                    name: a_name,
+                    display: "void".to_string(),
+                    matching_candidates: Default::default(),
+                },
+            );
+            vec![void.into()]
+        };
+        snapshot.solvables.insert(
+            b_solvable(v),
+            Solvable {
+                display: format!("b={v}"),
+                name: b_name,
+                order: (versions - 1 - v) as u32,
+                dependencies: Dependencies::Known(KnownDependencies {
+                    requirements,
+                    constrains: Vec::new(),
+                }),
+                hint_dependencies_available: false,
+            },
+        );
+    }
+
+    let root = alloc_version_set(
+        &mut snapshot,
+        VersionSet {
+            name: a_name,
+            display: "a *".to_string(),
+            matching_candidates: (0..versions).map(a_solvable).collect(),
+        },
+    );
+
+    (snapshot, vec![root])
 }
 
 struct GenParams {
@@ -216,15 +322,19 @@ fn main() {
     println!("encoding,versions,seed,duration_s,clauses,result");
     for &versions in &opts.versions {
         for seed in 0..opts.seeds {
-            let (snapshot, root_version_sets) = generate(&GenParams {
-                layers: opts.layers,
-                width: opts.width,
-                versions,
-                deps: opts.deps,
-                spread: opts.spread,
-                max_offset: opts.max_offset,
-                seed,
-            });
+            let (snapshot, root_version_sets) = if opts.storm {
+                generate_storm(versions)
+            } else {
+                generate(&GenParams {
+                    layers: opts.layers,
+                    width: opts.width,
+                    versions,
+                    deps: opts.deps,
+                    spread: opts.spread,
+                    max_offset: opts.max_offset,
+                    seed,
+                })
+            };
 
             for (name, encoding) in &encodings {
                 let provider = snapshot

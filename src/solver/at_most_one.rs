@@ -63,6 +63,15 @@ pub enum AmoEncoding {
         group_size: usize,
     },
 
+    /// No clauses at all: sibling negations are *virtual*. Assigning a
+    /// candidate true records a package-level selection that is consulted by
+    /// every value lookup; all other candidates of the package evaluate to
+    /// false without being physically assigned. Pairwise reason clauses are
+    /// materialized lazily only when conflict analysis needs them.
+    ///
+    /// See `docs/virtual-sibling-negations.md` for the design.
+    Virtual,
+
     /// Pairwise clauses while the package has at most `threshold` candidates,
     /// switching to the binary encoding beyond that.
     ///
@@ -87,6 +96,7 @@ impl std::str::FromStr for AmoEncoding {
             "sequential" => Ok(AmoEncoding::Sequential),
             "commander" => Ok(AmoEncoding::Commander { group_size: 3 }),
             "bimander" => Ok(AmoEncoding::Bimander { group_size: 2 }),
+            "virtual" => Ok(AmoEncoding::Virtual),
             _ => {
                 if let Some(threshold) = s.strip_prefix("hybrid:") {
                     let threshold = threshold
@@ -150,6 +160,9 @@ pub(crate) struct AtMostOnceTracker<V> {
     /// tracked variables themselves, level `k + 1` groups the commander
     /// variables of level `k`.
     commander_levels: Vec<CommanderLevel<V>>,
+    /// The package index in the decision map's registry, for the virtual
+    /// encoding.
+    pub(crate) virtual_package: Option<u32>,
 }
 
 /// The state of one level of the commander encoding.
@@ -186,6 +199,7 @@ impl<V> Default for AtMostOnceTracker<V> {
             variables: IndexSet::default(),
             helpers: Vec::new(),
             commander_levels: Vec::new(),
+            virtual_package: None,
         }
     }
 }
@@ -242,6 +256,9 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
             }
             AmoEncoding::Bimander { group_size } => {
                 self.add_bimander(variable, group_size.max(1), alloc_clause, alloc_var)
+            }
+            AmoEncoding::Virtual => {
+                unreachable!("the virtual encoding is handled directly by the encoder")
             }
             AmoEncoding::Hybrid { threshold } => {
                 // Stay pairwise while the set is small and no helper variables

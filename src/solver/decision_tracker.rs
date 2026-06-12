@@ -12,7 +12,12 @@ pub(crate) struct DecisionTracker {
 
 impl DecisionTracker {
     pub(crate) fn clear(&mut self) {
-        *self = Default::default();
+        // Keep the package registry of the map: it mirrors the encoding
+        // state (which candidates belong to which package), not the search
+        // state.
+        self.map.reset_assignments();
+        self.stack.clear();
+        self.propagate_index = 0;
     }
 
     #[cfg(feature = "diagnostics")]
@@ -28,6 +33,11 @@ impl DecisionTracker {
     #[inline]
     pub(crate) fn map(&self) -> &DecisionMap {
         &self.map
+    }
+
+    #[inline]
+    pub(crate) fn map_mut(&mut self) -> &mut DecisionMap {
+        &mut self.map
     }
 
     pub(crate) fn stack(&self) -> impl DoubleEndedIterator<Item = Decision> + '_ {
@@ -57,6 +67,14 @@ impl DecisionTracker {
         match self.map.value(decision.variable) {
             None => {
                 self.map.set(decision.variable, decision.value, level);
+                // A true assignment of a tracked package candidate selects it
+                // for the whole package: all sibling candidates now evaluate
+                // to false without being physically assigned.
+                if decision.value {
+                    if let Some(package) = self.map.package_of(decision.variable) {
+                        self.map.set_selection(package, decision.variable, level);
+                    }
+                }
                 self.stack.push(decision);
                 Ok(true)
             }
@@ -83,6 +101,11 @@ impl DecisionTracker {
     pub(crate) fn undo_last(&mut self) -> (Decision, u32) {
         let decision = self.stack.pop().unwrap();
         self.map.reset(decision.variable);
+        if decision.value {
+            if let Some(package) = self.map.package_of(decision.variable) {
+                self.map.clear_selection(package);
+            }
+        }
 
         self.propagate_index = self.stack.len();
 
