@@ -130,8 +130,11 @@ pub(crate) struct DecisionMap {
     interval_undo: Vec<IntervalUndo>,
 }
 
-/// The interval state of a package before a prefix assignment.
+/// The interval state of a package before a *tightening* prefix assignment,
+/// tagged with the trail position of that assignment. Non-tightening
+/// assignments (chain entries) push no record.
 struct IntervalUndo {
+    trail_index: usize,
     package: u32,
     lo: u32,
     lo_driver: Option<(VariableId, u32)>,
@@ -377,9 +380,21 @@ impl DecisionMap {
         value: bool,
         variable_id: VariableId,
         level: u32,
+        trail_index: usize,
     ) {
         let state = &mut self.packages[package as usize];
+        // Only tightening assignments change the interval and need an undo
+        // record; chain entries are always within the current bounds.
+        let tightens = if value {
+            index < state.hi
+        } else {
+            index + 1 > state.lo
+        };
+        if !tightens {
+            return;
+        }
         self.interval_undo.push(IntervalUndo {
+            trail_index,
             package,
             lo: state.lo,
             lo_driver: state.lo_driver,
@@ -388,27 +403,27 @@ impl DecisionMap {
         });
         if value {
             // The selected candidate has index <= index.
-            if index < state.hi {
-                state.hi = index;
-                state.hi_driver = Some((variable_id, level));
-            }
+            state.hi = index;
+            state.hi_driver = Some((variable_id, level));
         } else {
             // The selected candidate has index > index.
-            if index + 1 > state.lo {
-                state.lo = index + 1;
-                state.lo_driver = Some((variable_id, level));
-            }
+            state.lo = index + 1;
+            state.lo_driver = Some((variable_id, level));
         }
     }
 
     /// Restores the interval state saved before the most recent prefix
     /// assignment. Prefix assignments are undone in reverse trail order, so
     /// popping the undo stack restores the exact previous state in O(1).
-    pub fn undo_prefix_assignment(&mut self, package: u32) {
-        let undo = self
-            .interval_undo
-            .pop()
-            .expect("every prefix assignment pushes an undo record");
+    pub fn undo_prefix_assignment(&mut self, package: u32, trail_index: usize) {
+        // Non-tightening assignments pushed no record.
+        let Some(last) = self.interval_undo.last() else {
+            return;
+        };
+        if last.trail_index != trail_index {
+            return;
+        }
+        let undo = self.interval_undo.pop().expect("checked above");
         debug_assert_eq!(undo.package, package);
         let state = &mut self.packages[package as usize];
         state.lo = undo.lo;

@@ -99,12 +99,14 @@ impl DecisionTracker {
                     // An explicit prefix assignment narrows the allowed
                     // candidate index interval of the package.
                     PackageVar::Prefix { package, index } => {
+                        let trail_index = self.stack.len();
                         self.map.apply_prefix_assignment(
                             package,
                             index,
                             decision.value,
                             decision.variable,
                             level,
+                            trail_index,
                         );
                     }
                     _ => {}
@@ -178,7 +180,7 @@ impl DecisionTracker {
         debug_assert_ne!(self.map.value(p), Some(!value), "inconsistent anchor");
         self.map.set(p, value, level);
         self.map
-            .apply_prefix_assignment(package, index, value, p, level);
+            .apply_prefix_assignment(package, index, value, p, level, self.stack.len());
         self.stack.push(Decision::new(p, value, reason));
     }
 
@@ -209,7 +211,7 @@ impl DecisionTracker {
                 }
             }
             PackageVar::Prefix { package, .. } => {
-                self.map.undo_prefix_assignment(package);
+                self.map.undo_prefix_assignment(package, self.stack.len());
             }
             _ => {}
         }
