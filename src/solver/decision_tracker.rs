@@ -1,4 +1,7 @@
-use crate::solver::{decision::Decision, decision_map::DecisionMap};
+use crate::solver::{
+    decision::Decision,
+    decision_map::{DecisionMap, PackageVar},
+};
 use crate::{VariableId, internal::id::ClauseId};
 
 /// Tracks the assignments to solvables, keeping a log that can be used to backtrack, and a map that
@@ -67,13 +70,37 @@ impl DecisionTracker {
         match self.map.value(decision.variable) {
             None => {
                 self.map.set(decision.variable, decision.value, level);
-                // A true assignment of a tracked package candidate selects it
-                // for the whole package: all sibling candidates now evaluate
-                // to false without being physically assigned.
-                if decision.value {
-                    if let Some(package) = self.map.package_of(decision.variable) {
-                        self.map.set_selection(package, decision.variable, level);
+                match self.map.var_role(decision.variable) {
+                    // A true assignment of a tracked package candidate
+                    // selects it for the whole package: all sibling
+                    // candidates now evaluate to false without being
+                    // physically assigned. Ladder packages (with prefix
+                    // variables) express the selection through two explicit
+                    // boundary prefix assignments pushed right behind the
+                    // member's own trail entry.
+                    PackageVar::Member { package, index } if decision.value => {
+                        if self.map.package_prefix_count(package) == 0 {
+                            self.map
+                                .set_selection(package, decision.variable, index, level);
+                        } else {
+                            self.stack.push(decision);
+                            return self
+                                .push_selection_boundaries(package, index, level)
+                                .map(|_| true);
+                        }
                     }
+                    // An explicit prefix assignment narrows the allowed
+                    // candidate index interval of the package.
+                    PackageVar::Prefix { package, index } => {
+                        self.map.apply_prefix_assignment(
+                            package,
+                            index,
+                            decision.value,
+                            decision.variable,
+                            level,
+                        );
+                    }
+                    _ => {}
                 }
                 self.stack.push(decision);
                 Ok(true)
@@ -81,6 +108,26 @@ impl DecisionTracker {
             Some(value) if value == decision.value => Ok(false),
             _ => Err(()),
         }
+    }
+
+    /// Pushes the two explicit boundary prefix assignments
+    /// (`p_{index-1} := false`, `p_index := true`) for a selection of the
+    /// `index`-th member of `package` (virtual-ladder encoding). The reasons
+    /// are the pre-materialized boundary clauses of the member.
+    pub(crate) fn push_selection_boundaries(
+        &mut self,
+        package: u32,
+        index: u32,
+        level: u32,
+    ) -> Result<(), ()> {
+        let (lower_reason, upper_reason) = self.map.boundary_reasons(package, index as usize);
+        if let Some(lower_reason) = lower_reason {
+            let p = self.map.package_prefix(package, (index - 1) as usize);
+            self.try_add_decision(Decision::new(p, false, lower_reason), level)?;
+        }
+        let p = self.map.package_prefix(package, index as usize);
+        self.try_add_decision(Decision::new(p, true, upper_reason), level)?;
+        Ok(())
     }
 
     pub(crate) fn undo_until(&mut self, level: u32) {
@@ -101,10 +148,18 @@ impl DecisionTracker {
     pub(crate) fn undo_last(&mut self) -> (Decision, u32) {
         let decision = self.stack.pop().unwrap();
         self.map.reset(decision.variable);
-        if decision.value {
-            if let Some(package) = self.map.package_of(decision.variable) {
-                self.map.clear_selection(package);
+        match self.map.var_role(decision.variable) {
+            PackageVar::Member { package, .. } if decision.value => {
+                if let Some((selected, _, _)) = self.map.selection(package) {
+                    if selected == decision.variable {
+                        self.map.clear_selection(package);
+                    }
+                }
             }
+            PackageVar::Prefix { package, .. } => {
+                self.map.recompute_interval(package);
+            }
+            _ => {}
         }
 
         self.propagate_index = self.stack.len();

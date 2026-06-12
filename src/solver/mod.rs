@@ -303,6 +303,9 @@ pub(crate) struct PropagationCounters {
     pub unwatched_calls_by_type: PropagationVisitsByType,
     pub propagate_calls: u64,
     pub conflicts: u64,
+    /// Virtual-AMO resolution choices during conflict analysis.
+    pub virtual_pairwise_resolutions: u64,
+    pub virtual_prefix_upgrades: u64,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -1313,46 +1316,87 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
             self.propagate_watches(watched_literal, level)?;
 
-            // With the virtual at-most-one encoding, a true assignment of a
-            // tracked candidate makes all sibling candidates evaluate to
-            // false without trail entries. Their watchers still have to
-            // observe the falsification.
-            if decision.value {
-                if let Some(package) = self
-                    .state
-                    .decision_tracker
-                    .map()
-                    .package_of(decision.variable)
-                {
-                    let member_count = self
+            // With the virtual at-most-one encodings, a true assignment of a
+            // tracked candidate (or any explicit prefix assignment) gives
+            // other variables of the package derived values without trail
+            // entries. Their watchers still have to observe that.
+            match self
+                .state
+                .decision_tracker
+                .map()
+                .var_role(decision.variable)
+            {
+                decision_map::PackageVar::Member { package, .. } if decision.value => {
+                    // Virtual-ladder packages express the selection through
+                    // boundary prefix assignments that were pushed together
+                    // with the member's trail entry; their own propagation
+                    // walks the derived falsifications.
+                    if self
                         .state
                         .decision_tracker
                         .map()
-                        .package_member_count(package);
-                    for index in 0..member_count {
-                        let member = self
-                            .state
-                            .decision_tracker
-                            .map()
-                            .package_member(package, index);
-                        if member == decision.variable
-                            || self
-                                .state
-                                .decision_tracker
-                                .map()
-                                .explicit_value(member)
-                                .is_some()
-                        {
-                            // The candidate's own assignment already walked
-                            // its watchers (or it is the selection itself).
-                            continue;
-                        }
-                        self.propagate_watches(Literal::new(member, false), level)?;
+                        .package_prefix_count(package)
+                        == 0
+                    {
+                        self.propagate_package_event(package, level, 0, usize::MAX)?;
                     }
                 }
+                decision_map::PackageVar::Prefix { package, index } => {
+                    // Only the side of the package this assignment constrains
+                    // can have received new derived values: `p := true` caps
+                    // the allowed indices at `index`, `p := false` raises the
+                    // floor to `index + 1`.
+                    let (lo, hi) = if decision.value {
+                        (index as usize + 1, usize::MAX)
+                    } else {
+                        (0, index as usize)
+                    };
+                    self.propagate_package_event(package, level, lo, hi)?;
+                }
+                _ => {}
             }
         }
 
+        Ok(())
+    }
+
+    /// Visits the watchers of every variable of `package` whose value is
+    /// derived (a candidate that became virtually false, or a prefix variable
+    /// that received a derived value) so the watch invariant holds without
+    /// physical assignments. Visiting a watcher more than once is harmless.
+    fn propagate_package_event(
+        &mut self,
+        package: u32,
+        level: u32,
+        index_lo: usize,
+        index_hi: usize,
+    ) -> Result<(), PropagationError> {
+        let member_count = self
+            .state
+            .decision_tracker
+            .map()
+            .package_member_count(package);
+        for index in index_lo..member_count.min(index_hi.saturating_add(1)) {
+            let map = self.state.decision_tracker.map();
+            let member = map.package_member(package, index);
+            if map.explicit_value(member).is_none() && map.value(member) == Some(false) {
+                self.propagate_watches(Literal::new(member, false), level)?;
+            }
+        }
+        let prefix_count = self
+            .state
+            .decision_tracker
+            .map()
+            .package_prefix_count(package);
+        for index in index_lo..prefix_count.min(index_hi.saturating_add(1)) {
+            let map = self.state.decision_tracker.map();
+            let prefix_var = map.package_prefix(package, index);
+            if map.explicit_value(prefix_var).is_none() {
+                if let Some(value) = map.value(prefix_var) {
+                    self.propagate_watches(Literal::new(prefix_var, value), level)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1590,9 +1634,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         tracing::debug!("=== ANALYZE UNSOLVABLE");
 
         let mut involved = HashSet::default();
-        // Pairwise reasons for virtually falsified variables; materialized at
-        // the end and added to the conflict.
-        let mut virtual_reasons: Vec<(VariableId, VariableId)> = Vec::new();
+        // Reasons for derived (virtual) assignments; materialized at the end
+        // and added to the conflict.
+        let mut virtual_reasons: Vec<(VariableId, Literal, u32)> = Vec::new();
         let map = self.state.decision_tracker.map();
         self.state.clauses.kinds[clause_id.to_index()].visit_literals(
             &self.state.learnt_clauses,
@@ -1601,12 +1645,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             |literal| {
                 let var = literal.variable();
                 involved.insert(var);
-                // A virtually falsified variable is explained by the selected
-                // candidate of its package.
+                // A derived assignment is explained by its explicit driver
+                // (the selected candidate or an explicit prefix variable).
                 if map.explicit_value(var).is_none() {
-                    if let Some((selected, _)) = map.virtual_selection(var) {
-                        virtual_reasons.push((selected, var));
-                        involved.insert(selected);
+                    if let Some((driver, a, lit)) = map.derived_reason(var) {
+                        let package = map.package_of(var).expect("derived variables are tracked");
+                        virtual_reasons.push((a, lit, package));
+                        involved.insert(driver);
                     }
                 }
             },
@@ -1654,9 +1699,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         let var = literal.variable();
                         involved.insert(var);
                         if map.explicit_value(var).is_none() {
-                            if let Some((selected, _)) = map.virtual_selection(var) {
-                                virtual_reasons.push((selected, var));
-                                involved.insert(selected);
+                            if let Some((driver, a, lit)) = map.derived_reason(var) {
+                                let package =
+                                    map.package_of(var).expect("derived variables are tracked");
+                                virtual_reasons.push((a, lit, package));
+                                involved.insert(driver);
                             }
                         }
                     }
@@ -1664,8 +1711,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             );
         }
 
-        for (selected, falsified) in virtual_reasons {
-            let reason = self.state.materialize_virtual_reason(selected, falsified);
+        for (a, lit, package) in virtual_reasons {
+            let reason = self.state.materialize_amo_reason(a, lit, package);
             conflict.add_clause(reason);
         }
 
@@ -1699,9 +1746,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut s_value;
         let mut learnt_why = Vec::new();
         let mut first_iteration = true;
-        // Pairwise reasons for virtually falsified variables, materialized
-        // after the loop releases the borrow on the clause kinds.
-        let mut virtual_reasons: Vec<(VariableId, VariableId)> = Vec::new();
+        // Reasons for derived (virtual) assignments, materialized after the
+        // loop releases the borrow on the clause kinds.
+        let mut virtual_reasons: Vec<(VariableId, Literal, u32)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let (mut virtual_pairwise, mut virtual_upgrades) = (0u64, 0u64);
         let clause_kinds = &self.state.clauses.kinds;
         loop {
             learnt_why.push(clause_id);
@@ -1722,19 +1771,33 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         return;
                     }
 
-                    // A variable that is only virtually false has no trail
-                    // entry; resolve it through the selected candidate of its
-                    // package (the resolution with the pairwise reason
-                    // `(¬selected ∨ ¬var)`).
+                    // A variable whose value is only derived (virtual) has
+                    // no trail entry; resolve it through its explicitly
+                    // assigned driver: the selected candidate (virtual
+                    // encoding) or a boundary prefix variable
+                    // (virtual-ladder encoding). Prefix drivers are
+                    // range-pruning literals: keeping them in the learnt
+                    // clause excludes whole candidate index ranges.
                     let mut var = literal.variable();
                     let map = self.state.decision_tracker.map();
                     if map.explicit_value(var).is_none() {
-                        if let Some((selected, _)) = map.virtual_selection(var) {
-                            virtual_reasons.push((selected, var));
-                            if !seen.insert(selected) {
+                        if let Some((driver, a, lit)) = map.derived_reason(var) {
+                            let package =
+                                map.package_of(var).expect("derived variables are tracked");
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                match map.var_role(driver) {
+                                    decision_map::PackageVar::Prefix { .. } => {
+                                        virtual_upgrades += 1
+                                    }
+                                    _ => virtual_pairwise += 1,
+                                }
+                            }
+                            virtual_reasons.push((a, lit, package));
+                            if !seen.insert(driver) {
                                 return;
                             }
-                            var = selected;
+                            var = driver;
                         }
                     }
 
@@ -1779,9 +1842,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
-        // Record the lazily materialized pairwise reasons in the proof chain.
-        for (selected, falsified) in virtual_reasons {
-            let reason = self.state.materialize_virtual_reason(selected, falsified);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state.propagation_counters.virtual_pairwise_resolutions += virtual_pairwise;
+            self.state.propagation_counters.virtual_prefix_upgrades += virtual_upgrades;
+        }
+
+        // Record the lazily materialized reasons in the proof chain.
+        for (a, lit, package) in virtual_reasons {
+            let reason = self.state.materialize_amo_reason(a, lit, package);
             learnt_why.push(reason);
         }
 
@@ -1857,26 +1926,15 @@ impl<D: DependencyProvider> SolverState<D> {
         clause_id
     }
 
-    /// Materializes the pairwise reason clause `(¬selected ∨ ¬falsified)` for
-    /// a virtual falsification: `falsified` evaluates to false only because
-    /// `selected` is the chosen candidate of their shared package. The clause
-    /// is allocated without watches; it is already satisfied and only serves
-    /// as a reason in conflict analysis and error reporting.
-    fn materialize_virtual_reason(
-        &mut self,
-        selected: VariableId,
-        falsified: VariableId,
-    ) -> ClauseId {
-        let package = self
-            .decision_tracker
-            .map()
-            .package_of(falsified)
-            .expect("virtually falsified variables belong to a tracked package");
+    /// Materializes a reason clause `(¬a ∨ lit)` for a derived (virtual)
+    /// assignment of the at-most-one machinery of `package` — a pairwise
+    /// sibling exclusion, a candidate/prefix link, or a prefix chain link.
+    /// The clause is allocated without watches; it is already satisfied and
+    /// only serves as a reason in conflict analysis and error reporting.
+    fn materialize_amo_reason(&mut self, a: VariableId, lit: Literal, package: u32) -> ClauseId {
         let name = self.virtual_package_names[package as usize];
-        self.clauses.alloc(
-            None,
-            Clause::ForbidMultipleInstances(selected, falsified.negative(), name),
-        )
+        self.clauses
+            .alloc(None, Clause::ForbidMultipleInstances(a, lit, name))
     }
 
     /// Returns the solvables that the solver has chosen to include in the

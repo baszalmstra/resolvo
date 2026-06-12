@@ -72,6 +72,16 @@ pub enum AmoEncoding {
     /// See `docs/virtual-sibling-negations.md` for the design.
     Virtual,
 
+    /// Like [`AmoEncoding::Virtual`], but each candidate additionally gets a
+    /// *prefix variable* `pᵢ` ("the selected candidate has index ≤ i" in
+    /// discovery order). Prefix variables receive values derived from the
+    /// package selection, conflict analysis substitutes virtually falsified
+    /// candidates with prefix literals, and learnt clauses can therefore
+    /// assert explicit prefix assignments that exclude whole candidate
+    /// ranges — combining the virtual trail mechanics with range-compressed
+    /// learning like the sequential (ladder) encoding.
+    VirtualLadder,
+
     /// Pairwise clauses while the package has at most `threshold` candidates,
     /// switching to the binary encoding beyond that.
     ///
@@ -97,6 +107,7 @@ impl std::str::FromStr for AmoEncoding {
             "commander" => Ok(AmoEncoding::Commander { group_size: 3 }),
             "bimander" => Ok(AmoEncoding::Bimander { group_size: 2 }),
             "virtual" => Ok(AmoEncoding::Virtual),
+            "virtual-ladder" => Ok(AmoEncoding::VirtualLadder),
             _ => {
                 if let Some(threshold) = s.strip_prefix("hybrid:") {
                     let threshold = threshold
@@ -257,8 +268,8 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
             AmoEncoding::Bimander { group_size } => {
                 self.add_bimander(variable, group_size.max(1), alloc_clause, alloc_var)
             }
-            AmoEncoding::Virtual => {
-                unreachable!("the virtual encoding is handled directly by the encoder")
+            AmoEncoding::Virtual | AmoEncoding::VirtualLadder => {
+                unreachable!("the virtual encodings are handled directly by the encoder")
             }
             AmoEncoding::Hybrid { threshold } => {
                 // Stay pairwise while the set is small and no helper variables

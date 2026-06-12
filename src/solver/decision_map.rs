@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 
 use crate::VariableId;
 use crate::id::DenseIndex;
+use crate::internal::id::ClauseId;
+use crate::solver::clause::Literal;
 
 /// Represents a decision (i.e. an assignment to a variable) and the level at
 /// which it was made
@@ -36,32 +38,75 @@ impl DecisionAndLevel {
     }
 }
 
-/// Marker for variables that are not a member of any tracked package.
-const NO_PACKAGE: u32 = u32::MAX;
+/// The role a variable plays in the virtual at-most-one machinery.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PackageVar {
+    /// Not part of any tracked package.
+    None,
+    /// The `index`-th candidate of the tracked package.
+    Member { package: u32, index: u32 },
+    /// The prefix variable `p_index` of the tracked package: "the selected
+    /// candidate has index ≤ index".
+    Prefix { package: u32, index: u32 },
+}
 
 /// The candidates of one package tracked for virtual at-most-one handling.
 struct PackageState {
-    /// The candidate that is currently assigned true (and the level of that
-    /// assignment), if any. While set, every other member is implicitly
-    /// false.
-    selected: Option<(VariableId, u32)>,
+    /// The candidate that is currently assigned true: its variable, member
+    /// index and assignment level. While set, every other member is
+    /// implicitly false.
+    selected: Option<(VariableId, u32, u32)>,
     /// All registered candidate variables of this package.
     members: Vec<VariableId>,
+    /// The prefix variables, parallel to `members` (only allocated by the
+    /// virtual-ladder encoding).
+    prefix_vars: Vec<VariableId>,
+    /// Per member: the pre-materialized boundary reason clauses
+    /// `(¬member ∨ ¬p_{index-1})` and `(¬member ∨ p_index)` used when the
+    /// member is selected (virtual-ladder encoding). Parallel to `members`.
+    boundary_reasons: Vec<(Option<ClauseId>, ClauseId)>,
+    /// The minimum still-allowed member index, derived from explicitly false
+    /// prefix variables, along with the driving variable and its level.
+    lo: u32,
+    lo_driver: Option<(VariableId, u32)>,
+    /// The maximum still-allowed member index, derived from explicitly true
+    /// prefix variables, along with the driving variable and its level.
+    hi: u32,
+    hi_driver: Option<(VariableId, u32)>,
+}
+
+impl PackageState {
+    fn new() -> Self {
+        Self {
+            selected: None,
+            members: Vec::new(),
+            prefix_vars: Vec::new(),
+            boundary_reasons: Vec::new(),
+            lo: 0,
+            lo_driver: None,
+            hi: u32::MAX,
+            hi_driver: None,
+        }
+    }
 }
 
 /// A map of the assignments to solvables.
 ///
-/// With the virtual at-most-one encoding ([`crate::AmoEncoding::Virtual`])
-/// the map additionally tracks one *selection* per package: when a candidate
-/// of a tracked package is assigned true, all other candidates of that
-/// package evaluate to false without being physically assigned.
+/// With the virtual at-most-one encodings ([`crate::AmoEncoding::Virtual`]
+/// and [`crate::AmoEncoding::VirtualLadder`]) the map additionally tracks one
+/// *selection* per package — when a candidate of a tracked package is
+/// assigned true, all other candidates evaluate to false without being
+/// physically assigned — and, for the ladder variant, an interval `[lo, hi]`
+/// of still-allowed candidate indices derived from explicit prefix variable
+/// assignments.
 #[derive(Default)]
 pub(crate) struct DecisionMap {
     map: Vec<DecisionAndLevel>,
 
-    /// The package index of each variable, or [`NO_PACKAGE`]. Only populated
-    /// for candidates registered through [`Self::register_package_member`].
-    var_to_package: Vec<u32>,
+    /// The package role of each variable. Only populated for variables
+    /// registered through [`Self::register_package_member`] or
+    /// [`Self::register_package_prefix`].
+    var_roles: Vec<PackageVar>,
 
     /// State per tracked package.
     packages: Vec<PackageState>,
@@ -73,11 +118,16 @@ impl DecisionMap {
         self.map.len()
     }
 
-    /// Clears all assignments and selections but keeps the package registry.
+    /// Clears all assignments, selections and intervals but keeps the package
+    /// registry.
     pub fn reset_assignments(&mut self) {
         self.map.clear();
         for package in &mut self.packages {
             package.selected = None;
+            package.lo = 0;
+            package.lo_driver = None;
+            package.hi = u32::MAX;
+            package.hi_driver = None;
         }
     }
 
@@ -110,7 +160,7 @@ impl DecisionMap {
     pub fn level(&self, variable_id: VariableId) -> u32 {
         match self.map.get(variable_id.to_index()) {
             Some(d) if d.value().is_some() => d.level(),
-            _ => match self.virtual_selection(variable_id) {
+            _ => match self.derived_value_and_level(variable_id) {
                 Some((_, level)) => level,
                 None => 0,
             },
@@ -121,75 +171,197 @@ impl DecisionMap {
     pub fn value(&self, variable_id: VariableId) -> Option<bool> {
         match self.map.get(variable_id.to_index()).and_then(|d| d.value()) {
             Some(value) => Some(value),
-            None => self.virtual_selection(variable_id).map(|_| false),
+            None => self
+                .derived_value_and_level(variable_id)
+                .map(|(value, _)| value),
         }
     }
 
-    /// Returns the physically assigned value of a variable, ignoring virtual
-    /// falsification through a package selection.
+    /// Returns the physically assigned value of a variable, ignoring values
+    /// derived from package selections or prefix intervals.
     #[inline]
     pub fn explicit_value(&self, variable_id: VariableId) -> Option<bool> {
         self.map.get(variable_id.to_index()).and_then(|d| d.value())
     }
 
-    /// If `variable_id` is a member of a tracked package whose selection is a
-    /// *different* candidate, returns that selected candidate and the level
-    /// of its assignment. Such a variable evaluates to false.
+    /// Returns the derived (virtual) value and level of a variable, if any.
+    /// Does *not* consult the explicit assignment.
+    pub fn derived_value_and_level(&self, variable_id: VariableId) -> Option<(bool, u32)> {
+        match self.var_role(variable_id) {
+            PackageVar::None => None,
+            PackageVar::Member { package, index } => {
+                let state = &self.packages[package as usize];
+                if let Some((selected, _, level)) = state.selected {
+                    if selected != variable_id {
+                        return Some((false, level));
+                    }
+                    return None;
+                }
+                if index < state.lo {
+                    let (_, level) = state.lo_driver.expect("lo > 0 implies a driver");
+                    return Some((false, level));
+                }
+                if index > state.hi {
+                    let (_, level) = state.hi_driver.expect("bounded hi implies a driver");
+                    return Some((false, level));
+                }
+                None
+            }
+            PackageVar::Prefix { package, index } => {
+                let state = &self.packages[package as usize];
+                if let Some((_, selected_index, level)) = state.selected {
+                    return Some((selected_index <= index, level));
+                }
+                if state.hi <= index {
+                    let (_, level) = state.hi_driver.expect("bounded hi implies a driver");
+                    return Some((true, level));
+                }
+                if state.lo > index {
+                    let (_, level) = state.lo_driver.expect("lo > 0 implies a driver");
+                    return Some((false, level));
+                }
+                None
+            }
+        }
+    }
+
+    /// Returns the role of a variable in the virtual at-most-one machinery.
     #[inline]
-    pub fn virtual_selection(&self, variable_id: VariableId) -> Option<(VariableId, u32)> {
-        let &package = self.var_to_package.get(variable_id.to_index())?;
-        if package == NO_PACKAGE {
-            return None;
+    pub fn var_role(&self, variable_id: VariableId) -> PackageVar {
+        self.var_roles
+            .get(variable_id.to_index())
+            .copied()
+            .unwrap_or(PackageVar::None)
+    }
+
+    fn set_var_role(&mut self, variable_id: VariableId, role: PackageVar) {
+        let index = variable_id.to_index();
+        if index >= self.var_roles.len() {
+            self.var_roles.resize(index + 1, PackageVar::None);
         }
-        match self.packages[package as usize].selected {
-            Some((selected, level)) if selected != variable_id => Some((selected, level)),
-            _ => None,
-        }
+        debug_assert_eq!(self.var_roles[index], PackageVar::None);
+        self.var_roles[index] = role;
     }
 
     /// Allocates a new tracked package and returns its index.
     pub fn alloc_package(&mut self) -> u32 {
         let index = self.packages.len() as u32;
-        self.packages.push(PackageState {
-            selected: None,
-            members: Vec::new(),
-        });
+        self.packages.push(PackageState::new());
         index
     }
 
-    /// Registers `variable_id` as a candidate of `package`.
-    pub fn register_package_member(&mut self, package: u32, variable_id: VariableId) {
-        let index = variable_id.to_index();
-        if index >= self.var_to_package.len() {
-            self.var_to_package.resize(index + 1, NO_PACKAGE);
-        }
-        debug_assert_eq!(self.var_to_package[index], NO_PACKAGE);
-        self.var_to_package[index] = package;
+    /// Registers `variable_id` as the next candidate of `package` and returns
+    /// its member index.
+    pub fn register_package_member(&mut self, package: u32, variable_id: VariableId) -> u32 {
+        let member_index = self.packages[package as usize].members.len() as u32;
+        self.set_var_role(
+            variable_id,
+            PackageVar::Member {
+                package,
+                index: member_index,
+            },
+        );
         self.packages[package as usize].members.push(variable_id);
+        member_index
     }
 
-    /// Returns the tracked package `variable_id` belongs to, if any.
-    #[inline]
-    pub fn package_of(&self, variable_id: VariableId) -> Option<u32> {
-        match self.var_to_package.get(variable_id.to_index()) {
-            Some(&package) if package != NO_PACKAGE => Some(package),
-            _ => None,
-        }
+    /// Registers `variable_id` as the next prefix variable of `package`
+    /// (virtual-ladder encoding), along with the pre-materialized boundary
+    /// reason clauses of the member with the same index.
+    pub fn register_package_prefix(
+        &mut self,
+        package: u32,
+        variable_id: VariableId,
+        boundary_reasons: (Option<ClauseId>, ClauseId),
+    ) {
+        let index = self.packages[package as usize].prefix_vars.len() as u32;
+        self.set_var_role(variable_id, PackageVar::Prefix { package, index });
+        self.packages[package as usize]
+            .prefix_vars
+            .push(variable_id);
+        self.packages[package as usize]
+            .boundary_reasons
+            .push(boundary_reasons);
     }
 
-    /// Returns the current selection of `package`.
+    /// The boundary reason clauses of the `index`-th member of `package`.
     #[inline]
-    pub fn selection(&self, package: u32) -> Option<(VariableId, u32)> {
+    pub fn boundary_reasons(&self, package: u32, index: usize) -> (Option<ClauseId>, ClauseId) {
+        self.packages[package as usize].boundary_reasons[index]
+    }
+
+    /// Returns the current selection of `package`: the selected variable, its
+    /// member index, and the assignment level.
+    #[inline]
+    pub fn selection(&self, package: u32) -> Option<(VariableId, u32, u32)> {
         self.packages[package as usize].selected
     }
 
-    pub fn set_selection(&mut self, package: u32, variable_id: VariableId, level: u32) {
+    pub fn set_selection(&mut self, package: u32, variable_id: VariableId, index: u32, level: u32) {
         debug_assert!(self.packages[package as usize].selected.is_none());
-        self.packages[package as usize].selected = Some((variable_id, level));
+        self.packages[package as usize].selected = Some((variable_id, index, level));
     }
 
     pub fn clear_selection(&mut self, package: u32) {
         self.packages[package as usize].selected = None;
+    }
+
+    /// Updates the allowed-index interval of a package for an explicit prefix
+    /// assignment `p_index := value`.
+    pub fn apply_prefix_assignment(
+        &mut self,
+        package: u32,
+        index: u32,
+        value: bool,
+        variable_id: VariableId,
+        level: u32,
+    ) {
+        let state = &mut self.packages[package as usize];
+        if value {
+            // The selected candidate has index <= index.
+            if index < state.hi {
+                state.hi = index;
+                state.hi_driver = Some((variable_id, level));
+            }
+        } else {
+            // The selected candidate has index > index.
+            if index + 1 > state.lo {
+                state.lo = index + 1;
+                state.lo_driver = Some((variable_id, level));
+            }
+        }
+    }
+
+    /// Recomputes the allowed-index interval of a package from the explicit
+    /// prefix assignments. Called when a prefix assignment is undone.
+    pub fn recompute_interval(&mut self, package: u32) {
+        let mut lo = 0u32;
+        let mut lo_driver = None;
+        let mut hi = u32::MAX;
+        let mut hi_driver = None;
+        for (index, &prefix_var) in self.packages[package as usize]
+            .prefix_vars
+            .iter()
+            .enumerate()
+        {
+            let index = index as u32;
+            match self.explicit_value(prefix_var) {
+                Some(true) if index < hi => {
+                    hi = index;
+                    hi_driver = Some((prefix_var, self.map[prefix_var.to_index()].level()));
+                }
+                Some(false) if index + 1 > lo => {
+                    lo = index + 1;
+                    lo_driver = Some((prefix_var, self.map[prefix_var.to_index()].level()));
+                }
+                _ => {}
+            }
+        }
+        let state = &mut self.packages[package as usize];
+        state.lo = lo;
+        state.lo_driver = lo_driver;
+        state.hi = hi;
+        state.hi_driver = hi_driver;
     }
 
     /// The number of registered candidates of `package`.
@@ -202,5 +374,83 @@ impl DecisionMap {
     #[inline]
     pub fn package_member(&self, package: u32, index: usize) -> VariableId {
         self.packages[package as usize].members[index]
+    }
+
+    /// The number of allocated prefix variables of `package`.
+    #[inline]
+    pub fn package_prefix_count(&self, package: u32) -> usize {
+        self.packages[package as usize].prefix_vars.len()
+    }
+
+    /// Returns the `index`-th prefix variable of `package`.
+    #[inline]
+    pub fn package_prefix(&self, package: u32, index: usize) -> VariableId {
+        self.packages[package as usize].prefix_vars[index]
+    }
+
+    /// For a variable whose value is derived (not explicit), returns the
+    /// explicitly assigned *driver* variable it can be resolved through, and
+    /// the reason clause `(¬a ∨ lit)` that justifies the derivation.
+    ///
+    /// Returns `None` if the variable has no derived value.
+    pub fn derived_reason(
+        &self,
+        variable_id: VariableId,
+    ) -> Option<(VariableId, VariableId, Literal)> {
+        match self.var_role(variable_id) {
+            PackageVar::None => None,
+            PackageVar::Member { package, index } => {
+                let state = &self.packages[package as usize];
+                if let Some((selected, _, _)) = state.selected {
+                    if selected != variable_id {
+                        // (¬selected ∨ ¬member)
+                        return Some((selected, selected, variable_id.negative()));
+                    }
+                    return None;
+                }
+                if index < state.lo {
+                    // member → p_{lo-1}: (¬member ∨ p_{lo-1}), driver false.
+                    let (driver, _) = state.lo_driver.expect("lo > 0 implies a driver");
+                    return Some((driver, variable_id, driver.positive()));
+                }
+                if index > state.hi {
+                    // (¬member ∨ ¬p_hi), driver true.
+                    let (driver, _) = state.hi_driver.expect("bounded hi implies a driver");
+                    return Some((driver, variable_id, driver.negative()));
+                }
+                None
+            }
+            PackageVar::Prefix { package, index } => {
+                let state = &self.packages[package as usize];
+                if let Some((selected, selected_index, _)) = state.selected {
+                    // (¬selected ∨ p) if the selection is at or below the
+                    // prefix index, (¬selected ∨ ¬p) otherwise.
+                    let value = selected_index <= index;
+                    return Some((selected, selected, Literal::new(variable_id, !value)));
+                }
+                if state.hi <= index {
+                    // p_hi → p_index (monotone): (¬p_hi ∨ p_index).
+                    let (driver, _) = state.hi_driver.expect("bounded hi implies a driver");
+                    return Some((driver, driver, variable_id.positive()));
+                }
+                if state.lo > index {
+                    // p_index → p_{lo-1} (monotone): (¬p_index ∨ p_{lo-1}).
+                    let (driver, _) = state.lo_driver.expect("lo > 0 implies a driver");
+                    return Some((driver, variable_id, driver.positive()));
+                }
+                None
+            }
+        }
+    }
+
+    /// Returns the package a derived variable belongs to, if any.
+    #[inline]
+    pub fn package_of(&self, variable_id: VariableId) -> Option<u32> {
+        match self.var_role(variable_id) {
+            PackageVar::None => None,
+            PackageVar::Member { package, .. } | PackageVar::Prefix { package, .. } => {
+                Some(package)
+            }
+        }
     }
 }

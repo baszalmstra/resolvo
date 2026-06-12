@@ -188,6 +188,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         )
         .unwrap();
         writeln!(writer, "Conflicts:\t{}", counters.conflicts).unwrap();
+        writeln!(
+            writer,
+            "Virtual resolutions:\tpairwise={} prefix={}",
+            counters.virtual_pairwise_resolutions, counters.virtual_prefix_upgrades
+        )
+        .unwrap();
 
         writeln!(writer, "\nClause visits by type:").unwrap();
         let vbt = &counters.visits_by_type;

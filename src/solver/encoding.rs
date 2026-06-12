@@ -720,12 +720,16 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         .map(move |candidate_var| (name_id, candidate_var))
                 })
         {
-            if matches!(amo_encoding, crate::AmoEncoding::Virtual) {
+            if matches!(
+                amo_encoding,
+                crate::AmoEncoding::Virtual | crate::AmoEncoding::VirtualLadder
+            ) {
                 Self::register_virtual_candidate(
                     self.state,
                     &mut self.conflicting_clauses,
                     name_id,
                     candidate_var,
+                    matches!(amo_encoding, crate::AmoEncoding::VirtualLadder),
                 );
                 continue;
             }
@@ -822,6 +826,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         conflicting_clauses: &mut Vec<ClauseId>,
         name_id: D::NameId,
         candidate_var: VariableId,
+        with_prefix_vars: bool,
     ) {
         let mut tracker = state
             .at_most_one_trackers
@@ -840,10 +845,58 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 }
             };
 
+            let member_index = state
+                .decision_tracker
+                .map_mut()
+                .register_package_member(package, candidate_var);
+
+            // The ladder variant allocates a prefix variable per candidate so
+            // that conflict analysis can express candidate ranges, and
+            // pre-materializes the member's boundary reason clauses
+            // `(¬member ∨ ¬p_{index-1})` and `(¬member ∨ p_index)`.
+            if with_prefix_vars {
+                let prefix_var = state.variable_map.alloc_forbid_multiple_variable(name_id);
+                let lower_reason = if member_index > 0 {
+                    let previous_prefix = state
+                        .decision_tracker
+                        .map()
+                        .package_prefix(package, (member_index - 1) as usize);
+                    Some(state.materialize_amo_reason(
+                        candidate_var,
+                        previous_prefix.negative(),
+                        package,
+                    ))
+                } else {
+                    None
+                };
+                let upper_reason =
+                    state.materialize_amo_reason(candidate_var, prefix_var.positive(), package);
+                state.decision_tracker.map_mut().register_package_prefix(
+                    package,
+                    prefix_var,
+                    (lower_reason, upper_reason),
+                );
+            }
+
             let map = state.decision_tracker.map_mut();
-            map.register_package_member(package, candidate_var);
 
             match map.explicit_value(candidate_var) {
+                // A candidate that was decided before registration but is
+                // already excluded by the package's prefix interval means a
+                // different candidate is true too: conflict.
+                Some(true) if with_prefix_vars && map.derived_reason(candidate_var).is_some() => {
+                    let (_, a, lit) = map
+                        .derived_reason(candidate_var)
+                        .expect("checked in the guard");
+                    let clause_id = state.materialize_amo_reason(a, lit, package);
+                    conflicting_clauses.push(clause_id);
+                }
+                // The candidate was decided before it was registered: adopt
+                // it through the selection record (boundary prefix
+                // assignments cannot be inserted retroactively at the
+                // member's level without breaking the trail's level
+                // monotonicity). The next regular decision of this package
+                // uses boundaries again.
                 Some(true) => match map.selection(package) {
                     None => {
                         // The candidate was decided before it was registered:
@@ -851,7 +904,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         // watchers of all other members observe the
                         // falsification.
                         let level = map.level(candidate_var);
-                        map.set_selection(package, candidate_var, level);
+                        map.set_selection(package, candidate_var, member_index, level);
                         for index in 0..map.package_member_count(package) {
                             let member = map.package_member(package, index);
                             if member != candidate_var && map.explicit_value(member).is_none() {
@@ -859,18 +912,24 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                             }
                         }
                     }
-                    Some((selected, _)) if selected != candidate_var => {
+                    Some((selected, _, _)) if selected != candidate_var => {
                         // Two candidates of the same package are true. This
                         // parallels the (false, false) conflict case of the
                         // clausal encodings: report a conflict through a
                         // materialized pairwise clause.
-                        let clause_id = state.materialize_virtual_reason(selected, candidate_var);
+                        let clause_id = state.materialize_amo_reason(
+                            selected,
+                            candidate_var.negative(),
+                            package,
+                        );
                         conflicting_clauses.push(clause_id);
                     }
                     Some(_) => {}
                 },
                 None => {
-                    if map.virtual_selection(candidate_var).is_some() {
+                    // The candidate may be virtually false already (an active
+                    // selection or interval): its watchers must observe that.
+                    if map.value(candidate_var) == Some(false) {
                         state
                             .pending_virtual_falsifications
                             .push(candidate_var.positive());

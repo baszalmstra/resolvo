@@ -1539,6 +1539,7 @@ fn test_amo_encodings_agree() {
         AmoEncoding::Bimander { group_size: 2 },
         AmoEncoding::Hybrid { threshold: 3 },
         AmoEncoding::Virtual,
+        AmoEncoding::VirtualLadder,
     ] {
         assert_eq!(
             solve_with(encoding),
