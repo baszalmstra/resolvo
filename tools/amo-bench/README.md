@@ -113,6 +113,40 @@ Running the solver test suite with each encoding (via `RESOLVO_AMO_ENCODING`):
 - The hybrid (pairwise below a threshold) does not pay off: the binary
   encoding's helper overhead at small n is already negligible, and the
   pairwise clauses are pure overhead once the threshold is crossed.
+
+### Virtual sibling negations (`virtual`)
+
+`AmoEncoding::Virtual` emits no at-most-one clauses at all (see
+`docs/virtual-sibling-negations.md`): assigning a candidate true records a
+package-level selection consulted by every value lookup, the watchers of the
+sibling candidates are visited directly, and conflict analysis resolves
+virtually falsified variables through lazily materialized pairwise reasons.
+
+On the boto3-style backtracking storm (`--storm`: a=v pins b=v, every b but
+the oldest is dead, the solver walks every version with no real search):
+
+| encoding   | n=1400: FM clauses / FM visits / propagated / wall | n=5000 wall |
+| ---------- | -------------------------------------------------- | ----------- |
+| binary     | 30 800 / 15.8 M / 2.97 M / 0.28 s                  | 5.07 s      |
+| sequential | 8 392 / 5.9 M / 5.88 M / 0.22 s                    | 2.96 s      |
+| virtual    | **0 / 0 / 1.96 M / 0.11 s**                        | **1.52 s**  |
+
+The remaining propagated assignments are negative-assertion replays, not
+sibling negations. This is the regime the virtual design targets, and it wins
+by 2.5–3.3× over the current encoding, growing with the candidate count.
+
+On conflict-heavy workloads the trade inverts: virtual learnt clauses are
+pairwise-shaped (no helper variables to compress candidate ranges), so the
+solver conflicts roughly twice as often as with the ladder/commander helpers
+(measured 10.1 k vs 3.3–5.5 k conflicts on the synthetic V=100 instance) and
+the random conda-forge suite — dominated by unsat conflict analysis — is
+~40% slower than binary (mean 0.943 s vs 0.666 s, slower on 124 of 133
+non-trivial problems). All verdicts and solutions stay identical.
+
+The natural follow-up for a best-of-both design is to keep the virtual trail
+mechanics but learn over package-level literals (PubGrub-style terms) instead
+of per-candidate literals, so a learnt clause can exclude a whole candidate
+range without helper variables.
 - Pairwise is uniformly worse on anything but tiny candidate sets, both in
   time and in memory (O(n²) clauses; 259 MB peak RSS for four packages with
   2 000 candidates, vs ~3 MB for the others).
