@@ -143,10 +143,33 @@ the random conda-forge suite — dominated by unsat conflict analysis — is
 ~40% slower than binary (mean 0.943 s vs 0.666 s, slower on 124 of 133
 non-trivial problems). All verdicts and solutions stay identical.
 
-The natural follow-up for a best-of-both design is to keep the virtual trail
-mechanics but learn over package-level literals (PubGrub-style terms) instead
-of per-candidate literals, so a learnt clause can exclude a whole candidate
-range without helper variables.
+### Virtual ladder (`virtual-ladder`)
+
+`AmoEncoding::VirtualLadder` implements the best-of-both follow-up: one
+prefix variable per candidate ("selected index ≤ i"), two explicit boundary
+prefix assignments pushed behind every candidate decision (with
+pre-materialized reasons), and an allowed-index interval per package that
+derives all other values in O(1). Conflict analysis resolves sibling
+falsifications into prefix literals, so learnt clauses assert range-pruning
+prefix assignments — three trail entries per selection instead of n.
+
+| workload                | binary  | sequential | virtual | virtual-ladder |
+| ----------------------- | ------- | ---------- | ------- | -------------- |
+| storm n=1400            | 0.30 s  | 0.22 s     | 0.14 s  | **0.14 s**     |
+| storm n=5000            | 5.07 s  | 2.88 s     | 1.68 s  | **1.85 s**     |
+| conflict-heavy V=100    | ~0.45 s | 0.31 s     | 1.0 s   | **0.48 s**     |
+| conflict-heavy conflicts| 5.5 k   | 3.3 k      | 10.1 k  | **5.1 k**      |
+| conda-forge mean (150)  | 0.67 s  | 0.77 s     | 0.94 s  | **0.84 s**     |
+
+It strictly dominates the plain virtual encoding (equal on storms, ~2×
+faster on conflict-heavy workloads with half the conflicts — all conflict
+resolutions are prefix-shaped) and strictly dominates binary on storms while
+matching it on conflict-heavy search. The clausal sequential/commander
+encodings remain ahead on the unsat-dominated random conda-forge suite:
+their full helper chains live on the trail, giving conflict analysis finer
+UIP granularity than the two boundary literals per selection. Memory: n
+prefix variables plus 2n unwatched reason clauses per package — comparable
+to sequential's clause count, but with zero watch-list traffic.
 - Pairwise is uniformly worse on anything but tiny candidate sets, both in
   time and in memory (O(n²) clauses; 259 MB peak RSS for four packages with
   2 000 candidates, vs ~3 MB for the others).
