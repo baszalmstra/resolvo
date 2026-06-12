@@ -43,7 +43,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 Clause::Learnt(..) => {
                     learned_clauses += 1;
                 }
-                Clause::Constrains(..) => {
+                Clause::Constrains(..)
+                | Clause::ConstrainsExcluded(..)
+                | Clause::ConstrainsParent(..) => {
                     constrains_clauses += 1;
                 }
                 Clause::AnyOf(..) => {
@@ -60,6 +62,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 None => assertion_clauses += 1,
                 Some(_) => match clause {
                     Clause::Constrains(..)
+                    | Clause::ConstrainsExcluded(..)
+                    | Clause::ConstrainsParent(..)
                     | Clause::ForbidMultipleInstances(..)
                     | Clause::Lock(..)
                     | Clause::AnyOf(..) => binary_watched += 1,
@@ -211,6 +215,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             )
             .unwrap();
         }
+
+        let queue_counters = &self.state.decide_queue.counters;
+        writeln!(writer, "\n=== Decide Queue ===").unwrap();
+        writeln!(writer, "Sync touches:\t{}", queue_counters.sync_touches).unwrap();
+        writeln!(
+            writer,
+            "Selection visits:\t{}",
+            queue_counters.selection_visits
+        )
+        .unwrap();
+        writeln!(writer, "- Hot:\t{}", queue_counters.hot_visits).unwrap();
+        writeln!(writer, "Dequeues:\t{}", queue_counters.dequeues).unwrap();
+        writeln!(writer, "Walk evaluations:\t{}", queue_counters.walk_evals).unwrap();
 
         writeln!(writer, "\n=== Phase Timing ===").unwrap();
         writeln!(
