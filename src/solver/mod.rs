@@ -1356,13 +1356,26 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // Only the side of the package this assignment constrains
                     // can have received new derived values: `p := true` caps
                     // the allowed indices at `index`, `p := false` raises the
-                    // floor to `index + 1`.
-                    let (lo, hi) = if decision.value {
-                        (index as usize + 1, usize::MAX)
-                    } else {
-                        (0, index as usize)
+                    // floor to `index + 1`. If the assignment did not tighten
+                    // the interval (it is not the current bound driver), the
+                    // derived values are unchanged and no watchers have to be
+                    // visited.
+                    let is_driver = {
+                        let map = self.state.decision_tracker.map();
+                        if decision.value {
+                            map.hi_driver(package).map(|(v, _)| v) == Some(decision.variable)
+                        } else {
+                            map.lo_driver(package).map(|(v, _)| v) == Some(decision.variable)
+                        }
                     };
-                    self.propagate_package_event(package, level, lo, hi)?;
+                    if is_driver {
+                        let (lo, hi) = if decision.value {
+                            (index as usize + 1, usize::MAX)
+                        } else {
+                            (0, index as usize)
+                        };
+                        self.propagate_package_event(package, level, lo, hi)?;
+                    }
                 }
                 _ => {}
             }

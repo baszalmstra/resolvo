@@ -128,6 +128,35 @@ impl DecisionTracker {
         let p = self.map.package_prefix(package, index as usize);
         self.try_add_decision(Decision::new(p, true, upper_reason), level)?;
 
+        // Adaptive chain window: push explicit chain entries over the index
+        // window between the previous selection of this package and this
+        // one. Conflicts cluster at the moving search frontier, and explicit
+        // prefix entries there give conflict analysis the same adjacent-step
+        // granularity as the clausal sequential encoding, at a cost
+        // proportional to how far the frontier moved instead of the
+        // candidate count. The entries are pure learning aids: skipping them
+        // never affects soundness.
+        if let Some(previous) = self.map.swap_last_selected(package, index) {
+            let count = self.map.package_prefix_count(package) as u32;
+            if previous > index {
+                // The selection moved down: p_i is true for i ≥ index.
+                // Ascend from the upper boundary so every chain reason
+                // (¬p_{i-1} ∨ p_i) is unit when applied.
+                for i in (index + 1)..=previous.min(count.saturating_sub(1)) {
+                    let reason = self.map.chain_reason(package, (i - 1) as usize);
+                    self.force_prefix_assignment(package, i, true, reason, level);
+                }
+            } else if previous < index {
+                // The selection moved up: p_i is false for i < index.
+                // Descend from the lower boundary so every chain reason
+                // (¬p_i ∨ p_{i+1}) is unit when applied.
+                for i in (previous..index.saturating_sub(1)).rev() {
+                    let reason = self.map.chain_reason(package, i as usize);
+                    self.force_prefix_assignment(package, i, false, reason, level);
+                }
+            }
+        }
+
         // EXPERIMENT (RESOLVO_FULL_CHAIN=1): also push the full prefix chain
         // explicitly, like the clausal sequential encoding does, justified by
         // the monotone chain clauses in chain order. This makes conflict

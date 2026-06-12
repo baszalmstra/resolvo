@@ -77,6 +77,12 @@ struct PackageState {
     /// prefix variables, along with the driving variable and its level.
     hi: u32,
     hi_driver: Option<(VariableId, u32)>,
+    /// The member index of the previous selection of this package. A pure
+    /// heuristic memory (never undone): re-selections push explicit chain
+    /// entries over the window between the old and new index, giving
+    /// conflict analysis adjacent-step anchors where the search frontier
+    /// just moved.
+    last_selected: Option<u32>,
 }
 
 impl PackageState {
@@ -91,6 +97,7 @@ impl PackageState {
             lo_driver: None,
             hi: u32::MAX,
             hi_driver: None,
+            last_selected: None,
         }
     }
 }
@@ -306,6 +313,27 @@ impl DecisionMap {
     #[inline]
     pub fn chain_reason(&self, package: u32, index: usize) -> ClauseId {
         self.packages[package as usize].chain_reasons[index]
+    }
+
+    /// The driver of the lower interval bound, if any.
+    #[inline]
+    pub fn lo_driver(&self, package: u32) -> Option<(VariableId, u32)> {
+        self.packages[package as usize].lo_driver
+    }
+
+    /// The driver of the upper interval bound, if any.
+    #[inline]
+    pub fn hi_driver(&self, package: u32) -> Option<(VariableId, u32)> {
+        self.packages[package as usize].hi_driver
+    }
+
+    /// Records `index` as the package's latest selection and returns the
+    /// previous one.
+    pub fn swap_last_selected(&mut self, package: u32, index: u32) -> Option<u32> {
+        std::mem::replace(
+            &mut self.packages[package as usize].last_selected,
+            Some(index),
+        )
     }
 
     /// Returns the current selection of `package`: the selected variable, its
