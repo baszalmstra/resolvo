@@ -257,6 +257,25 @@ one package, it can be rewritten over the existing prefix variables:
   derive incompatibilities natively as intervals — PubGrub-style range
   unions inside CDCL.
 
+**Implemented for requirements** (encoder: `add_pending_requirement_ranges`):
+unconditional single-set requirements over a contiguous member range get the
+two redundant strengtheners `(¬parent ∨ p_b)` and `(¬parent ∨ ¬p_{a−1})`.
+These are sound regardless of later candidate registrations: the requires
+clause plus at-most-one forces the selection into `[a, b]` whenever the
+parent is selected, and new members never join an existing requirement's
+candidate set. Measured effect: conflict-heavy V=500 went from 10% behind
+clausal sequential to 32% ahead (19.5 s vs 28.7 s, 5/5), V=100 to 0.152 s
+(sequential 0.23 s), storms unchanged.
+
+**Constrains needs an extra gate.** A constraint forbids a fixed candidate
+set; the *allowed* set implicitly includes candidates registered later. An
+upper bound `(¬parent ∨ p_b)` derived from today's members would wrongly
+exclude an allowed candidate that registers at an index above `b` tomorrow.
+Interval-encoding constrains is therefore only sound when every candidate of
+the package is already registered (`member_count == total candidates` from
+`get_candidates`) so that indices are final — or with machinery to revisit
+the clause on registration.
+
 Costs and prerequisites: contiguity must be checked per version set at
 encode time (with the current clause forms as fallback); candidates that are
 only reachable through constrains/conditions must also be registered as
