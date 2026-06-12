@@ -169,11 +169,28 @@ piece was isolated.
 | conda-forge seed 1      | 1.09 s, 2 timeouts | 1.07 s, 1 timeout | 1.15 s, 2 timeouts | **0.75 s, 0 timeouts** |
 | conda-forge seed 2 (250 problems) | 0.73 s, 0 timeouts | — | 0.86 s, 2 timeouts | **0.60 s, 0 timeouts** |
 
-Virtual-ladder wins or ties every benchmark except the V=500 mean (within
-14% of sequential at the same 5/5 solve rate); on conda-forge seed 1 it is
-the only configuration with zero timeouts, solving both problems on which
-every clausal encoding times out. Solutions and sat/unsat verdicts are
+With the requirement interval strengtheners (conflict-gated, packages with
+≥32 candidates, non-trivial ranges) the sweep is complete. Load-matched
+final numbers, virtual-ladder vs the best clausal encodings:
+
+| workload | binary | commander:3 | sequential | virtual-ladder |
+| --- | --- | --- | --- | --- |
+| storm n=1400 / n=5000 | 0.26 / 4.4 s | — | 0.20 / 2.6 s | **0.13 / 1.68 s** |
+| conflict-heavy V=100 (5 seeds) | 0.36 s | 0.22 s | 0.21–0.23 s | **0.13 s** |
+| conflict-heavy V=500 (5 seeds) | 1/5 | 4/5 | 5/5, 28.7 s | **5/5, 16.4 s** |
+| conda-forge seed 0 | 0.753 s | 0.729 s | — | **0.701 s** |
+| conda-forge seed 1 | 1.186 s, 3 TO | 1.269 s, 3 TO | — | **0.803 s, 0 TO** |
+| conda-forge seed 2 (250) | 0.749 s | 0.885 s, 2 TO | — | **0.666 s, 0 TO** |
+
+Virtual-ladder is the fastest configuration on every benchmark and the only
+one that never times out — it solves every conda-forge problem on which the
+clausal encodings hit the 20 s limit. Solutions and sat/unsat verdicts are
 identical to all other encodings on every problem tested.
+
+A general lesson from getting here: interval machinery (prefix chains,
+requirement strengtheners) must be emitted as *conflict-gated search aids*.
+Emitted eagerly, their propagation cost regressed shallow solves by 10–25%;
+held back until the solver starts conflicting, they are strictly positive.
 
 It strictly dominates the plain virtual encoding (equal on storms, ~2×
 faster on conflict-heavy workloads with half the conflicts — all conflict
