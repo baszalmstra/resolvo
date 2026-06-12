@@ -1490,3 +1490,76 @@ fn test_constrains_multiple_parents() {
     x=1
     "###);
 }
+
+/// All at-most-one encodings (including the virtual one, which emits no
+/// clauses at all) must produce the same solution on a problem that requires
+/// backtracking through several candidates of the same packages.
+#[test]
+fn test_amo_encodings_agree() {
+    use resolvo::AmoEncoding;
+
+    let packages: &[(&str, u32, Vec<&str>)] = &[
+        // The newest versions of b and c conflict through their shared
+        // dependency on d, forcing the solver to walk candidates.
+        ("b", 7, vec!["d 4..6"]),
+        ("b", 6, vec!["d 3..5"]),
+        ("b", 5, vec!["d 1..3"]),
+        ("c", 3, vec!["d 1..2"]),
+        ("c", 2, vec!["d 1..3"]),
+        ("d", 5, vec![]),
+        ("d", 4, vec![]),
+        ("d", 2, vec![]),
+        ("d", 1, vec![]),
+        ("e", 2, vec!["b", "c"]),
+        ("e", 1, vec![]),
+    ];
+
+    let solve_with = |encoding: AmoEncoding| {
+        let mut provider = BundleBoxProvider::from_packages(packages);
+        let requirements = provider.requirements(&["e", "b", "c"]);
+        let mut solver = Solver::new(provider).with_amo_encoding(encoding);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).expect("problem is solvable");
+        transaction_to_string(solver.provider(), &solved)
+    };
+
+    let baseline = solve_with(AmoEncoding::Binary);
+    insta::assert_snapshot!(baseline, @r###"
+    b=5
+    c=3
+    d=1
+    e=2
+    "###);
+
+    for encoding in [
+        AmoEncoding::Pairwise,
+        AmoEncoding::Sequential,
+        AmoEncoding::Commander { group_size: 2 },
+        AmoEncoding::Commander { group_size: 3 },
+        AmoEncoding::Bimander { group_size: 2 },
+        AmoEncoding::Hybrid { threshold: 3 },
+        AmoEncoding::Virtual,
+    ] {
+        assert_eq!(
+            solve_with(encoding),
+            baseline,
+            "{encoding:?} produced a different solution"
+        );
+    }
+}
+
+/// Forces a conflict whose analysis must resolve a virtually falsified
+/// sibling through a lazily materialized pairwise reason clause.
+#[test]
+fn test_virtual_amo_unsat() {
+    let mut provider = BundleBoxProvider::from_packages(&[("a", 2, vec![]), ("a", 5, vec![])]);
+    let requirements = provider.requirements(&["a 0..4", "a 5..10"]);
+    let mut solver = Solver::new(provider).with_amo_encoding(resolvo::AmoEncoding::Virtual);
+    let problem = Problem::new().requirements(requirements);
+    match solver.solve(problem) {
+        Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
+            insta::assert_snapshot!(conflict.display_user_friendly(&solver).to_string());
+        }
+        other => panic!("expected unsat, got {other:?}"),
+    }
+}
