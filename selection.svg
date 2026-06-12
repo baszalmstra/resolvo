@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="430" viewBox="0 0 920 430" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="920" height="430" rx="8" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="460" y="34" text-anchor="middle" font-size="19" font-weight="600" fill="#1f2328">Selection: first eligible clause, then only hot clauses can win</text>
+  <text x="460" y="56" text-anchor="middle" font-size="13" fill="#656d76">clauses are visited in ClausePosition order (parent registration order, then list order)</text>
+
+  <!-- queue cells -->
+  <g font-size="12" text-anchor="middle">
+    <!-- cell 1: stale -->
+    <rect x="40" y="90" width="84" height="56" rx="6" fill="#f6f8fa" stroke="#8c959f"/>
+    <text x="82" y="112" fill="#656d76">(0,0)</text>
+    <text x="82" y="130" fill="#cf222e" font-size="11" font-weight="600">stale</text>
+    <!-- cell 2: stale -->
+    <rect x="136" y="90" width="84" height="56" rx="6" fill="#f6f8fa" stroke="#8c959f"/>
+    <text x="178" y="112" fill="#656d76">(0,2)</text>
+    <text x="178" y="130" fill="#cf222e" font-size="11" font-weight="600">stale</text>
+    <!-- cell 3: initial best -->
+    <rect x="232" y="90" width="84" height="56" rx="6" fill="#dafbe1" stroke="#1a7f37" stroke-width="2"/>
+    <text x="274" y="112" fill="#1a7f37" font-weight="600">(1,0)</text>
+    <text x="274" y="130" fill="#1a7f37" font-size="11">act 0.0 / 4 cand</text>
+    <!-- cell 4: cold, skipped -->
+    <rect x="328" y="90" width="84" height="56" rx="6" fill="#ffffff" stroke="#d0d7de" stroke-dasharray="4 3"/>
+    <text x="370" y="112" fill="#8c959f">(1,1)</text>
+    <text x="370" y="130" fill="#8c959f" font-size="11">cold</text>
+    <!-- cell 5: cold, skipped -->
+    <rect x="424" y="90" width="84" height="56" rx="6" fill="#ffffff" stroke="#d0d7de" stroke-dasharray="4 3"/>
+    <text x="466" y="112" fill="#8c959f">(2,0)</text>
+    <text x="466" y="130" fill="#8c959f" font-size="11">cold</text>
+    <!-- cell 6: hot, loses -->
+    <rect x="520" y="90" width="84" height="56" rx="6" fill="#fff1e5" stroke="#bc4c00"/>
+    <text x="562" y="112" fill="#bc4c00" font-weight="600">(2,4) hot</text>
+    <text x="562" y="130" fill="#bc4c00" font-size="11">act 1.8 / 6 cand</text>
+    <!-- cell 7: hot, wins -->
+    <rect x="616" y="90" width="84" height="56" rx="6" fill="#dafbe1" stroke="#1a7f37" stroke-width="2.5"/>
+    <text x="658" y="112" fill="#1a7f37" font-weight="600">(4,1) hot</text>
+    <text x="658" y="130" fill="#1a7f37" font-size="11">act 3.2 / 1 cand</text>
+    <!-- cell 8: hot, never visited -->
+    <rect x="712" y="90" width="84" height="56" rx="6" fill="#fff1e5" stroke="#bc4c00" stroke-dasharray="4 3"/>
+    <text x="754" y="112" fill="#bc4c00">(5,0) hot</text>
+    <text x="754" y="130" fill="#bc4c00" font-size="11">not visited</text>
+    <!-- ellipsis -->
+    <text x="836" y="124" fill="#8c959f" font-size="18">&#8230;</text>
+  </g>
+
+  <!-- step annotations -->
+  <g font-size="12.5">
+    <line x1="130" y1="146" x2="130" y2="180" stroke="#8c959f" stroke-width="1.2"/>
+    <text x="130" y="198" text-anchor="middle" fill="#1f2328" font-weight="600">1. pop stale entries</text>
+    <text x="130" y="215" text-anchor="middle" fill="#656d76">inspected, no longer eligible:</text>
+    <text x="130" y="231" text-anchor="middle" fill="#656d76">removed from the queue</text>
+
+    <line x1="274" y1="146" x2="274" y2="248" stroke="#1a7f37" stroke-width="1.2"/>
+    <text x="274" y="266" text-anchor="middle" fill="#1f2328" font-weight="600">2. first eligible clause</text>
+    <text x="274" y="283" text-anchor="middle" fill="#656d76">becomes the initial best</text>
+
+    <line x1="466" y1="146" x2="466" y2="180" stroke="#8c959f" stroke-width="1.2"/>
+    <text x="466" y="198" text-anchor="middle" fill="#1f2328" font-weight="600">3. cold clauses are skipped</text>
+    <text x="466" y="215" text-anchor="middle" fill="#656d76">never in a conflict &#8594; activity 0,</text>
+    <text x="466" y="231" text-anchor="middle" fill="#656d76">and replacement needs strictly</text>
+    <text x="466" y="247" text-anchor="middle" fill="#656d76">higher activity: they cannot win</text>
+
+    <line x1="658" y1="146" x2="658" y2="266" stroke="#1a7f37" stroke-width="1.2"/>
+    <text x="658" y="284" text-anchor="middle" fill="#1f2328" font-weight="600">4. only hot clauses are inspected</text>
+    <text x="658" y="301" text-anchor="middle" fill="#656d76">(2,4) loses: more candidates than the best.</text>
+    <text x="658" y="317" text-anchor="middle" fill="#656d76">(4,1) wins: higher activity and fewer candidates.</text>
+  </g>
+
+  <!-- early stop band -->
+  <rect x="40" y="346" width="840" height="60" rx="6" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="56" y="370" font-size="13" font-weight="600" fill="#1f2328">5. early stop: (4,1) has one candidate left, so nothing can beat it; (5,0) is never visited.</text>
+  <text x="56" y="391" font-size="12.5" fill="#656d76">Hot clauses live in a second, much smaller BTreeMap, so a decide() call typically touches a handful of clauses instead of all of them.</text>
+</svg>
