@@ -241,6 +241,11 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// clause shape `(a, lit)`.
     amo_reason_cache: HashMap<(VariableId, usize), ClauseId>,
 
+    /// Requirement candidate sets that may receive interval strengtheners
+    /// once the solver starts conflicting. Held here so they survive across
+    /// encoding rounds; see `Encoder::add_pending_requirement_ranges`.
+    pending_requirement_ranges: Vec<(VariableId, Vec<VariableId>)>,
+
     /// Keeps track of auxiliary variables that are used to encode at-least-one
     /// solvable for a package.
     at_least_one_tracker: <D::NameId as SolverId>::Map<Option<VariableId>>,
@@ -279,6 +284,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             virtual_package_names: Vec::new(),
             pending_virtual_falsifications: Vec::new(),
             amo_reason_cache: Default::default(),
+            pending_requirement_ranges: Vec::new(),
             at_least_one_tracker: Default::default(),
             constrains_aux_vars: Default::default(),
             decision_tracker: Default::default(),

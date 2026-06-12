@@ -56,12 +56,6 @@ pub(crate) struct Encoder<'a, 'cache, D: DependencyProvider> {
     /// A set of packages that should have an at-least-once tracker.
     new_at_least_one_packages: IndexMap<D::NameId, VariableId, ahash::RandomState>,
 
-    /// Unconditional requirements whose candidates may form a contiguous
-    /// member-index range of a virtual-ladder package. Processed after the
-    /// pending forbid targets have been registered (which assigns the member
-    /// indices); see [`Self::add_pending_requirement_ranges`].
-    pending_requirement_ranges: Vec<(VariableId, Vec<VariableId>)>,
-
     /// Results from futures that completed immediately during
     /// `try_immediate_or_queue`.
     pending_results: VecDeque<Result<TaskResult<'cache, D>, Box<dyn Any>>>,
@@ -131,7 +125,6 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             forbid_seen: IndexedSet::default(),
             level,
             new_at_least_one_packages: IndexMap::default(),
-            pending_requirement_ranges: Vec::new(),
             pending_results: VecDeque::new(),
         }
     }
@@ -327,7 +320,8 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             && version_set_variables.len() == 1
             && version_set_variables[0].len() > 1
         {
-            self.pending_requirement_ranges
+            self.state
+                .pending_requirement_ranges
                 .push((variable, version_set_variables[0].clone()));
         }
 
@@ -1008,7 +1002,15 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     fn add_pending_requirement_ranges(&mut self) {
         use crate::solver::decision_map::PackageVar;
 
-        for (parent, candidate_vars) in self.pending_requirement_ranges.drain(..) {
+        // The strengtheners only pay off in conflict-driven search; on
+        // conflict-free solves (and single-conflict unsolvable roots) their
+        // propagation cost is pure overhead. Like the prefix chains, they
+        // are held back until the solver has started conflicting.
+        if !self.state.decision_tracker.chain_enabled {
+            return;
+        }
+
+        for (parent, candidate_vars) in std::mem::take(&mut self.state.pending_requirement_ranges) {
             // The candidates must all be members of the same ladder package
             // and cover a contiguous member-index range.
             let map = self.state.decision_tracker.map();
