@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="400" viewBox="0 0 920 400" font-family="Segoe UI, Helvetica, Arial, sans-serif">
   <rect x="0" y="0" width="920" height="400" rx="8" fill="#ffffff" stroke="#d0d7de"/>
   <text x="460" y="34" text-anchor="middle" font-size="19" font-weight="600" fill="#1f2328">Catching up with the trail: the sync floor</text>
-  <text x="460" y="56" text-anchor="middle" font-size="13" fill="#656d76">the queue compares snapshots; everything that happened in between cancels out</text>
+  <text x="460" y="56" text-anchor="middle" font-size="13" fill="#656d76">the trail is the solver's chronological assignment log; it only changes at its end, so two snapshots share a common prefix</text>
 
   <!-- axes -->
   <line x1="90" y1="330" x2="860" y2="330" stroke="#8c959f" stroke-width="1.5"/>
