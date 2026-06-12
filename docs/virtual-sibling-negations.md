@@ -232,3 +232,36 @@ suite (storms, conflict-heavy at V=100, V=500 solve rate, both conda-forge
 seeds — on seed 1 it is the only configuration with zero timeouts), with the
 single exception of the V=500 mean where clausal sequential remains ~14%
 faster at the same solve rate.
+
+## Future applications: interval-encoded requirements
+
+The prefix variables make "which candidate of package P" an integer variable
+with bounds literals, and the at-most-one constraint was only the first
+consumer. Whenever a clause talks about a *contiguous member-index range* of
+one package, it can be rewritten over the existing prefix variables:
+
+- **Requires** `(¬parent ∨ c_a ∨ … ∨ c_b)` becomes three binary clauses:
+  `(¬parent ∨ S_pkg)` (the existing at-least-one auxiliary),
+  `(¬parent ∨ p_b)` and `(¬parent ∨ ¬p_{a−1})`. This removes the
+  O(range) `next_unwatched_literal` scans, the per-requirement sorted
+  candidate vectors (a large share of solver memory on big snapshots), and
+  lets `decide` jump to `max(lo, a)` instead of skip-scanning.
+- **Constrains** excludes the complement of a range — at most two end
+  ranges, so two prefix clauses replace both the pairwise and the shared
+  auxiliary-variable constrains encodings where the range is contiguous.
+- **Locks** become the interval `[k, k]`: two prefix assertions instead of a
+  clause per other candidate.
+- **Conditions**: the `DisjunctionComplement` candidate slices are again
+  range literals over one package.
+- With requirements and reasons both in prefix language, learnt clauses
+  derive incompatibilities natively as intervals — PubGrub-style range
+  unions inside CDCL.
+
+Costs and prerequisites: contiguity must be checked per version set at
+encode time (with the current clause forms as fallback); candidates that are
+only reachable through constrains/conditions must also be registered as
+package members; and every consumer of `Clause::Requires` literals —
+`decide`, conflict-graph construction and user-facing error messages — needs
+an interval-aware path that maps prefix literals back to version-set ranges.
+This is a larger-surface change than the virtual encoding itself and should
+be attempted as its own project.
