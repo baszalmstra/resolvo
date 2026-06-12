@@ -56,6 +56,12 @@ pub(crate) struct Encoder<'a, 'cache, D: DependencyProvider> {
     /// A set of packages that should have an at-least-once tracker.
     new_at_least_one_packages: IndexMap<D::NameId, VariableId, ahash::RandomState>,
 
+    /// Unconditional requirements whose candidates may form a contiguous
+    /// member-index range of a virtual-ladder package. Processed after the
+    /// pending forbid targets have been registered (which assigns the member
+    /// indices); see [`Self::add_pending_requirement_ranges`].
+    pending_requirement_ranges: Vec<(VariableId, Vec<VariableId>)>,
+
     /// Results from futures that completed immediately during
     /// `try_immediate_or_queue`.
     pending_results: VecDeque<Result<TaskResult<'cache, D>, Box<dyn Any>>>,
@@ -125,6 +131,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             forbid_seen: IndexedSet::default(),
             level,
             new_at_least_one_packages: IndexMap::default(),
+            pending_requirement_ranges: Vec::new(),
             pending_results: VecDeque::new(),
         }
     }
@@ -179,6 +186,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         }
 
         self.add_pending_forbid_clauses();
+        self.add_pending_requirement_ranges();
         self.add_pending_at_least_one_clauses();
 
         Ok(self.conflicting_clauses)
@@ -306,6 +314,22 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+
+        // For unconditional single-version-set requirements of virtual-ladder
+        // packages, queue the candidate set for the interval strengtheners
+        // (see add_pending_requirement_ranges). Member indices are only
+        // assigned when the forbid targets are processed at the end of the
+        // round, so this is deferred.
+        // Single-candidate requirements are already binary clauses; the
+        // strengtheners only pay off for real ranges.
+        if matches!(self.state.amo_encoding, crate::AmoEncoding::VirtualLadder)
+            && condition.is_none()
+            && version_set_variables.len() == 1
+            && version_set_variables[0].len() > 1
+        {
+            self.pending_requirement_ranges
+                .push((variable, version_set_variables[0].clone()));
+        }
 
         // Make sure that for every candidate that we require we also have a forbid
         // clause to force one solvable per package name.
@@ -965,6 +989,97 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         }
 
         state.at_most_one_trackers.insert(name_id, tracker);
+    }
+
+    /// For every queued unconditional requirement whose candidates form a
+    /// *contiguous member-index range* `[a, b]` of a virtual-ladder package,
+    /// emit the two redundant interval strengtheners
+    ///
+    /// - `(¬parent ∨ p_b)`: selecting the parent caps the package's selection
+    ///   at index `b`;
+    /// - `(¬parent ∨ ¬p_{a−1})`: ... and raises its floor to index `a`.
+    ///
+    /// Both are implied by the requires clause together with the at-most-one
+    /// constraint, so they never change solutions — they exist because they
+    /// propagate the requirement as an interval in two binary clause visits
+    /// (instead of scans over the candidate list) and hand conflict analysis
+    /// range literals directly. The requires clause itself remains the source
+    /// of truth for error reporting.
+    fn add_pending_requirement_ranges(&mut self) {
+        use crate::solver::decision_map::PackageVar;
+
+        for (parent, candidate_vars) in self.pending_requirement_ranges.drain(..) {
+            // The candidates must all be members of the same ladder package
+            // and cover a contiguous member-index range.
+            let map = self.state.decision_tracker.map();
+            let mut min = u32::MAX;
+            let mut max = 0u32;
+            let mut package = None;
+            let mut contiguous = true;
+            for &candidate in &candidate_vars {
+                match map.var_role(candidate) {
+                    PackageVar::Member {
+                        package: candidate_package,
+                        index,
+                    } => {
+                        if *package.get_or_insert(candidate_package) != candidate_package {
+                            contiguous = false;
+                            break;
+                        }
+                        min = min.min(index);
+                        max = max.max(index);
+                    }
+                    _ => {
+                        contiguous = false;
+                        break;
+                    }
+                }
+            }
+            let Some(package) = package else { continue };
+            if !contiguous
+                || (max - min + 1) as usize != candidate_vars.len()
+                || map.package_prefix_count(package) == 0
+            {
+                continue;
+            }
+
+            let name_id = self.state.virtual_package_names[package as usize];
+            let upper = map.package_prefix(package, max as usize).positive();
+            let lower =
+                (min > 0).then(|| map.package_prefix(package, (min - 1) as usize).negative());
+            for lit in std::iter::once(upper).chain(lower) {
+                let (watched_literals, kind) =
+                    WatchedLiterals::forbid_multiple(parent, lit, name_id);
+                let clause_id = self.state.add_clause(watched_literals, kind);
+
+                // The clause is added while solving; synchronize it with the
+                // current assignment like any late clause.
+                let literal_a = parent.negative();
+                let map = self.state.decision_tracker.map();
+                let set_literal = match (literal_a.eval(map), lit.eval(map)) {
+                    (Some(false), None) => Some(lit),
+                    (None, Some(false)) => Some(literal_a),
+                    (Some(false), Some(false)) => {
+                        self.conflicting_clauses.push(clause_id);
+                        continue;
+                    }
+                    _ => None,
+                };
+                if let Some(literal) = set_literal {
+                    self.state
+                        .decision_tracker
+                        .try_add_decision(
+                            Decision::new(
+                                literal.variable(),
+                                literal.satisfying_value(),
+                                clause_id,
+                            ),
+                            self.level,
+                        )
+                        .expect("we checked that there is no value yet");
+                }
+            }
+        }
     }
 
     /// Adds clauses to track if at least one solvable for a particular package
