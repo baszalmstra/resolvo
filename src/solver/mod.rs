@@ -1770,6 +1770,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         mut conflicting_solvable: VariableId,
         mut clause_id: ClauseId,
     ) -> (u32, ClauseId, Literal) {
+        // From the first conflict on, virtual-ladder selections push their
+        // full prefix chain for better conflict analysis.
+        self.state.decision_tracker.chain_enabled = true;
         let mut seen = HashSet::default();
         let mut causes_at_current_level = 0u32;
         let mut learnt = Vec::new();

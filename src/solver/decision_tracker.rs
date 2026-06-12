@@ -11,6 +11,12 @@ pub(crate) struct DecisionTracker {
     map: DecisionMap,
     stack: Vec<Decision>,
     propagate_index: usize,
+    /// Set on the first conflict. Until then selections of virtual-ladder
+    /// packages only push their two boundary prefix assignments; afterwards
+    /// the full prefix chain is pushed, giving conflict analysis
+    /// adjacent-step anchors. Conflict-free solves (backtracking storms)
+    /// never pay for the chain.
+    pub(crate) chain_enabled: bool,
 }
 
 impl DecisionTracker {
@@ -21,6 +27,7 @@ impl DecisionTracker {
         self.map.reset_assignments();
         self.stack.clear();
         self.propagate_index = 0;
+        self.chain_enabled = false;
     }
 
     #[cfg(feature = "diagnostics")]
@@ -128,42 +135,16 @@ impl DecisionTracker {
         let p = self.map.package_prefix(package, index as usize);
         self.try_add_decision(Decision::new(p, true, upper_reason), level)?;
 
-        // Adaptive chain window: push explicit chain entries over the index
-        // window between the previous selection of this package and this
-        // one. Conflicts cluster at the moving search frontier, and explicit
-        // prefix entries there give conflict analysis the same adjacent-step
-        // granularity as the clausal sequential encoding, at a cost
-        // proportional to how far the frontier moved instead of the
-        // candidate count. The entries are pure learning aids: skipping them
-        // never affects soundness.
-        if let Some(previous) = self.map.swap_last_selected(package, index) {
-            let count = self.map.package_prefix_count(package) as u32;
-            if previous > index {
-                // The selection moved down: p_i is true for i ≥ index.
-                // Ascend from the upper boundary so every chain reason
-                // (¬p_{i-1} ∨ p_i) is unit when applied.
-                for i in (index + 1)..=previous.min(count.saturating_sub(1)) {
-                    let reason = self.map.chain_reason(package, (i - 1) as usize);
-                    self.force_prefix_assignment(package, i, true, reason, level);
-                }
-            } else if previous < index {
-                // The selection moved up: p_i is false for i < index.
-                // Descend from the lower boundary so every chain reason
-                // (¬p_i ∨ p_{i+1}) is unit when applied.
-                for i in (previous..index.saturating_sub(1)).rev() {
-                    let reason = self.map.chain_reason(package, i as usize);
-                    self.force_prefix_assignment(package, i, false, reason, level);
-                }
-            }
-        }
-
-        // EXPERIMENT (RESOLVO_FULL_CHAIN=1): also push the full prefix chain
-        // explicitly, like the clausal sequential encoding does, justified by
-        // the monotone chain clauses in chain order. This makes conflict
-        // analysis match (slightly beat) the clausal sequential encoding's
-        // learning quality, at the cost of O(n) trail entries per selection.
-        // Kept for reproducing the trail-anchor measurements.
-        if std::env::var("RESOLVO_FULL_CHAIN").is_ok() {
+        // Once the solver has started conflicting, push the full prefix
+        // chain explicitly (justified by the monotone chain clauses, in
+        // chain order). Explicit chain entries give conflict analysis the
+        // same adjacent-step range granularity as the clausal sequential
+        // encoding; see the learning-gap research in
+        // docs/virtual-sibling-negations.md. They are pure learning aids:
+        // skipping them never affects soundness, which is why conflict-free
+        // solves (backtracking storms) skip them entirely.
+        if self.chain_enabled {
+            self.map.swap_last_selected(package, index);
             for i in (0..index.saturating_sub(1)).rev() {
                 let reason = self.map.chain_reason(package, i as usize);
                 self.force_prefix_assignment(package, i, false, reason, level);
@@ -174,6 +155,7 @@ impl DecisionTracker {
                 self.force_prefix_assignment(package, i, true, reason, level);
             }
         }
+
         Ok(())
     }
 
@@ -227,7 +209,7 @@ impl DecisionTracker {
                 }
             }
             PackageVar::Prefix { package, .. } => {
-                self.map.recompute_interval(package);
+                self.map.undo_prefix_assignment(package);
             }
             _ => {}
         }

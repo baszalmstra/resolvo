@@ -122,6 +122,21 @@ pub(crate) struct DecisionMap {
 
     /// State per tracked package.
     packages: Vec<PackageState>,
+
+    /// Undo records for explicit prefix assignments, pushed by
+    /// [`Self::apply_prefix_assignment`] in trail order: the package and its
+    /// interval state before the assignment. Restoring is O(1) per pop,
+    /// keeping backjumps over many prefix entries linear.
+    interval_undo: Vec<IntervalUndo>,
+}
+
+/// The interval state of a package before a prefix assignment.
+struct IntervalUndo {
+    package: u32,
+    lo: u32,
+    lo_driver: Option<(VariableId, u32)>,
+    hi: u32,
+    hi_driver: Option<(VariableId, u32)>,
 }
 
 impl DecisionMap {
@@ -134,6 +149,7 @@ impl DecisionMap {
     /// registry.
     pub fn reset_assignments(&mut self) {
         self.map.clear();
+        self.interval_undo.clear();
         for package in &mut self.packages {
             package.selected = None;
             package.lo = 0;
@@ -363,6 +379,13 @@ impl DecisionMap {
         level: u32,
     ) {
         let state = &mut self.packages[package as usize];
+        self.interval_undo.push(IntervalUndo {
+            package,
+            lo: state.lo,
+            lo_driver: state.lo_driver,
+            hi: state.hi,
+            hi_driver: state.hi_driver,
+        });
         if value {
             // The selected candidate has index <= index.
             if index < state.hi {
@@ -378,8 +401,25 @@ impl DecisionMap {
         }
     }
 
+    /// Restores the interval state saved before the most recent prefix
+    /// assignment. Prefix assignments are undone in reverse trail order, so
+    /// popping the undo stack restores the exact previous state in O(1).
+    pub fn undo_prefix_assignment(&mut self, package: u32) {
+        let undo = self
+            .interval_undo
+            .pop()
+            .expect("every prefix assignment pushes an undo record");
+        debug_assert_eq!(undo.package, package);
+        let state = &mut self.packages[package as usize];
+        state.lo = undo.lo;
+        state.lo_driver = undo.lo_driver;
+        state.hi = undo.hi;
+        state.hi_driver = undo.hi_driver;
+    }
+
     /// Recomputes the allowed-index interval of a package from the explicit
     /// prefix assignments. Called when a prefix assignment is undone.
+    #[allow(dead_code)]
     pub fn recompute_interval(&mut self, package: u32) {
         let mut lo = 0u32;
         let mut lo_driver = None;
