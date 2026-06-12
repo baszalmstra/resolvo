@@ -871,6 +871,23 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 };
                 let upper_reason =
                     state.materialize_amo_reason(candidate_var, prefix_var.positive(), package);
+                // The monotone chain clause (¬p_{index-1} ∨ p_index), used as
+                // a reason by the experimental full-chain mode.
+                if member_index > 0 {
+                    let previous_prefix = state
+                        .decision_tracker
+                        .map()
+                        .package_prefix(package, (member_index - 1) as usize);
+                    let chain = state.materialize_amo_reason(
+                        previous_prefix,
+                        prefix_var.positive(),
+                        package,
+                    );
+                    state
+                        .decision_tracker
+                        .map_mut()
+                        .register_chain_reason(package, chain);
+                }
                 state.decision_tracker.map_mut().register_package_prefix(
                     package,
                     prefix_var,

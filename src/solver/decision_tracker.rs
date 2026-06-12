@@ -127,7 +127,48 @@ impl DecisionTracker {
         }
         let p = self.map.package_prefix(package, index as usize);
         self.try_add_decision(Decision::new(p, true, upper_reason), level)?;
+
+        // EXPERIMENT (RESOLVO_FULL_CHAIN=1): also push the full prefix chain
+        // explicitly, like the clausal sequential encoding does, justified by
+        // the monotone chain clauses in chain order. This makes conflict
+        // analysis match (slightly beat) the clausal sequential encoding's
+        // learning quality, at the cost of O(n) trail entries per selection.
+        // Kept for reproducing the trail-anchor measurements.
+        if std::env::var("RESOLVO_FULL_CHAIN").is_ok() {
+            for i in (0..index.saturating_sub(1)).rev() {
+                let reason = self.map.chain_reason(package, i as usize);
+                self.force_prefix_assignment(package, i, false, reason, level);
+            }
+            let count = self.map.package_prefix_count(package) as u32;
+            for i in (index + 1)..count {
+                let reason = self.map.chain_reason(package, (i - 1) as usize);
+                self.force_prefix_assignment(package, i, true, reason, level);
+            }
+        }
         Ok(())
+    }
+
+    /// Forces an explicit prefix assignment onto the trail even if the value
+    /// is already derived. Used for selection anchors: explicit prefix
+    /// entries are usable as unique implication points by conflict analysis,
+    /// which derived values are not.
+    pub(crate) fn force_prefix_assignment(
+        &mut self,
+        package: u32,
+        index: u32,
+        value: bool,
+        reason: ClauseId,
+        level: u32,
+    ) {
+        let p = self.map.package_prefix(package, index as usize);
+        if self.map.explicit_value(p).is_some() {
+            return;
+        }
+        debug_assert_ne!(self.map.value(p), Some(!value), "inconsistent anchor");
+        self.map.set(p, value, level);
+        self.map
+            .apply_prefix_assignment(package, index, value, p, level);
+        self.stack.push(Decision::new(p, value, reason));
     }
 
     pub(crate) fn undo_until(&mut self, level: u32) {

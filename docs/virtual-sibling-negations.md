@@ -163,3 +163,46 @@ analysis.
 - The `(Some(false), Some(false))` late-clause conflict path needs an
   equivalent: registering a second true candidate for an already-selected
   package must surface a conflict with a materialized pairwise reason.
+
+## Learning-gap research (measured)
+
+Why does virtual-ladder still conflict ~1.6× more often than the clausal
+sequential encoding on conflict-heavy workloads? A series of controlled
+experiments (conflict-heavy synthetic, V=100, seed 0):
+
+| configuration                          | conflicts | notes                          |
+| -------------------------------------- | --------- | ------------------------------ |
+| clausal sequential                     | 3 347     | reference                      |
+| virtual-ladder, boundaries only        | 5 485     | shipping configuration         |
+| + tight prefix explanations            | 5 485     | clauses −40% (memoization), conflicts unchanged |
+| + helper-literal activity bumps        | ~same     | hypothesis rejected            |
+| + exponential anchors, pairwise reasons| 6 436     | worse: resolutions collapse to the selected candidate |
+| + exponential anchors, telescoping reasons | 5 283 | marginal, wall cost exceeds gain |
+| **full prefix chain on the trail** (`RESOLVO_FULL_CHAIN=1`) | **3 003** | **beats sequential** — hypothesis confirmed |
+
+Findings:
+
+1. It is *not* learnt-clause expressiveness: virtual-ladder's learnt clauses
+   are shorter (avg 2.25 vs 2.84 literals) and contain range literals more
+   often (59% vs 35%) than sequential's, with equal backjump distances.
+2. It is *not* explanation tightness: switching member explanations from the
+   interval driver to the tightest prefix bound (the LCG "most general
+   explanation" principle) eliminated 40% of clause allocations but changed
+   no conflict counts.
+3. It *is* trail residency of the intermediate prefix variables: pushing the
+   full chain explicitly (justified by monotone chain clauses, in chain
+   order) makes virtual-ladder learn *better* than clausal sequential
+   (3 003 vs 3 347 conflicts) — but reintroduces the O(n) trail churn the
+   virtual design removes, and the overlapping package-event walks make it
+   quadratic, so it is not the shipping configuration.
+4. Static log-spaced anchors do not capture the chain's value, even with
+   telescoping prefix-to-prefix reasons: the benefit comes from
+   *adjacent-step* granularity near the moving conflict frontier, which
+   exponential spacing misses.
+
+The remaining promising direction is **adaptive chain windows**: when a
+package is re-selected at index k' after a previous selection at k, push
+explicit chain entries only over `[min(k,k'), max(k,k')]` — the window the
+conflict frontier just moved through. That is O(|k−k'|) per re-selection,
+which amortizes to exactly the incremental trail cost the clausal sequential
+encoding pays, while keeping the first selection of each package at O(1).

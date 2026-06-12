@@ -65,6 +65,10 @@ struct PackageState {
     /// `(¬member ∨ ¬p_{index-1})` and `(¬member ∨ p_index)` used when the
     /// member is selected (virtual-ladder encoding). Parallel to `members`.
     boundary_reasons: Vec<(Option<ClauseId>, ClauseId)>,
+    /// Per prefix index `i`: the monotone chain clause `(¬p_i ∨ p_{i+1})`,
+    /// available once `p_{i+1}` exists. Used as reasons by the experimental
+    /// full-chain mode.
+    chain_reasons: Vec<ClauseId>,
     /// The minimum still-allowed member index, derived from explicitly false
     /// prefix variables, along with the driving variable and its level.
     lo: u32,
@@ -82,6 +86,7 @@ impl PackageState {
             members: Vec::new(),
             prefix_vars: Vec::new(),
             boundary_reasons: Vec::new(),
+            chain_reasons: Vec::new(),
             lo: 0,
             lo_driver: None,
             hi: u32::MAX,
@@ -288,6 +293,19 @@ impl DecisionMap {
     #[inline]
     pub fn boundary_reasons(&self, package: u32, index: usize) -> (Option<ClauseId>, ClauseId) {
         self.packages[package as usize].boundary_reasons[index]
+    }
+
+    /// Registers the chain clause `(¬p_index ∨ p_{index+1})` of `package`.
+    pub fn register_chain_reason(&mut self, package: u32, clause_id: ClauseId) {
+        self.packages[package as usize]
+            .chain_reasons
+            .push(clause_id);
+    }
+
+    /// The chain clause `(¬p_index ∨ p_{index+1})` of `package`.
+    #[inline]
+    pub fn chain_reason(&self, package: u32, index: usize) -> ClauseId {
+        self.packages[package as usize].chain_reasons[index]
     }
 
     /// Returns the current selection of `package`: the selected variable, its
