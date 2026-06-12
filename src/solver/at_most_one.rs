@@ -14,7 +14,7 @@ use indexmap::IndexSet;
 /// Every clause produced by any of these encodings is a binary clause of the
 /// shape `(¬a ∨ b)` or `(¬a ∨ ¬b)`, which keeps the fast binary-clause
 /// propagation path applicable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AmoEncoding {
     /// One clause `(¬xᵢ ∨ ¬xⱼ)` for every pair of candidates.
     ///
@@ -28,6 +28,7 @@ pub enum AmoEncoding {
     /// falsifies every other candidate.
     ///
     /// `n⌈log₂ n⌉` clauses and `⌈log₂ n⌉` auxiliary variables.
+    #[default]
     Binary,
 
     /// The sequential ("ladder"/Sinz) encoding. A chain of auxiliary
@@ -46,12 +47,6 @@ pub enum AmoEncoding {
         /// The number of candidates up to which pairwise clauses are used.
         threshold: usize,
     },
-}
-
-impl Default for AmoEncoding {
-    fn default() -> Self {
-        AmoEncoding::Binary
-    }
 }
 
 impl std::str::FromStr for AmoEncoding {
