@@ -27,12 +27,12 @@ binary clauses. For a package with `n` reachable candidates:
 | `binary`       | ≈ n·⌈log₂n⌉    | ⌈log₂n⌉    | O(n log n)            |
 | `sequential`   | 3n − 4         | n − 1      | O(n): ≈ 125·n B       |
 | `commander:g`  | ≈ n(g+1)/(g−1) | ≈ n/(g−1)  | O(n): ≈ 110·n B (g=3) |
+| `bimander:g`   | ≈ n((g−1)/2 + log₂(n/g)) | ⌈log₂(n/g)⌉ | O(n log n)  |
 | `hybrid:t`     | pairwise ≤ t, then binary | | O(n log n)         |
 
 The product encoding was not implemented because it lays variables out on a
 √n×√n grid and therefore needs the candidate count up front, which conflicts
-with the incremental discovery of candidates. The bimander encoding (binary ×
-commander) could be added on top of the commander infrastructure if desired.
+with the incremental discovery of candidates.
 
 ## Results (2026-06-12)
 
@@ -44,6 +44,7 @@ commander) could be added on top of the commander infrastructure if desired.
 | pairwise    | 0.016 s   | 2.09 s     | 60 s (0/5 sat)     | 1 730 k       |
 | sequential  | 0.008 s   | 0.16 s     | 21.6 s (5/5 sat)   | 107 k         |
 | commander:3 | 0.009 s   | 0.17 s     | 28.0 s (4/5 sat)   | 115 k         |
+| bimander:2  | 0.010 s   | 0.29 s     | 54.8 s (1/5 sat)   | 193 k         |
 | hybrid:16   | 0.016 s   | 0.33 s     | 55.1 s (1/5 sat)   | 207 k         |
 
 ### conda-forge (real snapshot via rattler `create-resolvo-snapshot`, 150 random problems, 20 s timeout, `solve-snapshot --amo-encoding`)
@@ -53,6 +54,7 @@ commander) could be added on top of the commander infrastructure if desired.
 | binary      | 0.666 s | 0.591 s | 1.59 s  | 99.9 s   | —                                |
 | sequential  | 0.774 s | 0.542 s | 1.57 s  | 116.1 s  | 64 faster / 20 slower, one 20 s timeout outlier |
 | commander:3 | 0.641 s | 0.553 s | 1.54 s  | 96.2 s   | 70 faster / 16 slower            |
+| bimander:2  | 0.691 s | 0.607 s | 1.52 s  | 103.7 s  | 14 faster / 90 slower            |
 | hybrid:16   | 0.664 s | 0.589 s | 1.53 s  | 99.7 s   | 57 faster / 30 slower            |
 | pairwise    | 1.655 s | 1.694 s | 3.65 s  | 248.3 s  | 0 faster / 133 slower            |
 
@@ -68,6 +70,14 @@ All encodings agreed on sat/unsat for every problem.
   because most packages only have a handful of reachable candidates, but the
   direction is consistent (commander:3 faster on 70 of 129 non-trivial
   problems, slower on 16, and the largest regression was only +0.6 s).
+- Bimander behaves like the binary encoding on both workloads (its group-index
+  bits dominate its behavior), despite being a frequent winner in the SAT
+  literature. The likely explanation also explains why the linear encodings
+  win here: the ladder and commander auxiliary variables represent
+  *contiguous ranges* of the preference-sorted candidate list, so learnt
+  clauses over them generalize across whole version windows; binary/bimander
+  bit patterns do not align with the candidate order, so conflicts cannot be
+  expressed compactly.
 - Sequential has the best raw numbers on candidate-heavy workloads but showed
   one pathological tail on conda-forge (a 20 s timeout on a problem every
   other encoding solves in ~2 s). Commander:3 had the best tail behavior
