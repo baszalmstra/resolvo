@@ -189,24 +189,39 @@ impl Conflict {
                     graph.add_edge(root_node, node2_id, ConflictEdge::Conflict(conflict));
                 }
                 &Clause::ForbidMultipleInstances(instance1_id, instance2_id, _) => {
-                    let solvable1 = instance1_id
-                        .as_solvable_or_root(&state.variable_map)
-                        .expect("only solvables can be excluded");
+                    let Some(solvable1) = instance1_id.as_solvable_or_root(&state.variable_map)
+                    else {
+                        // Some at-most-one encodings (e.g. the sequential
+                        // ladder) emit clauses that only link two helper
+                        // variables. These carry no information for the
+                        // conflict graph.
+                        continue;
+                    };
                     let node1_id = Self::add_node(&mut graph, &mut nodes, solvable1);
 
-                    let VariableOrigin::ForbidMultiple(name) =
-                        state.variable_map.origin(instance2_id.variable())
-                    else {
-                        unreachable!("expected only forbid variables")
-                    };
-
-                    let previous_node = last_node_by_name.insert(name, node1_id);
-                    if let Some(previous_node) = previous_node {
-                        graph.add_edge(
-                            previous_node,
-                            node1_id,
-                            ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
-                        );
+                    match state.variable_map.origin(instance2_id.variable()) {
+                        VariableOrigin::ForbidMultiple(name) => {
+                            let previous_node = last_node_by_name.insert(name, node1_id);
+                            if let Some(previous_node) = previous_node {
+                                graph.add_edge(
+                                    previous_node,
+                                    node1_id,
+                                    ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                                );
+                            }
+                        }
+                        // The pairwise encoding directly links two solvables.
+                        VariableOrigin::Solvable(solvable2) => {
+                            let node2_id = Self::add_node(&mut graph, &mut nodes, solvable2.into());
+                            graph.add_edge(
+                                node1_id,
+                                node2_id,
+                                ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                            );
+                        }
+                        origin => {
+                            unreachable!("unexpected variable origin {origin:?} in forbid clause")
+                        }
                     }
                 }
                 &Clause::Constrains(package_id, dep_id, version_set_id) => {

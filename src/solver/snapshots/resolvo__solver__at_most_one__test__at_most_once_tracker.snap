@@ -1,5 +1,5 @@
 ---
-source: src/solver/binary_encoding.rs
+source: src/solver/at_most_one.rs
 expression: "clauses.iter().format(\"\\n\")"
 snapshot_kind: text
 ---

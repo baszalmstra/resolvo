@@ -395,10 +395,20 @@ impl<'s> SnapshotProvider<'s> {
         }
     }
 
+    /// The number of version set ids reserved by the snapshot itself.
+    /// Additional version sets are allocated after these.
+    fn version_set_id_base(&self) -> usize {
+        if self.snapshot.version_sets.is_empty() {
+            0
+        } else {
+            self.snapshot.version_sets.max() + 1
+        }
+    }
+
     /// Adds another requirement that matches any version of a package.
     /// If you use "*" as the matcher, it will match any version of the package.
     pub fn add_package_requirement(&mut self, name: NameId, matcher: &str) -> VersionSetId {
-        let id = self.snapshot.version_sets.max() + self.additional_version_sets.len();
+        let id = self.version_set_id_base() + self.additional_version_sets.len();
         let package = self.package(name);
 
         let matching_candidates = package
@@ -440,9 +450,9 @@ impl<'s> SnapshotProvider<'s> {
 
     fn version_set(&self, version_set: VersionSetId) -> &VersionSet {
         let idx = version_set.to_index();
-        let max_idx = self.snapshot.version_sets.max();
-        if idx >= max_idx {
-            &self.additional_version_sets[idx - max_idx]
+        let base = self.version_set_id_base();
+        if idx >= base {
+            &self.additional_version_sets[idx - base]
         } else {
             self.snapshot
                 .version_sets

@@ -40,6 +40,11 @@ struct Opts {
     /// Enable tracing output (set RUST_LOG for verbosity, e.g. RUST_LOG=info)
     #[clap(long)]
     tracing: bool,
+
+    /// The encoding to use for at-most-one constraints
+    /// (pairwise, binary, sequential, hybrid:<threshold>).
+    #[clap(long)]
+    amo_encoding: Option<resolvo::AmoEncoding>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -146,6 +151,9 @@ fn main() {
 
         let problem = Problem::default().requirements(requirements);
         let mut solver = Solver::new(provider);
+        if let Some(encoding) = opts.amo_encoding {
+            solver = solver.with_amo_encoding(encoding);
+        }
         let mut records = None;
         let mut error = None;
         let result = solver.solve(problem);

@@ -24,13 +24,15 @@ use crate::{
     },
     requirement::RequirementMap,
     runtime::{AsyncRuntime, NowOrNeverRuntime},
-    solver::binary_encoding::AtMostOnceTracker,
+    solver::at_most_one::AtMostOnceTracker,
     solver_id::{IdMap, IdSet, SolverId},
     utils::{IndexedSet, Mapping},
 };
 
-mod binary_encoding;
+mod at_most_one;
 mod cache;
+
+pub use at_most_one::AmoEncoding;
 pub(crate) mod clause;
 mod conditions;
 mod decision;
@@ -221,6 +223,10 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     clauses_added_for_solvable: WithRootSet<D::SolvableId>,
     at_most_one_trackers: HashMap<D::NameId, AtMostOnceTracker<VariableId>>,
 
+    /// The encoding to use for at-most-one constraints between the candidates
+    /// of a package.
+    pub(crate) amo_encoding: AmoEncoding,
+
     /// Keeps track of auxiliary variables that are used to encode at-least-one
     /// solvable for a package.
     at_least_one_tracker: <D::NameId as SolverId>::Map<Option<VariableId>>,
@@ -255,6 +261,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             clauses_added_for_package: Default::default(),
             clauses_added_for_solvable: Default::default(),
             at_most_one_trackers: Default::default(),
+            amo_encoding: AmoEncoding::from_env(),
             at_least_one_tracker: Default::default(),
             constrains_aux_vars: Default::default(),
             decision_tracker: Default::default(),
@@ -414,6 +421,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
     }
 
+    /// Configure the encoding used for the at-most-one constraints between
+    /// the candidates of a package. This is an experimental knob to evaluate
+    /// the trade-offs between the different encodings; see [`AmoEncoding`].
+    #[must_use]
+    pub fn with_amo_encoding(mut self, encoding: AmoEncoding) -> Self {
+        self.state.amo_encoding = encoding;
+        self
+    }
+
     /// Solves the given [`Problem`].
     ///
     /// The solver first solves for the root requirements and constraints, and
@@ -446,8 +462,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         problem: Problem<D::SolvableId, impl IntoIterator<Item = D::SolvableId>>,
     ) -> Result<Vec<D::SolvableId>, UnsolvableOrCancelled> {
-        // Re-initialize the solver state.
+        // Re-initialize the solver state, keeping the configured at-most-one
+        // encoding.
+        let amo_encoding = self.state.amo_encoding;
         self.state = SolverState::default();
+        self.state.amo_encoding = amo_encoding;
 
         // Construct the root dependencies from the problem
         let root_dependencies = Dependencies::Known(KnownDependencies {

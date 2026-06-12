@@ -727,8 +727,10 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 .at_most_one_trackers
                 .remove(&name_id)
                 .unwrap_or_default();
+            let amo_encoding = self.state.amo_encoding;
             let variable_is_new = other_solvables.add(
                 candidate_var,
+                amo_encoding,
                 |a, b, positive| {
                     let literal_b = if positive { b.positive() } else { b.negative() };
                     let literal_a = a.negative();
