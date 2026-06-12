@@ -1,0 +1,21 @@
+---
+source: src/solver/at_most_one.rs
+expression: "clauses.iter().format(\"\\n\")"
+---
+¬x2 ∨ ¬x1
+¬x1 ∨ ¬v1
+¬x2 ∨ ¬v1
+¬x3 ∨ v1
+¬x4 ∨ ¬x3
+¬x4 ∨ v1
+¬x1 ∨ ¬v2
+¬x2 ∨ ¬v2
+¬x3 ∨ ¬v2
+¬x4 ∨ ¬v2
+¬x5 ∨ ¬v1
+¬x5 ∨ v2
+¬x6 ∨ ¬x5
+¬x6 ∨ ¬v1
+¬x6 ∨ v2
+¬x7 ∨ v1
+¬x7 ∨ v2

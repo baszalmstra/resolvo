@@ -50,6 +50,19 @@ pub enum AmoEncoding {
         group_size: usize,
     },
 
+    /// The bimander encoding (Hölldobler & Nguyen), a hybrid of the binary
+    /// and commander encodings. Variables are split into groups of
+    /// `group_size`; within a group the constraint is pairwise, and instead
+    /// of a commander variable per group the index of a variable's group is
+    /// encoded in binary over `⌈log₂(n / group_size)⌉` shared bit variables.
+    ///
+    /// Roughly `n((group_size - 1)/2 + log₂(n / group_size))` clauses and
+    /// `⌈log₂(n / group_size)⌉` auxiliary variables.
+    Bimander {
+        /// The number of variables per group.
+        group_size: usize,
+    },
+
     /// Pairwise clauses while the package has at most `threshold` candidates,
     /// switching to the binary encoding beyond that.
     ///
@@ -73,6 +86,7 @@ impl std::str::FromStr for AmoEncoding {
             "binary" => Ok(AmoEncoding::Binary),
             "sequential" => Ok(AmoEncoding::Sequential),
             "commander" => Ok(AmoEncoding::Commander { group_size: 3 }),
+            "bimander" => Ok(AmoEncoding::Bimander { group_size: 2 }),
             _ => {
                 if let Some(threshold) = s.strip_prefix("hybrid:") {
                     let threshold = threshold
@@ -87,10 +101,19 @@ impl std::str::FromStr for AmoEncoding {
                         return Err("commander group size must be at least 2".to_string());
                     }
                     Ok(AmoEncoding::Commander { group_size })
+                } else if let Some(group_size) = s.strip_prefix("bimander:") {
+                    let group_size: usize = group_size
+                        .parse()
+                        .map_err(|e| format!("invalid bimander group size: {e}"))?;
+                    if group_size < 1 {
+                        return Err("bimander group size must be at least 1".to_string());
+                    }
+                    Ok(AmoEncoding::Bimander { group_size })
                 } else {
                     Err(format!(
                         "unknown at-most-one encoding {s:?}, expected `pairwise`, `binary`, \
-                         `sequential`, `commander[:<group size>]` or `hybrid:<threshold>`"
+                         `sequential`, `commander[:<group size>]`, `bimander[:<group size>]` \
+                         or `hybrid:<threshold>`"
                     ))
                 }
             }
@@ -191,11 +214,23 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
         // need to add any clauses. The commander encoding still has to record
         // the variable as a member of its first group.
         if self.variables.is_empty() {
-            if let AmoEncoding::Commander { group_size } = encoding {
-                return self.add_commander(variable, group_size.max(2), alloc_clause, alloc_var);
+            match encoding {
+                AmoEncoding::Commander { group_size } => {
+                    return self.add_commander(
+                        variable,
+                        group_size.max(2),
+                        alloc_clause,
+                        alloc_var,
+                    );
+                }
+                AmoEncoding::Bimander { group_size } => {
+                    return self.add_bimander(variable, group_size.max(1), alloc_clause, alloc_var);
+                }
+                _ => {
+                    self.variables.insert(variable.clone());
+                    return true;
+                }
             }
-            self.variables.insert(variable.clone());
-            return true;
         }
 
         match encoding {
@@ -204,6 +239,9 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
             AmoEncoding::Sequential => self.add_sequential(variable, alloc_clause, alloc_var),
             AmoEncoding::Commander { group_size } => {
                 self.add_commander(variable, group_size.max(2), alloc_clause, alloc_var)
+            }
+            AmoEncoding::Bimander { group_size } => {
+                self.add_bimander(variable, group_size.max(1), alloc_clause, alloc_var)
             }
             AmoEncoding::Hybrid { threshold } => {
                 // Stay pairwise while the set is small and no helper variables
@@ -372,6 +410,70 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
 
         true
     }
+
+    /// Like the commander encoding, variables are split into groups that are
+    /// internally pairwise, but instead of a commander variable per group the
+    /// index of a variable's group is encoded in binary over shared bit
+    /// variables (like the binary encoding, but per group instead of per
+    /// variable). Two variables from different groups force contradictory
+    /// values on at least one bit.
+    ///
+    /// Reuses level 0 of [`Self::commander_levels`] for the group bookkeeping
+    /// (the commander-specific fields stay unused) and [`Self::helpers`] for
+    /// the bit variables.
+    fn add_bimander(
+        &mut self,
+        variable: V,
+        group_size: usize,
+        mut alloc_clause: impl FnMut(V, V, bool),
+        mut alloc_var: impl FnMut() -> V,
+    ) -> bool {
+        if self.commander_levels.is_empty() {
+            self.commander_levels.push(CommanderLevel::default());
+        }
+
+        // If the open group is full, close it and open the next one. This is
+        // done before inserting `variable` so that the bit backfill below only
+        // covers the variables of earlier groups.
+        if self.commander_levels[0].open_group.len() == group_size {
+            let level = &mut self.commander_levels[0];
+            level.open_group.clear();
+            level.closed_groups += 1;
+            let group_idx = level.closed_groups;
+
+            // Allocate bit variables until the new group's index is
+            // representable. All existing variables belong to earlier groups
+            // whose indices have a 0 in any newly allocated bit.
+            while group_idx >= (1 << self.helpers.len()) {
+                let bit = alloc_var();
+                self.helpers.push(bit.clone());
+                for var in self.variables.iter().cloned() {
+                    alloc_clause(var, bit.clone(), false);
+                }
+            }
+        }
+
+        self.variables.insert(variable.clone());
+        let level = &mut self.commander_levels[0];
+
+        // Pairwise within the group.
+        for member in &level.open_group {
+            alloc_clause(variable.clone(), member.clone(), false);
+        }
+        level.open_group.push(variable.clone());
+
+        // The bit pattern of the group's index.
+        let group_idx = level.closed_groups;
+        for (bit_idx, bit) in self.helpers.iter().enumerate() {
+            alloc_clause(
+                variable.clone(),
+                bit.clone(),
+                ((group_idx >> bit_idx) & 1) == 1,
+            );
+        }
+
+        true
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +593,12 @@ mod test {
         insta::assert_snapshot!(clauses.iter().format("\n"));
     }
 
+    #[test]
+    fn test_at_most_once_tracker_bimander() {
+        let clauses = clauses_for(AmoEncoding::Bimander { group_size: 2 }, 7);
+        insta::assert_snapshot!(clauses.iter().format("\n"));
+    }
+
     /// Brute-force check: for every assignment with two or more true
     /// variables, at least one clause must be violated (given the best-case
     /// assignment of helper variables), and assignments with at most one true
@@ -503,6 +611,9 @@ mod test {
             AmoEncoding::Sequential,
             AmoEncoding::Commander { group_size: 2 },
             AmoEncoding::Commander { group_size: 3 },
+            AmoEncoding::Bimander { group_size: 1 },
+            AmoEncoding::Bimander { group_size: 2 },
+            AmoEncoding::Bimander { group_size: 3 },
             AmoEncoding::Hybrid { threshold: 3 },
         ] {
             for n in 1..=8usize {
