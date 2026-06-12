@@ -646,28 +646,32 @@ const PREFIX_BUDGET_FLOOR: u64 = 10_000;
 /// Conflicts a single `run_sat` call may accumulate before the
 /// env-literals-last ordering is suspended for the rest of that run (see
 /// [`SolverState::env_ordering_suspended`] and
-/// docs/design/universal-refutation-ordering.md). Mechanical cell
-/// transitions need a handful of conflicts (~3 on the benchmark corpus) and
-/// genuine solution searches stay well below this; a run that crosses it is
-/// almost certainly refuting, where the deferral only postpones the env
-/// contradictions that prune the search.
-const ENV_ORDERING_CONFLICT_LIMIT: u64 = 32;
+/// docs/design/universal-refutation-ordering.md).
+///
+/// THE SWITCH IS DISABLED BY DEFAULT. It was designed and tuned before
+/// the Luby restarts landed; the corrected full-corpus A/B (night-2
+/// acceptance in the benchmark report; the first pair was invalidated
+/// by a tool build mistake) shows that with restarts present the
+/// switch is a net negative: off recovers four capped problems (265,
+/// 433, 704, 750) and the mechanical-enumeration slowdowns (problem
+/// 106 runs 10x faster) against one loss (577, which completes at
+/// ~102 s), with a lower total wall. The machinery stays for research
+/// through [`Solver::set_env_ordering_conflict_limit`] and
+/// [`Solver::set_env_ordering_work_budget`].
+const ENV_ORDERING_CONFLICT_LIMIT: u64 = u64::MAX;
 
 /// Work multiple for the refutation switch's work-based co-trigger, in
 /// units of the from-scratch solve cost (see
-/// [`SolverState::env_ordering_work_deadline`]). Legitimate cell
-/// transitions cost a fraction of a fresh solve; a run several fresh
-/// solves deep without completing is refuting. Deliberately far below
-/// [`PREFIX_BUDGET_FACTOR`]: suspending the ordering in-run is gentle
-/// (the run restarts and continues neutrally), while the budget abandons
-/// the whole reuse attempt, so the switch firing first keeps the budget
-/// machinery dormant.
-const ENV_ORDERING_WORK_FACTOR: u64 = 4;
+/// [`SolverState::env_ordering_work_deadline`]). Zero together with a
+/// zero floor means the co-trigger is disabled, which is the default
+/// (see [`ENV_ORDERING_CONFLICT_LIMIT`] for the corpus rationale).
+const ENV_ORDERING_WORK_FACTOR: u64 = 0;
 
 /// Lower bound for the work-based co-trigger, used directly while no
 /// fresh-solve cost has been recorded yet (the first run of an
-/// enumeration) and as a floor for trivially cheap first cells.
-const ENV_ORDERING_WORK_FLOOR: u64 = 2_000_000;
+/// enumeration) and as a floor for trivially cheap first cells. Zero
+/// together with a zero factor means the co-trigger is disabled.
+const ENV_ORDERING_WORK_FLOOR: u64 = 0;
 
 /// Upper bound for the work-based co-trigger (clamped after the
 /// fresh-cost scaling, but never below the floor override): on problems
@@ -905,7 +909,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
     /// Overrides the work-based co-trigger of the refutation switch (see
     /// [`ENV_ORDERING_WORK_FACTOR`] and [`ENV_ORDERING_WORK_FLOOR`]).
-    /// Diagnostics-only, for tests and benchmark sweeps.
+    /// Passing zero for BOTH disables the co-trigger, which is the
+    /// default. Diagnostics-only, for tests and benchmark sweeps.
     #[cfg(feature = "diagnostics")]
     pub fn set_env_ordering_work_budget(&mut self, factor: u64, floor: u64) {
         self.env_ordering_work_factor = factor;
@@ -2477,6 +2482,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         if self.state.run_conflicts == 1
             && self.state.env_ordering_active
             && !self.state.env_ordering_suspended
+            && !(self.env_ordering_work_factor == 0 && self.env_ordering_work_floor == 0)
         {
             // First conflict of the run: refutation work may be starting.
             // Arm the work-based stage-2 trigger; from here the run has a

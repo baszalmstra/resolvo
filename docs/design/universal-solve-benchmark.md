@@ -680,3 +680,108 @@ where the baseline timed out and the queue-powered build now completes
 the unsolvable verdict inside the cap. Total concrete wall drops from
 1736 s to 1563 s, making the decide queue a measured mainline win
 independent of universal solving.
+
+## Night 2: outlier classes attacked on four fronts (2026-06-12)
+
+After the combined head landed, the remaining outliers were classified
+(persistent universal-only timeouts; refutation regressions from the
+env ordering; per-cell search cost; intrinsically hard instances) and
+four parallel research efforts attacked them
+(`research-refutation-ordering`, `research-assertion-watermark`,
+`research-cdcl-modernization`, `research-outlier-forensics`), merged as
+`research-universal-night2` with the decide-queue debug oracle
+asserting through every merge step. Design notes:
+`universal-refutation-ordering.md`, `assertion-watermark.md`,
+`cdcl-modernization.md`, `outlier-forensics.md`,
+`night2-integration.md`.
+
+What landed:
+
+- **Forensics first**: the fragmentation suspect (problem 265, 708
+  cells) turned out to be honest output (563 genuinely distinct
+  solutions; merging cannot express the unions) whose cost is one
+  intrinsic wall: the first entry into a cuda [11,12) cell refutes the
+  whole modern GPU stack (57k conflicts). The mystery problem 212 is
+  the same class in extreme form. Both also showed the prefix work
+  budget false-firing on intrinsic walls and re-paying them; with
+  restarts landed the budgets went fully dormant corpus-wide.
+- **Assertion watermark**: the three per-propagate assertion rescans
+  became incremental (per-list cursors plus a trail-position heap
+  invalidated through a tracker sync floor). Exactly behavior
+  preserving, scan work down four to five orders of magnitude
+  (problem 433's learnt-list scan: 11.84e9 entries to 103,944, zero of
+  which ever applied), wall wins up to 2.7x on the conflict-heavy
+  class.
+- **Luby restarts** (base 128, restart floor respecting the
+  starting-level contract): concrete 539 from timeout to 33.6 s,
+  concrete 186 from 182 s to 11.8 s, universal 138 from 64 s to 9.1 s.
+  Learnt-DB reduction was prototyped and DROPPED with measured
+  rationale (learnt clauses are 2-3% of propagation visits here, and
+  hard proofs reuse broad clause sets: freezing re-learned 88% of
+  frozen clauses); phase saving is structurally a no-op (decisions
+  carry no polarity freedom). A per-propagate scan fix fell out of the
+  deletion work: only unit learnt clauses register for the assertion
+  scan.
+- **Refutation switch**: the env-literals-last ordering is wrong for
+  refutations; a two-stage per-run switch (stage 1: conflict limit,
+  suspend and restart; stage 2: work deadline, restart with activity
+  rescore) repairs the five known counterexamples.
+
+### The refutation switch: invalid A/B, corrected verdict, default off
+
+A tooling mistake initially invalidated the switch A/B: the
+solve-snapshot env overrides are compiled under the TOOL's own
+`diagnostics` feature, and building with `--features
+resolvo/diagnostics` alone silently compiles them out, so the first
+"switch off" corpus pair compared the shipped defaults against
+themselves (a perfect, and perfectly meaningless, wash). With the tool
+built correctly (`--features diagnostics`), the extended-cap matrix on
+the switch-sensitive problems:
+
+| problem | both stages | stage 2 only | switch off |
+|---|---|---|---|
+| 577 | 9.6 s | 42.4 s | 102-108 s |
+| 506 | ~10 s | 9.3 s | 59.7 s |
+| 669 | 11.6 s | - | 23.7 s |
+| 768 | 82-86 s | - | 78.0 s |
+| 704 | ~176 s | ~178-199 s | **38.4 s** |
+| 750 | ~108 s | - | **18.8 s** |
+| 587 | 6.4 s | - | 7.4 s |
+
+The valid full-corpus A/B settles it: switch OFF wins. Off recovers
+four capped problems (265, 433, 704 and 750, whose apparent restart
+regression was switch damage all along) and the mechanical-enumeration
+slowdowns the on-run had introduced (problem 106: 38.2 s to 3.8 s,
+plus 415, 464, 491, 215), against one loss (577, which still completes
+at ~102 s), with a lower total wall. The switch predates the Luby
+restarts and was tuned against a head without them; with restarts
+present it is a net negative, so it now ships DISABLED (unreachable
+conflict limit, zeroed work budget), with the machinery and the
+setters kept for research. Re-tuning it against the restart-equipped
+head, with 577/506/669 as targets and 704/750/106 as guards, is a
+follow-up.
+
+### Acceptance (linux-64, 1000 problems, final shipped defaults)
+
+| | campaign baseline | night-1 head | night-2 head |
+|---|---|---|---|
+| universal total wall | 3350 s | 2267 s | **1771 s** |
+| universal timeouts | 23 | 12 | **5** |
+| universal p95 vs concrete | 4.4x | 2.1x | **2.0x** |
+| universal p99 duration | 60 s (capped) | 60 s (capped) | **32 s** |
+| concrete total wall | 1736 s | 1736 s (unchanged) | **1233 s** |
+| concrete timeouts | 7 | 7 | **2** |
+
+- The five remaining universal timeouts: 539 and 982 (concrete cannot
+  finish them either), and 212 / 577 / 768, all of which now COMPLETE
+  above the cap (237 s, 102 s, 78 s). Problem 212 completing at all is
+  a first for any configuration ever benchmarked; the watermark plus
+  the restarts cracked it together.
+- Concrete: five of seven timeouts recovered (186, 204, 232, 539,
+  935); only 553 and 982 remain, and 553's universal solve returns its
+  verdict in seconds. Restart-induced solution drift: 12 of ~791 ok
+  problems (1.5%) select a different valid solution; the list is in
+  the night-2 integration note and needs a product-level acceptability
+  call before mainlining restarts.
+- All universal solutions verifier-clean in every run; the 1000-seed
+  property test and the decide oracle stayed green throughout.
