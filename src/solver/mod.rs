@@ -256,6 +256,39 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     deferred_requirements:
         IndexMap<ConditionId, Vec<DeferredRequirement<D::SolvableId>>, ahash::RandomState>,
 
+    /// Conflicts analyzed since the last restart (or since entry) of the
+    /// current `run_sat` call, counted per conflict that yields a learnt
+    /// clause. A level-1 conflict that proves unsolvability is reported
+    /// before this is bumped, so it never paces a restart. Compared against
+    /// [`Self::restart_limit`].
+    conflicts_since_restart: u64,
+
+    /// The number of restarts performed by the current `run_sat` call;
+    /// indexes the Luby sequence that paces [`Self::restart_limit`].
+    restarts_performed: u64,
+
+    /// The conflict count at which the next restart fires (see
+    /// [`Solver::maybe_restart`]).
+    restart_limit: u64,
+
+    /// The root install level of the current `run_sat` call
+    /// (`starting_level + 1`), the retract target of
+    /// [`Solver::restart_to_run_root`]. Everything below it is preserved
+    /// prior state (the previous solution while a soft requirement is
+    /// being decided) that a restart must never undo.
+    run_root_level: u32,
+
+    /// Restart signatures (conflict level, trail length) observed by the
+    /// current `run_sat` call, with the number of restarts fired from each;
+    /// see [`RESTART_FUTILITY_REPEATS`].
+    restart_signatures: HashMap<(u32, usize), u32>,
+
+    /// Set once the current run demonstrates restart futility (one
+    /// signature reached [`RESTART_FUTILITY_REPEATS`]): the run commits to
+    /// its search and no further restarts fire until the next `run_sat`
+    /// call.
+    restarts_suppressed: bool,
+
     #[cfg(feature = "diagnostics")]
     propagation_counters: PropagationCounters,
 }
@@ -282,10 +315,69 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             max_activity: 0.0,
             decide_queue: Default::default(),
             deferred_requirements: Default::default(),
+            conflicts_since_restart: 0,
+            restarts_performed: 0,
+            restart_limit: u64::MAX,
+            run_root_level: 0,
+            restart_signatures: Default::default(),
+            restarts_suppressed: false,
             #[cfg(feature = "diagnostics")]
             propagation_counters: Default::default(),
         }
     }
+}
+
+/// Base interval, in learnt conflicts, of the Luby restart sequence: the
+/// n-th restart of a `run_sat` call fires after `luby(n) *
+/// RESTART_BASE_INTERVAL` conflicts. Classic CDCL restarts keep all learnt
+/// clauses and activity scores but abandon the current partial assignment,
+/// so a search that walked into a hopeless subtree re-descends from the run
+/// root, now pruned by the learnt clauses (and reordered where conflict
+/// activity has since shifted the candidate ranking). The value 128 is the
+/// campaign-tuned one: a 512 sensitivity check kept only half the win on
+/// the hard problems and lost ground everywhere else.
+const RESTART_BASE_INTERVAL: u64 = 128;
+
+/// A restart that keeps firing from the same state — same conflict level
+/// and same trail length — is not redirecting the search: the re-descent
+/// keeps rebuilding the same prefix, which means the run is grinding one
+/// long contiguous proof that restarts only interrupt (and, near the
+/// timeout, can prevent from ever finishing). After this many restarts
+/// from one signature the run commits: restarts are suppressed until the
+/// next `run_sat` call.
+///
+/// `(level, trail length)` is a deliberately coarse fingerprint of the
+/// search state, not an identity: two genuinely different assignments can
+/// share it, so the gate can in principle over-suppress a productive run
+/// that revisits one length four times. It is chosen over the standard
+/// trail-size moving average of Glucose-style blocking restarts (Audemard
+/// & Simon) or Biere's flip-rate agility because resolvo cannot phase-save
+/// — candidate values are fixed by version preference, so a cycle here is
+/// *exact* rather than approximate, and exact-equality counting detects it
+/// without a noisy statistic. Measured on the conda-forge corpus the
+/// separation was clean: cycling runs repeated one signature dozens of
+/// times before the deadline, while the traced productive solves never
+/// repeated one (their restart states differed by tens of thousands of
+/// trail entries). 4 sits in that gap — high enough not to clip a run that
+/// briefly revisits a state, low enough to cut a cycle long before the cap.
+const RESTART_FUTILITY_REPEATS: u32 = 4;
+
+/// The Luby sequence (1, 1, 2, 1, 1, 2, 4, 1, ...) for `x >= 0`, the
+/// textbook universally-optimal restart pacing: frequent short intervals
+/// with geometrically rarer long ones, so neither short- nor long-tailed
+/// conflict distributions degenerate.
+fn luby(mut x: u64) -> u64 {
+    let (mut size, mut seq) = (1u64, 0u32);
+    while size < x + 1 {
+        seq += 1;
+        size = 2 * size + 1;
+    }
+    while size - 1 != x {
+        size = (size - 1) >> 1;
+        seq -= 1;
+        x %= size;
+    }
+    1u64 << seq
 }
 
 /// Counters that track propagation loop behavior for performance analysis.
@@ -307,6 +399,11 @@ pub(crate) struct PropagationCounters {
     pub unwatched_calls_by_type: PropagationVisitsByType,
     pub propagate_calls: u64,
     pub conflicts: u64,
+    /// Times the Luby restart policy fired (see [`Solver::maybe_restart`]).
+    pub restarts: u64,
+    /// Times a run suppressed its restarts after demonstrating futility
+    /// (see [`RESTART_FUTILITY_REPEATS`]).
+    pub restart_suppressions: u64,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -419,6 +516,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// first fire" invariant of the lazy-conditional-candidates path.
     pub fn deferred_requirements_count(&self) -> usize {
         self.state.deferred_requirements_count()
+    }
+
+    /// The number of times the Luby restart policy fired.
+    #[cfg(feature = "diagnostics")]
+    pub fn restart_count(&self) -> u64 {
+        self.state.propagation_counters.restarts
+    }
+
+    /// The number of `run_sat` calls that suppressed their restarts after
+    /// hitting the futility gate.
+    #[cfg(feature = "diagnostics")]
+    pub fn restart_suppression_count(&self) -> u64 {
+        self.state.propagation_counters.restart_suppressions
     }
 
     /// Set the runtime of the solver to `runtime`.
@@ -569,6 +679,18 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             .next_back()
             .map(|decision| self.state.decision_tracker.level(decision.variable))
             .unwrap_or(0);
+
+        // Arm the restart policy for this run: the root level pins everything
+        // the caller wants preserved (see [`SolverState::run_root_level`]),
+        // and the Luby sequence restarts from its first interval. Each
+        // `run_sat` call is its own search episode; knowledge transfers
+        // through the learnt clauses and activity scores, not the pacing.
+        self.state.run_root_level = starting_level + 1;
+        self.state.conflicts_since_restart = 0;
+        self.state.restarts_performed = 0;
+        self.state.restart_limit = RESTART_BASE_INTERVAL * luby(0);
+        self.state.restart_signatures.clear();
+        self.state.restarts_suppressed = false;
 
         let mut level = starting_level;
         let mut new_solvables: Vec<(VariableId, ClauseId)> = Vec::new();
@@ -1010,6 +1132,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         attempted_value,
                         conflicting_clause,
                     )?;
+                    level = self.maybe_restart(level);
                 }
             }
         }
@@ -1079,6 +1202,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
         let (new_level, learned_clause_id, literal) =
             self.analyze(level, conflicting_solvable, conflicting_clause);
+        self.state.conflicts_since_restart += 1;
         let old_level = level;
         level = new_level;
 
@@ -1107,6 +1231,91 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
 
         Ok(level)
+    }
+
+    /// Fires a classic CDCL restart when the current `run_sat` call has
+    /// accumulated enough conflicts since the previous one (Luby pacing,
+    /// see [`RESTART_BASE_INTERVAL`]).
+    ///
+    /// A restart undoes every decision above the run's root install level
+    /// while keeping all learnt clauses and activity scores: the search
+    /// re-descends guided by what the conflicts taught it instead of
+    /// staying committed to early decisions that predate that knowledge.
+    /// See [`Solver::restart_to_run_root`] for the retract primitive and
+    /// its soundness argument, and [`RESTART_FUTILITY_REPEATS`] for the
+    /// futility gate that makes a cycling run commit instead.
+    ///
+    /// Called only after [`Solver::learn_from_conflict`] has had its chance
+    /// to declare the problem unsolvable (a level-1 conflict returns before
+    /// we get here), so a refutation that bottoms out at the run root is
+    /// never mistaken for a restart opportunity.
+    fn maybe_restart(&mut self, level: u32) -> u32 {
+        // The count comparison is the hot-path check: on a run that never
+        // restarts it is the operand that returns, so test it first and
+        // consult the suppression flag only once a restart could fire.
+        if self.state.conflicts_since_restart < self.state.restart_limit
+            || self.state.restarts_suppressed
+        {
+            return level;
+        }
+
+        let signature = (level, self.state.decision_tracker.assignments().len());
+        let fired = self
+            .state
+            .restart_signatures
+            .entry(signature)
+            .or_insert(0u32);
+        *fired += 1;
+        if *fired >= RESTART_FUTILITY_REPEATS {
+            tracing::debug!(
+                "├─ Suppressing restarts: {} fired from level {level} with trail length {}",
+                *fired,
+                signature.1
+            );
+            self.state.restarts_suppressed = true;
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state.propagation_counters.restart_suppressions += 1;
+            }
+            return level;
+        }
+
+        self.state.conflicts_since_restart = 0;
+        self.state.restarts_performed += 1;
+        self.state.restart_limit = RESTART_BASE_INTERVAL * luby(self.state.restarts_performed);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state.propagation_counters.restarts += 1;
+        }
+
+        if level > self.state.run_root_level {
+            tracing::debug!(
+                "├─ Restart {}: backtracking from level {level} to {}",
+                self.state.restarts_performed,
+                self.state.run_root_level
+            );
+        }
+        self.restart_to_run_root(level)
+    }
+
+    /// The restart primitive: retracts the trail to
+    /// [`SolverState::run_root_level`], the root install level of the
+    /// current run. Kept separate from [`Solver::maybe_restart`] so other
+    /// restart triggers can share one retract path.
+    ///
+    /// Everything below the root level (a preserved prior solution while a
+    /// soft requirement is being decided) survives by construction. Learnt
+    /// clauses and activity scores are untouched. Backtracking is the only
+    /// effect; assertions of single-literal learnt clauses are re-applied
+    /// by [`Solver::decide_learned`] on the next propagation round.
+    fn restart_to_run_root(&mut self, level: u32) -> u32 {
+        let root_level = self.state.run_root_level;
+        if level <= root_level {
+            // Already at (or below) the restart target.
+            return level;
+        }
+        self.state.decision_tracker.undo_until(root_level);
+        root_level
     }
 
     /// The propagate step of the CDCL algorithm
@@ -1745,5 +1954,16 @@ impl<D: DependencyProvider> SolverState<D> {
             .values()
             .map(|entries| entries.len())
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::luby;
+
+    #[test]
+    fn luby_produces_the_textbook_sequence() {
+        let observed: Vec<u64> = (0..15).map(luby).collect();
+        assert_eq!(observed, vec![1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8]);
     }
 }

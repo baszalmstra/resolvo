@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The solver now uses a classic CDCL restart policy (Luby sequence over a
+  base interval of 128 conflicts, tuned on the conda-forge corpus), which
+  dramatically reduces solve times on conflict-heavy and unsolvable
+  problems. As with any solver heuristic improvement, valid solutions may
+  differ between resolvo versions: a small tail of problems now resolves to
+  a different but equally valid solution. Version preference is unaffected.
+
 ## [0.10.4](https://github.com/prefix-dev/resolvo/compare/resolvo-v0.10.3...resolvo-v0.10.4) - 2026-06-02
 
 ### Other

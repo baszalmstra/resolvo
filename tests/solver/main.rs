@@ -778,6 +778,103 @@ fn test_solve_with_soft_requirement_forbid_clause_conflict() {
     "###);
 }
 
+/// Adds an unsolvable, conflict-heavy core: every version of `a` needs a
+/// different exclusive version of `m` than every version of `b`, so the
+/// refutation has to dismiss each version of `a` with a real conflict
+/// (selecting `a=i` propagates `m=i`, which forbids every other `m` version
+/// and with it all of `b`). With enough versions the conflict count crosses
+/// the Luby restart base interval and restarts fire mid-refutation.
+fn add_conflict_heavy_core(provider: &mut BundleBoxProvider, n: u32) {
+    for i in 1..=n {
+        let a_dep = format!("m {i}..{}", i + 1);
+        let b_dep = format!("m {}..{}", i + n, i + n + 1);
+        provider.add_package("a", Pack::new(i), &[a_dep.as_str()], &[]);
+        provider.add_package("b", Pack::new(i), &[b_dep.as_str()], &[]);
+        provider.add_package("m", Pack::new(i), &[], &[]);
+        provider.add_package("m", Pack::new(i + n), &[], &[]);
+    }
+}
+
+/// A refutation that crosses the restart interval must still conclude
+/// unsolvable: a restart lands at the run's root install level without
+/// being mistaken for the conflict-at-root unsolvable case, and the learnt
+/// clauses eventually contradict at that level.
+///
+/// This refutation makes monotonic progress (each `a=i` is permanently
+/// killed by a learnt clause), so every restart fires from a different,
+/// shrinking state. It therefore also pins that the futility gate does not
+/// misfire on a productive run: no signature repeats, so suppression must
+/// stay at zero. (The gate's firing path — a run that *does* revisit a
+/// signature — is an emergent activity-driven cycle seen on the corpus,
+/// e.g. concrete problem 761; it is exercised there rather than by a
+/// synthetic unit test, where cycling does not reliably reproduce.)
+#[test]
+fn test_restarts_during_refutation_keep_the_verdict() {
+    let mut provider = BundleBoxProvider::new();
+    add_conflict_heavy_core(&mut provider, 300);
+
+    let requirements = provider.requirements(&["a", "b"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+
+    let result = solver.solve(problem);
+    assert!(
+        matches!(result, Err(UnsolvableOrCancelled::Unsolvable(_))),
+        "the a/b/m core is unsolvable"
+    );
+    #[cfg(feature = "diagnostics")]
+    {
+        assert!(
+            solver.restart_count() >= 1,
+            "a conflict-heavy refutation must cross the restart interval \
+             (got {} restarts)",
+            solver.restart_count()
+        );
+        assert_eq!(
+            solver.restart_suppression_count(),
+            0,
+            "a monotonic refutation makes progress and must not trip the \
+             futility gate"
+        );
+    }
+}
+
+/// The restart floor contract: while a soft requirement is being decided,
+/// the previous solution is preserved prior state below the run's root
+/// install level, and a restart must never undo it. The soft requirement
+/// drags in the conflict-heavy core so restarts fire during its `run_sat`
+/// call; the hard solution must come through untouched and the soft
+/// requirement must simply be excluded.
+#[test]
+fn test_restarts_in_soft_requirement_run_preserve_prior_solution() {
+    let mut provider =
+        BundleBoxProvider::from_packages(&[("app", 1, vec!["lib"]), ("lib", 1, vec![])]);
+    add_conflict_heavy_core(&mut provider, 300);
+    provider.add_package("s", Pack::new(1), &["a", "b"], &[]);
+
+    let requirements = provider.requirements(&["app"]);
+    let extra_solvables = [provider.solvable_id("s", 1)];
+
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new()
+        .requirements(requirements)
+        .soft_requirements(extra_solvables);
+
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r###"
+        app=1
+        lib=1
+        "###);
+    #[cfg(feature = "diagnostics")]
+    assert!(
+        solver.restart_count() >= 1,
+        "the soft-requirement run must cross the restart interval \
+         (got {} restarts)",
+        solver.restart_count()
+    );
+}
+
 #[test]
 fn test_solve_with_additional_with_constrains() {
     let mut provider = BundleBoxProvider::from_packages(&[
