@@ -24,12 +24,12 @@ use crate::{
     },
     requirement::RequirementMap,
     runtime::{AsyncRuntime, NowOrNeverRuntime},
-    solver::binary_encoding::AtMostOnceTracker,
+    solver::at_most_one::AtMostOnceTracker,
     solver_id::{IdMap, IdSet, SolverId},
     utils::{IndexedSet, Mapping},
 };
 
-mod binary_encoding;
+mod at_most_one;
 mod cache;
 pub(crate) mod clause;
 mod conditions;

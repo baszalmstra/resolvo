@@ -189,9 +189,14 @@ impl Conflict {
                     graph.add_edge(root_node, node2_id, ConflictEdge::Conflict(conflict));
                 }
                 &Clause::ForbidMultipleInstances(instance1_id, instance2_id, _) => {
-                    let solvable1 = instance1_id
-                        .as_solvable_or_root(&state.variable_map)
-                        .expect("only solvables can be excluded");
+                    // Chain clauses of the at-most-one ladder encoding link
+                    // two helper variables; they carry no package information
+                    // (the candidate-helper clauses preserve every solvable
+                    // edge), so skip them.
+                    let Some(solvable1) = instance1_id.as_solvable_or_root(&state.variable_map)
+                    else {
+                        continue;
+                    };
                     let node1_id = Self::add_node(&mut graph, &mut nodes, solvable1);
 
                     let VariableOrigin::ForbidMultiple(name) =
