@@ -153,13 +153,17 @@ derives all other values in O(1). Conflict analysis resolves sibling
 falsifications into prefix literals, so learnt clauses assert range-pruning
 prefix assignments — three trail entries per selection instead of n.
 
-| workload                | binary  | sequential | virtual | virtual-ladder |
-| ----------------------- | ------- | ---------- | ------- | -------------- |
-| storm n=1400            | 0.30 s  | 0.22 s     | 0.14 s  | **0.14 s**     |
-| storm n=5000            | 5.07 s  | 2.88 s     | 1.68 s  | **1.85 s**     |
-| conflict-heavy V=100    | ~0.45 s | 0.31 s     | 1.0 s   | **0.48 s**     |
-| conflict-heavy conflicts| 5.5 k   | 3.3 k      | 10.1 k  | **5.1 k**      |
-| conda-forge mean (150)  | 0.67 s  | 0.77 s     | 0.94 s  | **0.84 s**     |
+Final numbers with adaptive chain windows and driver-gated package events
+(see the learning-gap research in `docs/virtual-sibling-negations.md`):
+
+| workload                | binary  | sequential | virtual | virtual-ladder | + RESOLVO_FULL_CHAIN |
+| ----------------------- | ------- | ---------- | ------- | -------------- | -------------------- |
+| storm n=1400            | 0.30 s  | 0.22 s     | 0.14 s  | **0.14 s**     | 0.16 s               |
+| storm n=5000            | 5.07 s  | 2.88 s     | 1.68 s  | **1.81 s**     | 2.06 s               |
+| conflict-heavy V=100 (5 seeds) | 0.36 s | 0.21 s | ~1.0 s | **0.35 s**    | 0.38 s               |
+| conflict-heavy conflicts (seed 0) | 5.5 k | 3.3 k | 10.1 k | 4.8 k         | **3.0 k**            |
+| conflict-heavy V=500 solved | 1/5 | **5/5**   | —       | 1/5            | 2/5                  |
+| conda-forge mean (150)  | 0.67 s  | 0.77 s     | 0.94 s  | **0.79 s**     | —                    |
 
 It strictly dominates the plain virtual encoding (equal on storms, ~2×
 faster on conflict-heavy workloads with half the conflicts — all conflict
