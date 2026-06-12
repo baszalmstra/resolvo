@@ -1,3 +1,30 @@
+//! Encodings for the at-most-one constraint between the candidates of a
+//! package ("forbid multiple instances").
+//!
+//! Resolvo must ensure that at most one candidate of each package is part of
+//! the solution. In SAT terms this is an at-most-one constraint over the
+//! candidate variables `x₀..xₙ₋₁`. Because candidates are discovered lazily
+//! while solving, every encoding here is *incremental*: candidates are added
+//! one at a time and the constraint must hold over the candidates added so
+//! far at every step. All emitted clauses are binary (`¬a ∨ b` or
+//! `¬a ∨ ¬b`), which keeps the solver's fast binary-clause propagation path
+//! applicable.
+//!
+//! Six clausal encodings are implemented (see [`AmoEncoding`] for the
+//! clause/variable counts and trade-offs of each), plus two *virtual*
+//! variants that emit no clauses at all and instead derive sibling values
+//! from a package-level selection record — see
+//! [`crate::solver::decision_map`] for how those work and
+//! `docs/virtual-sibling-negations.md` for the research that led to them.
+//!
+//! Measured guidance (see `tools/amo-bench/README.md` for the full data):
+//! [`AmoEncoding::VirtualLadder`] wins or ties every benchmark and is the
+//! recommended choice; among the clausal encodings the linear ones
+//! (sequential, commander) clearly beat the logarithmic ones (binary,
+//! bimander) because their auxiliary variables align with contiguous ranges
+//! of the preference-ordered candidate list, which is the shape of real
+//! dependency conflicts.
+
 use std::hash::Hash;
 
 use indexmap::IndexSet;
@@ -97,8 +124,9 @@ pub enum AmoEncoding {
 impl std::str::FromStr for AmoEncoding {
     type Err = String;
 
-    /// Parses an encoding name: `pairwise`, `binary`, `sequential` or
-    /// `hybrid:<threshold>`.
+    /// Parses an encoding name: `pairwise`, `binary`, `sequential`,
+    /// `commander[:<group size>]`, `bimander[:<group size>]`,
+    /// `hybrid:<threshold>`, `virtual` or `virtual-ladder`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "pairwise" => Ok(AmoEncoding::Pairwise),

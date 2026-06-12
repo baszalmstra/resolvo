@@ -146,7 +146,6 @@ impl DecisionTracker {
         // skipping them never affects soundness, which is why conflict-free
         // solves (backtracking storms) skip them entirely.
         if self.chain_enabled {
-            self.map.swap_last_selected(package, index);
             for i in (0..index.saturating_sub(1)).rev() {
                 let reason = self.map.chain_reason(package, i as usize);
                 self.force_prefix_assignment(package, i, false, reason, level);

@@ -1,3 +1,81 @@
+//! Tracks variable assignments, and implements the *virtual* at-most-one
+//! machinery used by [`crate::AmoEncoding::Virtual`] and
+//! [`crate::AmoEncoding::VirtualLadder`].
+//!
+//! # The problem
+//!
+//! Only one candidate of a package may be selected. Clausal at-most-one
+//! encodings (pairwise, binary, sequential, ...) all share one cost: when the
+//! solver decides `pkg == X`, unit propagation must physically assign
+//! `¬candidate` for every *other* candidate of the package — `n − 1` trail
+//! entries, decision-queue traffic and clause visits per selection. When the
+//! solver walks many versions of a large package (a "backtracking storm"),
+//! rebuilding those assignments dominates the solve time.
+//!
+//! # Virtual falsification
+//!
+//! Instead of assigning the siblings, the map records one *selection* per
+//! package: assigning a candidate true stores `(candidate, index, level)` in
+//! its [`PackageState`]. [`DecisionMap::value`] first consults the explicit
+//! assignment and otherwise *derives* a value: a member of a package whose
+//! selection is a different candidate evaluates to false, at the level of the
+//! selection. Because `Literal::eval` goes through `value`, deciding,
+//! propagation checks and conflict analysis all observe the derived value
+//! without any trail entries.
+//!
+//! Two pieces keep the rest of the solver correct:
+//!
+//! - **Watchers**: watches only fire on physical assignments, so the
+//!   propagation loop walks the watchers of every newly-derived value
+//!   directly (a *package event*) when a selection or prefix assignment is
+//!   processed.
+//! - **Reasons**: derived values have no trail entry for conflict analysis to
+//!   resolve through. [`DecisionMap::derived_reason`] names an explicitly
+//!   assigned *driver* variable and a reason clause `(¬a ∨ lit)` that
+//!   justifies the derivation; the solver materializes that clause lazily
+//!   (memoized) when analysis needs it.
+//!
+//! # Prefix variables (the virtual ladder)
+//!
+//! With only pairwise reasons (`¬selected ∨ ¬sibling`), learnt clauses name
+//! individual candidates and prune a single version at a time. The ladder
+//! variant therefore allocates one *prefix variable* per candidate:
+//!
+//! > `pᵢ` is true iff the selected candidate has index ≤ i
+//!
+//! in discovery (preference) order. A learnt clause containing `pᵢ` or `¬pᵢ`
+//! excludes a whole candidate *range* with a single literal — the same range
+//! compression that makes the clausal sequential encoding learn so well.
+//!
+//! Explicit prefix assignments collapse to an *interval* `[lo, hi]` of
+//! still-allowed candidate indices per package (`p_i = true` caps `hi` at
+//! `i`; `p_i = false` raises `lo` to `i + 1`). Value lookups for members and
+//! prefixes are then a single comparison against the interval, and an
+//! assignment that contradicts the interval (or an active selection) is
+//! detected as a conflict by the ordinary `try_add_decision` value check.
+//! Each *tightening* assignment pushes the previous interval onto an undo
+//! stack tagged with its trail position, so backjumping restores it in O(1)
+//! per popped entry.
+//!
+//! Selecting the candidate with index `k` pushes explicit assignments behind
+//! the member's own trail entry:
+//!
+//! - always the two *boundary* prefixes `p_{k−1} := false` and `p_k := true`,
+//!   with the pre-materialized reasons `(¬m ∨ ¬p_{k−1})` and `(¬m ∨ p_k)`;
+//! - once the solver has conflicted, additionally the full prefix *chain*
+//!   (`p_i := false` below, `p_i := true` above, justified by the monotone
+//!   chain clauses `(¬p_i ∨ p_{i+1})` in chain order).
+//!
+//! The chain entries carry no information the derivation layer does not
+//! already provide — they exist purely so that conflict analysis, which walks
+//! the trail, can stop at any prefix and learn a range literal (measured to
+//! be the difference between pairwise-grade and sequential-grade learning;
+//! see `docs/virtual-sibling-negations.md`). That is also why they can be
+//! skipped while no conflict has happened: conflict-free solves keep the
+//! O(1)-per-selection trail. Their package events are skipped as well: an
+//! assignment that does not tighten the interval (it is not the bound
+//! *driver*) produces no new derived values.
+
 use std::cmp::Ordering;
 
 use crate::VariableId;
@@ -77,12 +155,6 @@ struct PackageState {
     /// prefix variables, along with the driving variable and its level.
     hi: u32,
     hi_driver: Option<(VariableId, u32)>,
-    /// The member index of the previous selection of this package. A pure
-    /// heuristic memory (never undone): re-selections push explicit chain
-    /// entries over the window between the old and new index, giving
-    /// conflict analysis adjacent-step anchors where the search frontier
-    /// just moved.
-    last_selected: Option<u32>,
 }
 
 impl PackageState {
@@ -97,7 +169,6 @@ impl PackageState {
             lo_driver: None,
             hi: u32::MAX,
             hi_driver: None,
-            last_selected: None,
         }
     }
 }
@@ -346,15 +417,6 @@ impl DecisionMap {
         self.packages[package as usize].hi_driver
     }
 
-    /// Records `index` as the package's latest selection and returns the
-    /// previous one.
-    pub fn swap_last_selected(&mut self, package: u32, index: u32) -> Option<u32> {
-        std::mem::replace(
-            &mut self.packages[package as usize].last_selected,
-            Some(index),
-        )
-    }
-
     /// Returns the current selection of `package`: the selected variable, its
     /// member index, and the assignment level.
     #[inline]
@@ -430,39 +492,6 @@ impl DecisionMap {
         state.lo_driver = undo.lo_driver;
         state.hi = undo.hi;
         state.hi_driver = undo.hi_driver;
-    }
-
-    /// Recomputes the allowed-index interval of a package from the explicit
-    /// prefix assignments. Called when a prefix assignment is undone.
-    #[allow(dead_code)]
-    pub fn recompute_interval(&mut self, package: u32) {
-        let mut lo = 0u32;
-        let mut lo_driver = None;
-        let mut hi = u32::MAX;
-        let mut hi_driver = None;
-        for (index, &prefix_var) in self.packages[package as usize]
-            .prefix_vars
-            .iter()
-            .enumerate()
-        {
-            let index = index as u32;
-            match self.explicit_value(prefix_var) {
-                Some(true) if index < hi => {
-                    hi = index;
-                    hi_driver = Some((prefix_var, self.map[prefix_var.to_index()].level()));
-                }
-                Some(false) if index + 1 > lo => {
-                    lo = index + 1;
-                    lo_driver = Some((prefix_var, self.map[prefix_var.to_index()].level()));
-                }
-                _ => {}
-            }
-        }
-        let state = &mut self.packages[package as usize];
-        state.lo = lo;
-        state.lo_driver = lo_driver;
-        state.hi = hi;
-        state.hi_driver = hi_driver;
     }
 
     /// The number of registered candidates of `package`.

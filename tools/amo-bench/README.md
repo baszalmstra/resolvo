@@ -167,6 +167,7 @@ piece was isolated.
 | conflict-heavy V=500    | 1/5     | **5/5, 23.2 s** | 4/5    | 5/5, 26.4 s    |
 | conda-forge seed 0 (150 problems) | 0.67 s | 0.77 s | 0.64 s | **0.64 s**     |
 | conda-forge seed 1      | 1.09 s, 2 timeouts | 1.07 s, 1 timeout | 1.15 s, 2 timeouts | **0.75 s, 0 timeouts** |
+| conda-forge seed 2 (250 problems) | 0.73 s, 0 timeouts | — | 0.86 s, 2 timeouts | **0.60 s, 0 timeouts** |
 
 Virtual-ladder wins or ties every benchmark except the V=500 mean (within
 14% of sequential at the same 5/5 solve rate); on conda-forge seed 1 it is

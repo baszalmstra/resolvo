@@ -1,7 +1,11 @@
 # Design: virtual sibling negations for at-most-one constraints
 
-Status: design + measured motivation. Not implemented; written so that the
-at-most-one encoding work does not foreclose it.
+Status: **implemented** as `AmoEncoding::Virtual` and
+`AmoEncoding::VirtualLadder` (`src/solver/decision_map.rs` holds the
+machinery and its module documentation). This document is the original
+design followed by the research log that shaped the final implementation;
+read it in order to follow how each decision was reached, or read the
+`decision_map` module documentation for the final architecture only.
 
 ## Why clausal encodings hit a floor
 
