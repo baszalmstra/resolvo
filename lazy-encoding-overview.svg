@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="440" viewBox="0 0 940 440">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+  </defs>
+  <style>
+    .t  { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 13px; fill: #1f2328; }
+    .ts { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 12px; fill: #57606a; }
+    .tt { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 16px; font-weight: 600; fill: #1f2328; }
+    .pt { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 14px; font-weight: 600; }
+    .cap { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 13px; font-style: italic; }
+    .box { stroke-width: 1.25; }
+    .arr { stroke: #57606a; stroke-width: 1.5; marker-end: url(#arrow); fill: none; }
+  </style>
+
+  <rect x="0" y="0" width="940" height="440" fill="#ffffff"/>
+  <text class="tt" x="470" y="32" text-anchor="middle">Encoding a conditional requirement: foo=1 depends on "bla; if cond"</text>
+
+  <!-- left panel: eager -->
+  <rect x="24" y="52" width="440" height="364" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text class="pt" x="244" y="78" text-anchor="middle" fill="#cf222e">main (eager)</text>
+
+  <rect class="box" x="64" y="92" width="360" height="36" rx="6" fill="#ffffff" stroke="#d0d7de"/>
+  <text class="t" x="244" y="114" text-anchor="middle">foo=1 is encoded; it requires "bla; if cond"</text>
+  <line class="arr" x1="244" y1="128" x2="244" y2="144"/>
+
+  <rect class="box" x="64" y="146" width="360" height="36" rx="6" fill="#ffebe9" stroke="#cf222e"/>
+  <text class="t" x="244" y="168" text-anchor="middle">fetch candidates of cond and of bla (sorted)</text>
+  <line class="arr" x1="244" y1="182" x2="244" y2="198"/>
+
+  <rect class="box" x="64" y="200" width="360" height="36" rx="6" fill="#ffebe9" stroke="#cf222e"/>
+  <text class="t" x="244" y="222" text-anchor="middle">encode requires clause + at-most-one clauses</text>
+  <line class="arr" x1="244" y1="236" x2="244" y2="252"/>
+
+  <rect class="box" x="64" y="254" width="360" height="36" rx="6" fill="#ffebe9" stroke="#cf222e"/>
+  <text class="t" x="244" y="276" text-anchor="middle">prefetch dependencies of every bla candidate</text>
+  <line class="arr" x1="244" y1="290" x2="244" y2="306"/>
+
+  <rect class="box" x="64" y="308" width="360" height="36" rx="6" fill="#ffebe9" stroke="#cf222e"/>
+  <text class="t" x="244" y="330" text-anchor="middle">transitive fan-out: their requirements, candidates, &#8230;</text>
+
+  <text class="cap" x="244" y="380" text-anchor="middle" fill="#cf222e">all of this happens at encode time,</text>
+  <text class="cap" x="244" y="400" text-anchor="middle" fill="#cf222e">even if cond never holds during the solve</text>
+
+  <!-- right panel: lazy -->
+  <rect x="476" y="52" width="440" height="364" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text class="pt" x="696" y="78" text-anchor="middle" fill="#1a7f37">this PR (lazy)</text>
+
+  <rect class="box" x="516" y="92" width="360" height="36" rx="6" fill="#ffffff" stroke="#d0d7de"/>
+  <text class="t" x="696" y="114" text-anchor="middle">foo=1 is encoded; it requires "bla; if cond"</text>
+  <line class="arr" x1="696" y1="128" x2="696" y2="144"/>
+
+  <rect class="box" x="516" y="146" width="360" height="36" rx="6" fill="#ddf4ff" stroke="#0969da"/>
+  <text class="t" x="696" y="168" text-anchor="middle">fetch candidates of cond only</text>
+  <line class="arr" x1="696" y1="182" x2="696" y2="198"/>
+
+  <rect class="box" x="516" y="200" width="360" height="36" rx="6" fill="#ddf4ff" stroke="#0969da"/>
+  <text class="t" x="696" y="222" text-anchor="middle">park a deferred entry: cond &#8594; (foo=1, bla)</text>
+  <text class="ts" x="696" y="252" text-anchor="middle">(if cond already holds, encode right away instead)</text>
+
+  <line class="arr" x1="660" y1="262" x2="606" y2="284"/>
+  <line class="arr" x1="732" y1="262" x2="786" y2="284"/>
+
+  <rect class="box" x="516" y="288" width="170" height="76" rx="6" fill="#dafbe1" stroke="#1a7f37"/>
+  <text class="t" x="601" y="310" text-anchor="middle">cond never fires:</text>
+  <text class="t" x="601" y="328" text-anchor="middle">nothing else is ever</text>
+  <text class="t" x="601" y="346" text-anchor="middle">fetched or encoded</text>
+
+  <rect class="box" x="706" y="288" width="170" height="76" rx="6" fill="#ffffff" stroke="#d0d7de"/>
+  <text class="t" x="791" y="310" text-anchor="middle">cond fires during the</text>
+  <text class="t" x="791" y="328" text-anchor="middle">solve: encode exactly</text>
+  <text class="t" x="791" y="346" text-anchor="middle">like the eager path</text>
+
+  <text class="cap" x="696" y="400" text-anchor="middle" fill="#1a7f37">on condition-heavy indexes, most conditions never fire</text>
+</svg>

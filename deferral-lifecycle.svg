@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="330" viewBox="0 0 940 330">
+  <defs>
+    <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+  </defs>
+  <style>
+    .t  { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 12.5px; fill: #1f2328; }
+    .ts { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 11.5px; fill: #57606a; }
+    .tt { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 16px; font-weight: 600; fill: #1f2328; }
+    .m  { font-family: ui-monospace,'SF Mono',Consolas,monospace; font-size: 12px; fill: #1f2328; }
+    .cap { font-family: -apple-system,'Segoe UI',Helvetica,Arial,sans-serif; font-size: 12.5px; font-style: italic; fill: #57606a; }
+    .box { stroke-width: 1.25; }
+    .arr { stroke: #57606a; stroke-width: 1.5; marker-end: url(#arrow2); fill: none; }
+  </style>
+
+  <rect x="0" y="0" width="940" height="330" fill="#ffffff"/>
+  <text class="tt" x="470" y="32" text-anchor="middle">Lifecycle of one deferred conditional requirement</text>
+
+  <!-- stage 1 -->
+  <rect class="box" x="24" y="70" width="160" height="80" rx="6" fill="#ffffff" stroke="#d0d7de"/>
+  <text class="t" x="104" y="100" text-anchor="middle">encoder reaches foo=1</text>
+  <text class="t" x="104" y="120" text-anchor="middle">with "bla; if cond"</text>
+  <line class="arr" x1="184" y1="110" x2="205" y2="110"/>
+
+  <!-- stage 2 -->
+  <rect class="box" x="207" y="70" width="160" height="80" rx="6" fill="#ddf4ff" stroke="#0969da"/>
+  <text class="t" x="287" y="98" text-anchor="middle">stored per disjunct:</text>
+  <text class="m" x="287" y="118" text-anchor="middle">deferred[cond]</text>
+  <text class="m" x="287" y="134" text-anchor="middle">+= (foo=1, bla)</text>
+  <line class="arr" x1="367" y1="110" x2="388" y2="110"/>
+
+  <!-- stage 3 with self loop -->
+  <rect class="box" x="390" y="70" width="160" height="80" rx="6" fill="#ffffff" stroke="#d0d7de" stroke-dasharray="4 3"/>
+  <text class="t" x="470" y="98" text-anchor="middle">every solver iteration:</text>
+  <text class="t" x="470" y="116" text-anchor="middle">does a disjunct of</text>
+  <text class="t" x="470" y="134" text-anchor="middle">cond hold now?</text>
+  <path class="arr" d="M 440 70 C 430 48, 510 48, 500 68"/>
+  <text class="ts" x="470" y="50" text-anchor="middle">not yet</text>
+  <line class="arr" x1="550" y1="110" x2="571" y2="110"/>
+
+  <!-- stage 4 -->
+  <rect class="box" x="573" y="70" width="160" height="80" rx="6" fill="#ddf4ff" stroke="#0969da"/>
+  <text class="t" x="653" y="98" text-anchor="middle">first fire:</text>
+  <text class="t" x="653" y="116" text-anchor="middle">drain the entry, fetch</text>
+  <text class="t" x="653" y="134" text-anchor="middle">the bla candidates</text>
+  <line class="arr" x1="733" y1="110" x2="754" y2="110"/>
+
+  <!-- stage 5 -->
+  <rect class="box" x="756" y="70" width="160" height="80" rx="6" fill="#ffffff" stroke="#d0d7de"/>
+  <text class="t" x="836" y="98" text-anchor="middle">encode the requires</text>
+  <text class="t" x="836" y="116" text-anchor="middle">clause, exactly as the</text>
+  <text class="t" x="836" y="134" text-anchor="middle">eager path would have</text>
+
+  <!-- clause -->
+  <line class="arr" x1="836" y1="150" x2="836" y2="176"/>
+  <rect class="box" x="500" y="178" width="416" height="38" rx="6" fill="#fff8c5" stroke="#d4a72c"/>
+  <text class="m" x="708" y="202" text-anchor="middle">&#172;foo=1 &#8744; complement(cond) &#8744; bla=2 &#8744; bla=1 &#8744; &#8230;</text>
+  <text class="cap" x="708" y="240" text-anchor="middle">the clause keeps its condition literals, so it stays correct if the firing</text>
+  <text class="cap" x="708" y="258" text-anchor="middle">assignment is later backtracked; the entry is never re-encoded</text>
+
+  <!-- edge case note -->
+  <rect class="box" x="24" y="178" width="440" height="118" rx="6" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text class="t" x="40" y="202" font-weight="600">Edge case the deferral makes possible</text>
+  <text class="t" x="40" y="224">A bla candidate can already be decided false when the entry</text>
+  <text class="t" x="40" y="242">fires (e.g. forbidden by another package's constraint). Its</text>
+  <text class="t" x="40" y="260">clauses are still encoded: a false parent satisfies the clause</text>
+  <text class="t" x="40" y="278">(no conflict), and the assignment may be backtracked later.</text>
+</svg>
