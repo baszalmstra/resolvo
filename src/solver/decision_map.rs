@@ -408,15 +408,21 @@ impl DecisionMap {
                     }
                     return None;
                 }
+                // Use the *tightest* prefix bound that explains the
+                // falsification (the most general explanation in lazy clause
+                // generation terms), not the interval driver: the resulting
+                // learnt clauses assert much stronger range restrictions.
+                // The tight prefix is itself derived; resolution continues
+                // through it if necessary.
                 if index < state.lo {
-                    // member → p_{lo-1}: (¬member ∨ p_{lo-1}), driver false.
-                    let (driver, _) = state.lo_driver.expect("lo > 0 implies a driver");
-                    return Some((driver, variable_id, driver.positive()));
+                    // member → p_index: (¬member ∨ p_index), p_index false.
+                    let tight = state.prefix_vars[index as usize];
+                    return Some((tight, variable_id, tight.positive()));
                 }
                 if index > state.hi {
-                    // (¬member ∨ ¬p_hi), driver true.
-                    let (driver, _) = state.hi_driver.expect("bounded hi implies a driver");
-                    return Some((driver, variable_id, driver.negative()));
+                    // (¬member ∨ ¬p_{index-1}), p_{index-1} true.
+                    let tight = state.prefix_vars[(index - 1) as usize];
+                    return Some((tight, variable_id, tight.negative()));
                 }
                 None
             }

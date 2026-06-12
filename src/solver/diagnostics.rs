@@ -194,6 +194,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             counters.virtual_pairwise_resolutions, counters.virtual_prefix_upgrades
         )
         .unwrap();
+        if counters.conflicts > 0 {
+            writeln!(
+                writer,
+                "Learnt shape:\tavg-len={:.2} with-range-literal={}/{} avg-backjump={:.2}",
+                counters.learnt_literals as f64 / counters.conflicts as f64,
+                counters.learnt_with_range_literal,
+                counters.conflicts,
+                counters.backjump_levels as f64 / counters.conflicts as f64,
+            )
+            .unwrap();
+        }
 
         writeln!(writer, "\nClause visits by type:").unwrap();
         let vbt = &counters.visits_by_type;

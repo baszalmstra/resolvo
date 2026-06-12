@@ -237,6 +237,10 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// during the next propagation round.
     pending_virtual_falsifications: Vec<Literal>,
 
+    /// Memoization of materialized at-most-one reason clauses, keyed by the
+    /// clause shape `(a, lit)`.
+    amo_reason_cache: HashMap<(VariableId, usize), ClauseId>,
+
     /// Keeps track of auxiliary variables that are used to encode at-least-one
     /// solvable for a package.
     at_least_one_tracker: <D::NameId as SolverId>::Map<Option<VariableId>>,
@@ -274,6 +278,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             amo_encoding: AmoEncoding::from_env(),
             virtual_package_names: Vec::new(),
             pending_virtual_falsifications: Vec::new(),
+            amo_reason_cache: Default::default(),
             at_least_one_tracker: Default::default(),
             constrains_aux_vars: Default::default(),
             decision_tracker: Default::default(),
@@ -306,6 +311,12 @@ pub(crate) struct PropagationCounters {
     /// Virtual-AMO resolution choices during conflict analysis.
     pub virtual_pairwise_resolutions: u64,
     pub virtual_prefix_upgrades: u64,
+    /// Shape of learnt clauses: total literals, how many clauses contain at
+    /// least one range literal (prefix variable or clausal helper), and the
+    /// cumulative backjump distance.
+    pub learnt_literals: u64,
+    pub learnt_with_range_literal: u64,
+    pub backjump_levels: u64,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -1643,16 +1654,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             &self.state.requirement_to_sorted_candidates,
             &self.state.disjunctions,
             |literal| {
-                let var = literal.variable();
+                let mut var = literal.variable();
                 involved.insert(var);
-                // A derived assignment is explained by its explicit driver
-                // (the selected candidate or an explicit prefix variable).
-                if map.explicit_value(var).is_none() {
-                    if let Some((driver, a, lit)) = map.derived_reason(var) {
-                        let package = map.package_of(var).expect("derived variables are tracked");
-                        virtual_reasons.push((a, lit, package));
-                        involved.insert(driver);
+                // A derived assignment is explained through its derivation
+                // chain down to an explicitly assigned variable.
+                while map.explicit_value(var).is_none() {
+                    let Some((driver, a, lit)) = map.derived_reason(var) else {
+                        break;
+                    };
+                    let package = map.package_of(var).expect("derived variables are tracked");
+                    virtual_reasons.push((a, lit, package));
+                    if !involved.insert(driver) {
+                        break;
                     }
+                    var = driver;
                 }
             },
         );
@@ -1696,15 +1711,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     if literal.eval(map) == Some(true) {
                         assert_eq!(literal.variable(), decision.variable);
                     } else {
-                        let var = literal.variable();
+                        let mut var = literal.variable();
                         involved.insert(var);
-                        if map.explicit_value(var).is_none() {
-                            if let Some((driver, a, lit)) = map.derived_reason(var) {
-                                let package =
-                                    map.package_of(var).expect("derived variables are tracked");
-                                virtual_reasons.push((a, lit, package));
-                                involved.insert(driver);
+                        while map.explicit_value(var).is_none() {
+                            let Some((driver, a, lit)) = map.derived_reason(var) else {
+                                break;
+                            };
+                            let package =
+                                map.package_of(var).expect("derived variables are tracked");
+                            virtual_reasons.push((a, lit, package));
+                            if !involved.insert(driver) {
+                                break;
                             }
+                            var = driver;
                         }
                     }
                 },
@@ -1742,6 +1761,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut causes_at_current_level = 0u32;
         let mut learnt = Vec::new();
         let mut back_track_to = 0;
+        #[cfg(feature = "diagnostics")]
+        let conflict_level = current_level;
 
         let mut s_value;
         let mut learnt_why = Vec::new();
@@ -1772,32 +1793,40 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     }
 
                     // A variable whose value is only derived (virtual) has
-                    // no trail entry; resolve it through its explicitly
-                    // assigned driver: the selected candidate (virtual
-                    // encoding) or a boundary prefix variable
-                    // (virtual-ladder encoding). Prefix drivers are
-                    // range-pruning literals: keeping them in the learnt
-                    // clause excludes whole candidate index ranges.
+                    // no trail entry; resolve it through its derivation
+                    // chain. The chain stops at an explicitly assigned
+                    // variable, or early at a derived prefix literal from a
+                    // lower level — keeping that literal in the learnt
+                    // clause asserts a strong range restriction (the most
+                    // general explanation, in lazy-clause-generation terms).
                     let mut var = literal.variable();
                     let map = self.state.decision_tracker.map();
-                    if map.explicit_value(var).is_none() {
-                        if let Some((driver, a, lit)) = map.derived_reason(var) {
-                            let package =
-                                map.package_of(var).expect("derived variables are tracked");
-                            #[cfg(feature = "diagnostics")]
-                            {
-                                match map.var_role(driver) {
-                                    decision_map::PackageVar::Prefix { .. } => {
-                                        virtual_upgrades += 1
-                                    }
-                                    _ => virtual_pairwise += 1,
-                                }
+                    loop {
+                        if map.explicit_value(var).is_some() {
+                            break;
+                        }
+                        let Some((target, a, lit)) = map.derived_reason(var) else {
+                            break;
+                        };
+                        let package = map.package_of(var).expect("derived variables are tracked");
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            match map.var_role(target) {
+                                decision_map::PackageVar::Prefix { .. } => virtual_upgrades += 1,
+                                _ => virtual_pairwise += 1,
                             }
-                            virtual_reasons.push((a, lit, package));
-                            if !seen.insert(driver) {
-                                return;
-                            }
-                            var = driver;
+                        }
+                        virtual_reasons.push((a, lit, package));
+                        if !seen.insert(target) {
+                            return;
+                        }
+                        var = target;
+                        if map.explicit_value(var).is_none()
+                            && self.state.decision_tracker.level(var) != current_level
+                        {
+                            // A derived literal from a lower level can stay
+                            // in the learnt clause.
+                            break;
                         }
                     }
 
@@ -1890,8 +1919,31 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             );
         }
 
+        #[cfg(feature = "diagnostics")]
+        {
+            let learnt = &self.state.learnt_clauses[learnt_id];
+            self.state.propagation_counters.learnt_literals += learnt.len() as u64;
+            let has_range = learnt.iter().any(|lit| {
+                matches!(
+                    self.state.decision_tracker.map().var_role(lit.variable()),
+                    decision_map::PackageVar::Prefix { .. }
+                ) || matches!(
+                    self.state.variable_map.origin(lit.variable()),
+                    variable_map::VariableOrigin::ForbidMultiple(_)
+                )
+            });
+            if has_range {
+                self.state.propagation_counters.learnt_with_range_literal += 1;
+            }
+        }
+
         // Should revert at most to the root level
         let target_level = back_track_to.max(1);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state.propagation_counters.backjump_levels +=
+                conflict_level.saturating_sub(target_level) as u64;
+        }
         self.state.decision_tracker.undo_until(target_level);
 
         self.decay_activity_scores();
@@ -1932,9 +1984,15 @@ impl<D: DependencyProvider> SolverState<D> {
     /// The clause is allocated without watches; it is already satisfied and
     /// only serves as a reason in conflict analysis and error reporting.
     fn materialize_amo_reason(&mut self, a: VariableId, lit: Literal, package: u32) -> ClauseId {
+        if let Some(&clause_id) = self.amo_reason_cache.get(&(a, lit.to_index())) {
+            return clause_id;
+        }
         let name = self.virtual_package_names[package as usize];
-        self.clauses
-            .alloc(None, Clause::ForbidMultipleInstances(a, lit, name))
+        let clause_id = self
+            .clauses
+            .alloc(None, Clause::ForbidMultipleInstances(a, lit, name));
+        self.amo_reason_cache.insert((a, lit.to_index()), clause_id);
+        clause_id
     }
 
     /// Returns the solvables that the solver has chosen to include in the
