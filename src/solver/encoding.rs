@@ -1036,9 +1036,18 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 }
             }
             let Some(package) = package else { continue };
+            // The strengtheners cost two trail entries per parent decision;
+            // that only pays off when the interval actually prunes a
+            // meaningful number of candidates. Skip small packages (their
+            // candidate scans are cheap) and full-span ranges (nothing to
+            // prune).
+            const MIN_PACKAGE_SIZE: usize = 32;
+            let member_count = map.package_member_count(package);
             if !contiguous
                 || (max - min + 1) as usize != candidate_vars.len()
                 || map.package_prefix_count(package) == 0
+                || member_count < MIN_PACKAGE_SIZE
+                || (min == 0 && max as usize == member_count - 1)
             {
                 continue;
             }
