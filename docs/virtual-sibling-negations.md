@@ -117,6 +117,40 @@ lives elsewhere.
   clauses in `add_pending_forbid_clauses` and instead populate
   `var_to_package`.
 
+## Follow-up: range learning through virtual prefix (ladder) variables
+
+The implemented `AmoEncoding::Virtual` materializes *pairwise* reasons, so
+learnt clauses name individual candidates and conflict-heavy workloads search
+worse than the ladder/commander clausal encodings (measured: ~2× the
+conflicts). Materializing commander-shaped reasons does not fix this by
+itself: resolving through the chain ends at the selected candidate again, and
+stopping at a group literal only helps if that literal is *assignable* so the
+learnt clause can unit-propagate.
+
+The strong version of the idea uses ladder/prefix variables instead of a
+commander tree: `pᵢ` ≡ "the selected candidate has index ≤ i" in the
+preference-sorted candidate order.
+
+- Derived semantics are O(1): with selection at index `k`, `pᵢ = (k ≤ i)`;
+  explicit `pᵢ` assignments collapse to an interval `[lo, hi]` of allowed
+  indices per package, and a candidate's value lookup is one comparison.
+- All reasons are valid standalone lemmas, materializable on demand:
+  `(¬s ∨ pᵢ)` for `k ≤ i`, `(¬s ∨ ¬pⱼ)` for `k > j`, `(¬pⱼ₋₁ ∨ ¬cⱼ)`,
+  `(pⱼ ∨ ¬cⱼ)`, and the chain `(¬pᵢ ∨ pⱼ)` for `i ≤ j` — the sequential
+  encoding's clauses, never stored.
+- `analyze` substitutes a virtually-false candidate `cⱼ` with `¬pⱼ₋₁` / `pⱼ`;
+  the learnt clause then asserts an explicit prefix assignment on backjump:
+  one trail entry that excludes a whole version range, which `decide` skips
+  via the interval.
+
+This combines virtual trail mechanics with learning at least as strong as
+the sequential encoding (the best clausal learner in the benchmarks) — in
+effect PubGrub-style interval terms inside CDCL. Additional cost over the
+implemented prototype: prefix-variable allocation, interval maintenance with
+undo and level attribution, watcher walks for prefix variables and excluded
+ranges on selection/prefix events, and the substitution policy in conflict
+analysis.
+
 ## Open questions
 
 - Learnt clauses watching many distinct packages could make bucket
