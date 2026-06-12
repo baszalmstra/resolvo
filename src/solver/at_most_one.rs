@@ -37,6 +37,19 @@ pub enum AmoEncoding {
     /// `3n - 4` clauses and `n - 1` auxiliary variables.
     Sequential,
 
+    /// The commander encoding (Klieber & Kwon). Variables are split into
+    /// groups of `group_size`; within a group the constraint is pairwise, a
+    /// commander variable is implied by every member of its group, and the
+    /// at-most-one constraint over the commanders themselves is enforced
+    /// recursively.
+    ///
+    /// Roughly `n(group_size + 1)/2` clauses and `n/(group_size - 1)`
+    /// auxiliary variables.
+    Commander {
+        /// The number of variables per group. Must be at least 2.
+        group_size: usize,
+    },
+
     /// Pairwise clauses while the package has at most `threshold` candidates,
     /// switching to the binary encoding beyond that.
     ///
@@ -59,16 +72,25 @@ impl std::str::FromStr for AmoEncoding {
             "pairwise" => Ok(AmoEncoding::Pairwise),
             "binary" => Ok(AmoEncoding::Binary),
             "sequential" => Ok(AmoEncoding::Sequential),
+            "commander" => Ok(AmoEncoding::Commander { group_size: 3 }),
             _ => {
                 if let Some(threshold) = s.strip_prefix("hybrid:") {
                     let threshold = threshold
                         .parse()
                         .map_err(|e| format!("invalid hybrid threshold: {e}"))?;
                     Ok(AmoEncoding::Hybrid { threshold })
+                } else if let Some(group_size) = s.strip_prefix("commander:") {
+                    let group_size: usize = group_size
+                        .parse()
+                        .map_err(|e| format!("invalid commander group size: {e}"))?;
+                    if group_size < 2 {
+                        return Err("commander group size must be at least 2".to_string());
+                    }
+                    Ok(AmoEncoding::Commander { group_size })
                 } else {
                     Err(format!(
                         "unknown at-most-one encoding {s:?}, expected `pairwise`, `binary`, \
-                         `sequential` or `hybrid:<threshold>`"
+                         `sequential`, `commander[:<group size>]` or `hybrid:<threshold>`"
                     ))
                 }
             }
@@ -101,6 +123,38 @@ pub(crate) struct AtMostOnceTracker<V> {
     /// Auxiliary variables: the bit variables for the binary encoding or the
     /// ladder variables for the sequential encoding.
     pub(crate) helpers: Vec<V>,
+    /// Per-level group state for the commander encoding. Level 0 groups the
+    /// tracked variables themselves, level `k + 1` groups the commander
+    /// variables of level `k`.
+    commander_levels: Vec<CommanderLevel<V>>,
+}
+
+/// The state of one level of the commander encoding.
+struct CommanderLevel<V> {
+    /// The members of the group that is currently being filled.
+    open_group: Vec<V>,
+    /// The commander variable of the open group. The very first group of a
+    /// level only gets a commander once a second group is needed, because a
+    /// single group is already mutually exclusive through its pairwise
+    /// clauses.
+    open_commander: Option<V>,
+    /// The number of groups that have been filled completely.
+    closed_groups: usize,
+    /// The members of the first group if it was closed before any other group
+    /// existed. Its commander is allocated retroactively when a second group
+    /// is opened.
+    deferred_first_group: Option<Vec<V>>,
+}
+
+impl<V> Default for CommanderLevel<V> {
+    fn default() -> Self {
+        Self {
+            open_group: Vec::new(),
+            open_commander: None,
+            closed_groups: 0,
+            deferred_first_group: None,
+        }
+    }
 }
 
 impl<V> Default for AtMostOnceTracker<V> {
@@ -108,6 +162,7 @@ impl<V> Default for AtMostOnceTracker<V> {
         Self {
             variables: IndexSet::default(),
             helpers: Vec::new(),
+            commander_levels: Vec::new(),
         }
     }
 }
@@ -133,8 +188,12 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
 
         // If there are no variables yet, it means that this is the first variable that
         // is added. A single variable can never be in conflict with itself so we don't
-        // need to add any clauses.
+        // need to add any clauses. The commander encoding still has to record
+        // the variable as a member of its first group.
         if self.variables.is_empty() {
+            if let AmoEncoding::Commander { group_size } = encoding {
+                return self.add_commander(variable, group_size.max(2), alloc_clause, alloc_var);
+            }
             self.variables.insert(variable.clone());
             return true;
         }
@@ -143,6 +202,9 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
             AmoEncoding::Pairwise => self.add_pairwise(variable, alloc_clause),
             AmoEncoding::Binary => self.add_binary(variable, alloc_clause, alloc_var),
             AmoEncoding::Sequential => self.add_sequential(variable, alloc_clause, alloc_var),
+            AmoEncoding::Commander { group_size } => {
+                self.add_commander(variable, group_size.max(2), alloc_clause, alloc_var)
+            }
             AmoEncoding::Hybrid { threshold } => {
                 // Stay pairwise while the set is small and no helper variables
                 // have been allocated yet. Once the threshold is crossed the
@@ -230,6 +292,84 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
 
         self.helpers.push(ladder_var);
         self.variables.insert(variable);
+        true
+    }
+
+    /// Within a group the constraint is pairwise; every member implies the
+    /// group's commander variable and the commanders are themselves subject to
+    /// an at-most-one constraint one level up.
+    ///
+    /// Groups are filled one at a time. The first group of a level defers
+    /// allocating its commander until the group is full (a single group is
+    /// already mutually exclusive through its pairwise clauses); every later
+    /// group allocates its commander as soon as it is opened so that the
+    /// level-up constraint between the open group and the closed groups holds
+    /// at all times.
+    fn add_commander(
+        &mut self,
+        variable: V,
+        group_size: usize,
+        mut alloc_clause: impl FnMut(V, V, bool),
+        mut alloc_var: impl FnMut() -> V,
+    ) -> bool {
+        self.variables.insert(variable.clone());
+
+        // Insert the variable at level 0. Closing or opening a group produces
+        // commander variables that have to be inserted one level up.
+        let mut work = vec![(0usize, variable)];
+        while let Some((level_idx, var)) = work.pop() {
+            if self.commander_levels.len() <= level_idx {
+                self.commander_levels.push(CommanderLevel::default());
+            }
+            let level = &mut self.commander_levels[level_idx];
+
+            // Pairwise within the open group, and a link to the group's
+            // commander if it already has one.
+            for member in &level.open_group {
+                alloc_clause(var.clone(), member.clone(), false);
+            }
+            if let Some(commander) = &level.open_commander {
+                alloc_clause(var.clone(), commander.clone(), true);
+            }
+            level.open_group.push(var);
+
+            if level.open_group.len() == 1 && level.closed_groups > 0 {
+                // A new group was just opened next to existing closed groups:
+                // it needs a commander right away to be mutually exclusive
+                // with the closed groups one level up.
+                let commander = alloc_var();
+                self.helpers.push(commander.clone());
+                alloc_clause(level.open_group[0].clone(), commander.clone(), true);
+                level.open_commander = Some(commander.clone());
+                work.push((level_idx + 1, commander));
+
+                // If the first group of this level was closed without a
+                // commander, allocate one for it now.
+                if let Some(members) = level.deferred_first_group.take() {
+                    let commander = alloc_var();
+                    self.helpers.push(commander.clone());
+                    for member in members {
+                        alloc_clause(member, commander.clone(), true);
+                    }
+                    work.push((level_idx + 1, commander));
+                }
+            } else if level.open_group.len() == group_size {
+                // The group is full; close it.
+                level.closed_groups += 1;
+                if level.open_commander.take().is_some() {
+                    // The commander was already inserted one level up when the
+                    // group was opened.
+                    level.open_group.clear();
+                } else {
+                    // The first group of a level closes without a commander; a
+                    // single group is mutually exclusive through its pairwise
+                    // clauses alone. Keep the members for the retrofit above.
+                    debug_assert_eq!(level.closed_groups, 1);
+                    level.deferred_first_group = Some(std::mem::take(&mut level.open_group));
+                }
+            }
+        }
+
         true
     }
 }
@@ -345,6 +485,12 @@ mod test {
         insta::assert_snapshot!(clauses.iter().format("\n"));
     }
 
+    #[test]
+    fn test_at_most_once_tracker_commander() {
+        let clauses = clauses_for(AmoEncoding::Commander { group_size: 3 }, 7);
+        insta::assert_snapshot!(clauses.iter().format("\n"));
+    }
+
     /// Brute-force check: for every assignment with two or more true
     /// variables, at least one clause must be violated (given the best-case
     /// assignment of helper variables), and assignments with at most one true
@@ -355,9 +501,11 @@ mod test {
             AmoEncoding::Pairwise,
             AmoEncoding::Binary,
             AmoEncoding::Sequential,
+            AmoEncoding::Commander { group_size: 2 },
+            AmoEncoding::Commander { group_size: 3 },
             AmoEncoding::Hybrid { threshold: 3 },
         ] {
-            for n in 1..=6usize {
+            for n in 1..=8usize {
                 let mut clauses = Vec::new();
                 let mut concrete = Vec::new();
                 let mut helpers = Vec::new();
