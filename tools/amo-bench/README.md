@@ -60,6 +60,29 @@ with the incremental discovery of candidates.
 
 All encodings agreed on sat/unsat for every problem.
 
+A second seed (150 different problems, binary/sequential/commander:3 only)
+put all three within ±5% on aggregate (sequential 159.9 s < binary 163.6 s <
+commander 172.2 s total) with the means dominated by a handful of
+timeout-boundary problems: sequential solved one problem in 2.4 s on which
+both binary and commander timed out at 20 s, while commander had the best
+per-problem win ratio on the bulk (54 faster / 22 slower vs binary;
+sequential 39 / 45). Solution sizes were identical across encodings on all
+300 problems of both seeds.
+
+### Full test suite under every encoding
+
+Running the solver test suite with each encoding (via `RESOLVO_AMO_ENCODING`):
+
+- Wall time is indistinguishable (0.27–0.32 s, dominated by process startup).
+- **Solutions never change**: every exact-solution snapshot passes under all
+  six encodings.
+- **Error traces**: only 4 unsat-message snapshots differ, and only for some
+  encodings (sequential: 1, bimander: 2, pairwise/commander/hybrid: 4). Every
+  difference is a cosmetic reordering of the same conflict (which side of the
+  incompatibility is listed first, or which candidate versions are merged
+  into one line, e.g. `c 101` vs `c 101 | 103`); none is wrong or less
+  informative.
+
 ### Takeaways
 
 - The linear encodings (sequential, commander) clearly beat the current
@@ -78,10 +101,15 @@ All encodings agreed on sat/unsat for every problem.
   clauses over them generalize across whole version windows; binary/bimander
   bit patterns do not align with the candidate order, so conflicts cannot be
   expressed compactly.
-- Sequential has the best raw numbers on candidate-heavy workloads but showed
-  one pathological tail on conda-forge (a 20 s timeout on a problem every
-  other encoding solves in ~2 s). Commander:3 had the best tail behavior
-  overall.
+- Sequential and commander:3 are the two viable replacements. Sequential is
+  the strongest at the extremes (only encoding to solve all synthetic V=500
+  instances; rescued a conda-forge problem on which binary and commander both
+  timed out) and has the least error-trace churn, but showed one pathological
+  tail of its own (a 20 s timeout on a problem every other encoding solves in
+  ~2 s). Commander:3 is the most consistent on the bulk of typical problems.
+  On aggregate over typical conda-forge problems all three are within noise
+  of each other; the decisive differences are in the candidate-heavy regime,
+  where both linear encodings dominate binary.
 - The hybrid (pairwise below a threshold) does not pay off: the binary
   encoding's helper overhead at small n is already negligible, and the
   pairwise clauses are pure overhead once the threshold is crossed.
