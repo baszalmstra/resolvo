@@ -153,17 +153,26 @@ derives all other values in O(1). Conflict analysis resolves sibling
 falsifications into prefix literals, so learnt clauses assert range-pruning
 prefix assignments — three trail entries per selection instead of n.
 
-Final numbers with adaptive chain windows and driver-gated package events
-(see the learning-gap research in `docs/virtual-sibling-negations.md`):
+Final configuration: boundaries-only until the first conflict, then full
+prefix chains per selection (sequential-grade conflict analysis anchors),
+with O(1) prefix-assignment undo and driver-gated package events. See the
+learning-gap research in `docs/virtual-sibling-negations.md` for how each
+piece was isolated.
 
-| workload                | binary  | sequential | virtual | virtual-ladder | + RESOLVO_FULL_CHAIN |
-| ----------------------- | ------- | ---------- | ------- | -------------- | -------------------- |
-| storm n=1400            | 0.30 s  | 0.22 s     | 0.14 s  | **0.14 s**     | 0.16 s               |
-| storm n=5000            | 5.07 s  | 2.88 s     | 1.68 s  | **1.81 s**     | 2.06 s               |
-| conflict-heavy V=100 (5 seeds) | 0.36 s | 0.21 s | ~1.0 s | **0.35 s**    | 0.38 s               |
-| conflict-heavy conflicts (seed 0) | 5.5 k | 3.3 k | 10.1 k | 4.8 k         | **3.0 k**            |
-| conflict-heavy V=500 solved | 1/5 | **5/5**   | —       | 1/5            | 2/5                  |
-| conda-forge mean (150)  | 0.67 s  | 0.77 s     | 0.94 s  | **0.79 s**     | —                    |
+| workload                | binary  | sequential | commander:3 | virtual-ladder |
+| ----------------------- | ------- | ---------- | ----------- | -------------- |
+| storm n=1400            | 0.26 s  | 0.20 s     | —           | **0.14 s**     |
+| storm n=5000            | 4.44 s  | 2.58 s     | —           | **1.80 s**     |
+| conflict-heavy V=100 (5 seeds) | 0.36 s | 0.21 s | 0.22 s     | **0.20 s**     |
+| conflict-heavy V=500    | 1/5     | **5/5, 23.2 s** | 4/5    | 5/5, 26.4 s    |
+| conda-forge seed 0 (150 problems) | 0.67 s | 0.77 s | 0.64 s | **0.64 s**     |
+| conda-forge seed 1      | 1.09 s, 2 timeouts | 1.07 s, 1 timeout | 1.15 s, 2 timeouts | **0.75 s, 0 timeouts** |
+
+Virtual-ladder wins or ties every benchmark except the V=500 mean (within
+14% of sequential at the same 5/5 solve rate); on conda-forge seed 1 it is
+the only configuration with zero timeouts, solving both problems on which
+every clausal encoding times out. Solutions and sat/unsat verdicts are
+identical to all other encodings on every problem tested.
 
 It strictly dominates the plain virtual encoding (equal on storms, ~2×
 faster on conflict-heavy workloads with half the conflicts — all conflict

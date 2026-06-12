@@ -206,3 +206,25 @@ explicit chain entries only over `[min(k,k'), max(k,k')]` — the window the
 conflict frontier just moved through. That is O(|k−k'|) per re-selection,
 which amortizes to exactly the incremental trail cost the clausal sequential
 encoding pays, while keeping the first selection of each package at O(1).
+
+## Resolution (2026-06-12, late)
+
+The constant-factor gap was closed by two changes:
+
+1. **O(1) prefix undo.** `recompute_interval` on every popped prefix entry
+   was an O(n) scan, making backjumps over chain entries quadratic — this
+   was the entire "learning is slow" cost (217 ms → 21 ms of conflict
+   analysis on the conflict-heavy benchmark). An undo stack aligned with the
+   trail restores the interval in O(1).
+2. **Conflict-gated full chains.** Chain entries are pure learning aids, so
+   they are only pushed once the solver has conflicted. Conflict-free storms
+   keep pure-boundary trail costs; conflicting workloads get the full
+   adjacent-step anchor chain (which the experiments showed is what
+   sequential-grade learning requires). Driver-gated package events keep the
+   chain pushes from triggering redundant watcher walks.
+
+With those, the virtual-ladder encoding wins or ties every benchmark in the
+suite (storms, conflict-heavy at V=100, V=500 solve rate, both conda-forge
+seeds — on seed 1 it is the only configuration with zero timeouts), with the
+single exception of the V=500 mean where clausal sequential remains ~14%
+faster at the same solve rate.
