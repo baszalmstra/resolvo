@@ -126,7 +126,7 @@
 use std::{any::Any, collections::VecDeque};
 
 use super::{
-    EnvConstrainsEntry, SolverState,
+    SolverState,
     clause::{EnvConstrainsClause, WatchedLiterals},
     conditions,
 };
@@ -963,16 +963,8 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             }
         }
 
-        // Record for the decide() reference scan and cell extraction, then
-        // register with the incremental decide queue that drives selection.
-        self.state
-            .env_constrains_clauses
-            .entry(parent_var)
-            .or_default()
-            .push(EnvConstrainsEntry {
-                env_constrains_id,
-                clause_id,
-            });
+        // Register the clause with the incremental decide queue that drives
+        // selection.
         self.state.add_env_constrains_clause_to_queue(
             parent_var,
             package_name,

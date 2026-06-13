@@ -63,7 +63,15 @@ Everything else is a no-op visit.
 
 ## Chosen design: per-list cursors + position records + an undo floor
 
-Implementation: `src/solver/assertion_watermark.rs`, integrated in
+> **Superseded (2026-06):** this per-entry design (a `BinaryHeap` of
+> `(position, group, index)` records) was replaced by the simpler per-list
+> *bound* design from upstream PR #6 — one `verified_up_to` bound + a sticky
+> `dirty` flag per list, no per-entry records — which benchmarked faster on
+> conflict-light problems. The shipped module is
+> `src/solver/assertion_scans.rs`; see its module doc. The text below is kept
+> as historical rationale.
+
+Implementation (historical): `src/solver/assertion_watermark.rs`, integrated in
 `Solver::propagate_impl` and the three scan functions
 (`src/solver/mod.rs`); `DecisionTracker::take_assert_floor`
 (`src/solver/decision_tracker.rs`).

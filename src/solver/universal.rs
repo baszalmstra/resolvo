@@ -170,7 +170,7 @@ const TRAIL_RESHAPE_ORDINARY_LEVELS: u32 = 8;
 
 /// The number of cell literals each pinning rule contributed to one recorded
 /// cell of a universal enumeration (a diagnostics observation point, see
-/// [`Solver::universal_cell_pins`]).
+/// `Solver::universal_cell_pins`).
 ///
 /// Every literal of a recorded cell is attributed to exactly one rule: the
 /// rule that first pushed it during cell extraction or disjointness repair.
@@ -1165,6 +1165,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let state = &self.state;
         let decision_map = state.decision_tracker.map();
         let mut edges: Vec<CellEdge<D::SolvableId>> = Vec::new();
+        // First-occurrence order, with an O(1) membership guard so the
+        // per-cell dedup stays linear rather than O(edges^2).
+        let mut seen: ahash::HashSet<CellEdge<D::SolvableId>> = ahash::HashSet::default();
 
         for (&parent_var, requirements) in state.requires_clauses.iter() {
             if state.decision_tracker.assigned_value(parent_var) != Some(true) {
@@ -1231,7 +1234,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     requirement: *requirement,
                     target,
                 };
-                if !edges.contains(&edge) {
+                if seen.insert(edge) {
                     edges.push(edge);
                 }
             }
@@ -1868,11 +1871,32 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut clauses: Vec<Vec<Literal>> = Vec::new();
         for kind in &self.state.clauses.kinds {
             match *kind {
+                // The only clauses that constrain the environment space
+                // itself: oracle consistency (relations between env literals)
+                // and the model/blocking clauses.
                 Clause::EnvOracleConsistency(lit_a, lit_b) => clauses.push(vec![lit_a, lit_b]),
                 Clause::EnvClause(env_clause_id) => {
                     clauses.push(self.state.env_clauses[env_clause_id].literals.clone());
                 }
-                _ => {}
+                // Everything else constrains which SOLVABLES are valid GIVEN
+                // an environment, not which environments exist, so it must NOT
+                // enter the environment-space witness search (design 5.5):
+                // `EnvConstrains` and env-conditioned `Requires` are gated on a
+                // solvable being installed, so including them could make a
+                // coverable region look uncoverable. This arm is intentionally
+                // exhaustive (no `_`): a new clause kind that genuinely bounds
+                // the environment space must be added above deliberately.
+                Clause::InstallRoot
+                | Clause::Requires(..)
+                | Clause::Constrains(..)
+                | Clause::ConstrainsExcluded(..)
+                | Clause::ConstrainsParent(..)
+                | Clause::ForbidMultipleInstances(..)
+                | Clause::Lock(..)
+                | Clause::Learnt(..)
+                | Clause::Excluded(..)
+                | Clause::AnyOf(..)
+                | Clause::EnvConstrains(..) => {}
             }
         }
         find_witness(&clauses)

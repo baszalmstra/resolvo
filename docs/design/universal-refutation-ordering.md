@@ -1,5 +1,14 @@
 # A refutation switch for the env-literals-last ordering
 
+> **Status (2026-06): DISABLED BY DEFAULT.** A corrected full-corpus A/B run
+> after Luby restarts landed found the switch to be a net negative, so it
+> ships off: `ENV_ORDERING_CONFLICT_LIMIT = u64::MAX` and the work co-trigger
+> factors are `0` (see the rationale on `SolverState::env_ordering_suspended`
+> and the constants in `src/solver/mod.rs`). The mechanism is retained behind
+> the `diagnostics` setters for research only. The tuned constants and
+> benchmark narrative below describe the prototype configuration, which does
+> not ship.
+
 Status: prototyped and spot-measured on `research-refutation-ordering`
 (2026-06-12), on top of `research-universal-combined` (49ab6387).
 Follow-up to `universal-env-literals-last.md` and
