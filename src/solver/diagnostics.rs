@@ -188,6 +188,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         )
         .unwrap();
         writeln!(writer, "Conflicts:\t{}", counters.conflicts).unwrap();
+        writeln!(writer, "Restarts:\t{}", counters.restarts).unwrap();
+        writeln!(
+            writer,
+            "Restart suppressions:\t{}",
+            counters.restart_suppressions
+        )
+        .unwrap();
 
         writeln!(writer, "\nClause visits by type:").unwrap();
         let vbt = &counters.visits_by_type;
@@ -215,6 +222,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             )
             .unwrap();
         }
+
+        let queue_counters = &self.state.decide_queue.counters;
+        writeln!(writer, "\n=== Decide Queue ===").unwrap();
+        writeln!(writer, "Sync touches:\t{}", queue_counters.sync_touches).unwrap();
+        writeln!(
+            writer,
+            "Selection visits:\t{}",
+            queue_counters.selection_visits
+        )
+        .unwrap();
+        writeln!(writer, "- Hot:\t{}", queue_counters.hot_visits).unwrap();
+        writeln!(writer, "Dequeues:\t{}", queue_counters.dequeues).unwrap();
+        writeln!(writer, "Walk evaluations:\t{}", queue_counters.walk_evals).unwrap();
 
         writeln!(writer, "\n=== Phase Timing ===").unwrap();
         writeln!(

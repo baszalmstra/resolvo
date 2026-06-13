@@ -1,9 +1,9 @@
-use std::{any::Any, fmt::Display, ops::ControlFlow};
+use std::{any::Any, fmt::Display};
 
 use ahash::{HashMap, HashSet};
 pub use cache::SolverCache;
 use clause::{Clause, Literal, WatchedLiterals};
-use conditions::{Disjunction, DisjunctionId};
+use conditions::{DeferredRequirement, Disjunction, DisjunctionId, condition_disjunct_holds};
 use decision::Decision;
 use decision_tracker::DecisionTracker;
 use encoding::Encoder;
@@ -14,8 +14,8 @@ use variable_map::VariableMap;
 use watch_map::WatchMap;
 
 use crate::{
-    ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider, KnownDependencies,
-    Requirement, SolvableId, VariableId, VersionSetId,
+    ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
+    KnownDependencies, Requirement, SolvableId, VariableId, VersionSetId,
     conflict::Conflict,
     internal::{
         arena::Arena,
@@ -33,6 +33,7 @@ mod binary_encoding;
 mod cache;
 pub(crate) mod clause;
 mod conditions;
+mod decide_queue;
 mod decision;
 mod decision_map;
 mod decision_tracker;
@@ -196,11 +197,8 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     activity_decay: f32,
 }
 
-type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
-
 pub(crate) struct SolverState<D: DependencyProvider> {
     pub(crate) clauses: Clauses<D::NameId>,
-    requires_clauses: IndexMap<VariableId, Vec<RequiresClause>, ahash::RandomState>,
     watches: WatchMap,
 
     /// A mapping from requirements to the variables that represent the
@@ -235,6 +233,62 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// Activity score per package.
     name_activity: <D::NameId as SolverId>::Map<f32>,
 
+    /// The largest activity stored in `name_activity`, maintained bit-exactly
+    /// next to the bumps and decays. Used by the decision fold to stop early
+    /// when no remaining item can have a strictly higher activity.
+    max_activity: f32,
+
+    /// Incremental work queue that tracks which requires clauses are eligible
+    /// for the next decision. See [`decide_queue`].
+    decide_queue: decide_queue::DecideQueue<D>,
+
+    /// Conditional requirements whose condition did not hold at the moment the
+    /// encoder reached them, and whose requirement candidates have therefore
+    /// not been fetched. Keyed by `ConditionId`; each entry is a list of
+    /// per-disjunct deferred requirements that share that condition.
+    ///
+    /// Invariant: an entry remains in this map only as long as the
+    /// corresponding requires clause has *not* been encoded. The first time a
+    /// deferred entry's disjunct fires the entry is drained and the encoder
+    /// builds its requires clause exactly as the eager path would have. Once
+    /// encoded the entry is removed; condition firings later in the solve
+    /// (after backtracking or otherwise) do not re-encode it.
+    deferred_requirements:
+        IndexMap<ConditionId, Vec<DeferredRequirement<D::SolvableId>>, ahash::RandomState>,
+
+    /// Conflicts analyzed since the last restart (or since entry) of the
+    /// current `run_sat` call, counted per conflict that yields a learnt
+    /// clause. A level-1 conflict that proves unsolvability is reported
+    /// before this is bumped, so it never paces a restart. Compared against
+    /// [`Self::restart_limit`].
+    conflicts_since_restart: u64,
+
+    /// The number of restarts performed by the current `run_sat` call;
+    /// indexes the Luby sequence that paces [`Self::restart_limit`].
+    restarts_performed: u64,
+
+    /// The conflict count at which the next restart fires (see
+    /// [`Solver::maybe_restart`]).
+    restart_limit: u64,
+
+    /// The root install level of the current `run_sat` call
+    /// (`starting_level + 1`), the retract target of
+    /// [`Solver::restart_to_run_root`]. Everything below it is preserved
+    /// prior state (the previous solution while a soft requirement is
+    /// being decided) that a restart must never undo.
+    run_root_level: u32,
+
+    /// Restart signatures (conflict level, trail length) observed by the
+    /// current `run_sat` call, with the number of restarts fired from each;
+    /// see [`RESTART_FUTILITY_REPEATS`].
+    restart_signatures: HashMap<(u32, usize), u32>,
+
+    /// Set once the current run demonstrates restart futility (one
+    /// signature reached [`RESTART_FUTILITY_REPEATS`]): the run commits to
+    /// its search and no further restarts fire until the next `run_sat`
+    /// call.
+    restarts_suppressed: bool,
+
     #[cfg(feature = "diagnostics")]
     propagation_counters: PropagationCounters,
 }
@@ -243,7 +297,6 @@ impl<D: DependencyProvider> Default for SolverState<D> {
     fn default() -> Self {
         Self {
             clauses: Default::default(),
-            requires_clauses: Default::default(),
             watches: Default::default(),
             requirement_to_sorted_candidates: Default::default(),
             variable_map: Default::default(),
@@ -259,10 +312,72 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             constrains_aux_vars: Default::default(),
             decision_tracker: Default::default(),
             name_activity: Default::default(),
+            max_activity: 0.0,
+            decide_queue: Default::default(),
+            deferred_requirements: Default::default(),
+            conflicts_since_restart: 0,
+            restarts_performed: 0,
+            restart_limit: u64::MAX,
+            run_root_level: 0,
+            restart_signatures: Default::default(),
+            restarts_suppressed: false,
             #[cfg(feature = "diagnostics")]
             propagation_counters: Default::default(),
         }
     }
+}
+
+/// Base interval, in learnt conflicts, of the Luby restart sequence: the
+/// n-th restart of a `run_sat` call fires after `luby(n) *
+/// RESTART_BASE_INTERVAL` conflicts. Classic CDCL restarts keep all learnt
+/// clauses and activity scores but abandon the current partial assignment,
+/// so a search that walked into a hopeless subtree re-descends from the run
+/// root, now pruned by the learnt clauses (and reordered where conflict
+/// activity has since shifted the candidate ranking). The value 128 is the
+/// campaign-tuned one: a 512 sensitivity check kept only half the win on
+/// the hard problems and lost ground everywhere else.
+const RESTART_BASE_INTERVAL: u64 = 128;
+
+/// A restart that keeps firing from the same state — same conflict level
+/// and same trail length — is not redirecting the search: the re-descent
+/// keeps rebuilding the same prefix, which means the run is grinding one
+/// long contiguous proof that restarts only interrupt (and, near the
+/// timeout, can prevent from ever finishing). After this many restarts
+/// from one signature the run commits: restarts are suppressed until the
+/// next `run_sat` call.
+///
+/// `(level, trail length)` is a deliberately coarse fingerprint of the
+/// search state, not an identity: two genuinely different assignments can
+/// share it, so the gate can in principle over-suppress a productive run
+/// that revisits one length four times. It is chosen over the standard
+/// trail-size moving average of Glucose-style blocking restarts (Audemard
+/// & Simon) or Biere's flip-rate agility because resolvo cannot phase-save
+/// — candidate values are fixed by version preference, so a cycle here is
+/// *exact* rather than approximate, and exact-equality counting detects it
+/// without a noisy statistic. Measured on the conda-forge corpus the
+/// separation was clean: cycling runs repeated one signature dozens of
+/// times before the deadline, while the traced productive solves never
+/// repeated one (their restart states differed by tens of thousands of
+/// trail entries). 4 sits in that gap — high enough not to clip a run that
+/// briefly revisits a state, low enough to cut a cycle long before the cap.
+const RESTART_FUTILITY_REPEATS: u32 = 4;
+
+/// The Luby sequence (1, 1, 2, 1, 1, 2, 4, 1, ...) for `x >= 0`, the
+/// textbook universally-optimal restart pacing: frequent short intervals
+/// with geometrically rarer long ones, so neither short- nor long-tailed
+/// conflict distributions degenerate.
+fn luby(mut x: u64) -> u64 {
+    let (mut size, mut seq) = (1u64, 0u32);
+    while size < x + 1 {
+        seq += 1;
+        size = 2 * size + 1;
+    }
+    while size - 1 != x {
+        size = (size - 1) >> 1;
+        seq -= 1;
+        x %= size;
+    }
+    1u64 << seq
 }
 
 /// Counters that track propagation loop behavior for performance analysis.
@@ -284,6 +399,11 @@ pub(crate) struct PropagationCounters {
     pub unwatched_calls_by_type: PropagationVisitsByType,
     pub propagate_calls: u64,
     pub conflicts: u64,
+    /// Times the Luby restart policy fired (see [`Solver::maybe_restart`]).
+    pub restarts: u64,
+    /// Times a run suppressed its restarts after demonstrating futility
+    /// (see [`RESTART_FUTILITY_REPEATS`]).
+    pub restart_suppressions: u64,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -391,6 +511,26 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.clauses.kinds.len()
     }
 
+    /// Total number of deferred per-disjunct conditional requirements still
+    /// waiting for their condition to fire. Useful to verify the "remove on
+    /// first fire" invariant of the lazy-conditional-candidates path.
+    pub fn deferred_requirements_count(&self) -> usize {
+        self.state.deferred_requirements_count()
+    }
+
+    /// The number of times the Luby restart policy fired.
+    #[cfg(feature = "diagnostics")]
+    pub fn restart_count(&self) -> u64 {
+        self.state.propagation_counters.restarts
+    }
+
+    /// The number of `run_sat` calls that suppressed their restarts after
+    /// hitting the futility gate.
+    #[cfg(feature = "diagnostics")]
+    pub fn restart_suppression_count(&self) -> u64 {
+        self.state.propagation_counters.restart_suppressions
+    }
+
     /// Set the runtime of the solver to `runtime`.
     #[must_use]
     pub fn with_runtime<RT2: AsyncRuntime>(self, runtime: RT2) -> Solver<D, RT2> {
@@ -448,6 +588,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ) -> Result<Vec<D::SolvableId>, UnsolvableOrCancelled> {
         // Re-initialize the solver state.
         self.state = SolverState::default();
+
+        // The decision fold's activity-based shortcuts are only sound when
+        // activities can never become negative and cold packages stay at
+        // exactly zero.
+        self.state
+            .decide_queue
+            .set_standard_activity_params(self.activity_add > 0.0 && self.activity_decay >= 0.0);
 
         // Construct the root dependencies from the problem
         let root_dependencies = Dependencies::Known(KnownDependencies {
@@ -532,6 +679,18 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             .next_back()
             .map(|decision| self.state.decision_tracker.level(decision.variable))
             .unwrap_or(0);
+
+        // Arm the restart policy for this run: the root level pins everything
+        // the caller wants preserved (see [`SolverState::run_root_level`]),
+        // and the Luby sequence restarts from its first interval. Each
+        // `run_sat` call is its own search episode; knowledge transfers
+        // through the learnt clauses and activity scores, not the pacing.
+        self.state.run_root_level = starting_level + 1;
+        self.state.conflicts_since_restart = 0;
+        self.state.restarts_performed = 0;
+        self.state.restart_limit = RESTART_BASE_INTERVAL * luby(0);
+        self.state.restart_signatures.clear();
+        self.state.restarts_suppressed = false;
 
         let mut level = starting_level;
         let mut new_solvables: Vec<(VariableId, ClauseId)> = Vec::new();
@@ -664,30 +823,45 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     .map(|d| (d.variable, d.derived_from)),
             );
 
-            if new_solvables.is_empty() {
-                // If no new literals were selected this solution is complete and we can return.
+            // Also detect deferred conditional requirements whose condition
+            // has just started to hold. These have to be encoded before we can
+            // conclude the solution is complete.
+            let fired_conditions = self.state.fired_deferred_conditions();
+
+            if new_solvables.is_empty() && fired_conditions.is_empty() {
+                // If no new literals were selected and no deferred conditions
+                // fired, this solution is complete and we can return.
                 tracing::trace!(
-                    "Level {}: No new solvables selected, solution is complete",
+                    "Level {}: No new solvables or fired conditions, solution is complete",
                     level
                 );
                 return Ok(true);
             }
 
-            tracing::debug!("==== Found newly selected solvables");
-            tracing::debug!(
-                " - {}",
-                new_solvables
-                    .iter()
-                    .copied()
-                    .format_with("\n- ", |(id, derived_from), f| f(&format_args!(
-                        "{} (derived from {})",
-                        id.display(&self.state.variable_map, self.provider()),
-                        self.state.clauses.kinds[derived_from.to_index()]
-                            .display(&self.state.variable_map, self.provider()),
-                    )))
-                    .to_string()
-            );
-            tracing::debug!("====");
+            if !new_solvables.is_empty() {
+                tracing::debug!("==== Found newly selected solvables");
+                tracing::debug!(
+                    " - {}",
+                    new_solvables
+                        .iter()
+                        .copied()
+                        .format_with("\n- ", |(id, derived_from), f| f(&format_args!(
+                            "{} (derived from {})",
+                            id.display(&self.state.variable_map, self.provider()),
+                            self.state.clauses.kinds[derived_from.to_index()]
+                                .display(&self.state.variable_map, self.provider()),
+                        )))
+                        .to_string()
+                );
+                tracing::debug!("====");
+            }
+
+            if !fired_conditions.is_empty() {
+                tracing::debug!(
+                    "==== Found {} deferred condition(s) that just fired",
+                    fired_conditions.len()
+                );
+            }
 
             solvable_ids.clear();
             solvable_ids.extend(new_solvables.iter().filter_map(|(variable, _)| {
@@ -698,11 +872,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     .map(SolvableIdOrRoot::from)
             }));
 
+            // Drain the fired deferred requirements.
+            let mut deferred_to_encode = Vec::new();
+            for condition in fired_conditions {
+                deferred_to_encode.extend(self.state.drain_fired_deferred(condition));
+            }
+
             #[cfg(feature = "diagnostics")]
             let encoding_start = std::time::Instant::now();
             let conflicting_clauses = self.async_runtime.block_on(
                 Encoder::new(&mut self.state, &self.cache, root_deps, level)
-                    .encode(solvable_ids.iter().copied()),
+                    .encode_with_deferred(solvable_ids.iter().copied(), deferred_to_encode),
             )?;
             #[cfg(feature = "diagnostics")]
             {
@@ -844,211 +1024,61 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ///    with the least amount of possible candidates requires less
     ///    backtracking to determine unsatisfiability than a requirement with
     ///    more possible candidates.
+    ///
+    /// The selection is computed incrementally by [`decide_queue::DecideQueue`]
+    /// instead of rescanning every requires clause on every call; debug
+    /// builds verify the queue's bookkeeping invariants on every call.
     fn decide(&mut self) -> Option<(VariableId, VariableId, ClauseId)> {
-        struct PossibleDecision {
-            /// The activity of the package that is selected
-            package_activity: f32,
-
-            /// If this decision is based on a requirement that is explicitly
-            /// requested by the user.
-            is_explicit_requirement: bool,
-
-            /// The total number of possible candidates that are available for
-            /// this requirement.
-            candidate_count: u32,
-
-            /// The decision to make.
-            decision: (VariableId, VariableId, ClauseId),
-        }
-
-        let mut best_decision: Option<PossibleDecision> = None;
-        for (&solvable_id, requirements) in self.state.requires_clauses.iter() {
-            let is_explicit_requirement = solvable_id == VariableId::root();
-            if let Some(best_decision) = &best_decision {
-                // If we already have an explicit requirement, there is no need to evaluate
-                // non-explicit requirements.
-                if best_decision.is_explicit_requirement && !is_explicit_requirement {
-                    continue;
-                }
-            }
-
-            // Consider only clauses in which we have decided to install the solvable
-            if self.state.decision_tracker.assigned_value(solvable_id) != Some(true) {
-                continue;
-            }
-
-            for (deps, condition, clause_id) in requirements.iter() {
-                let mut candidate = ControlFlow::Break(());
-
-                // If the clause has a condition that is not yet satisfied we need to skip it.
-                if let Some(condition) = *condition {
-                    let literals = &self.state.disjunctions[condition].literals;
-                    if !literals.iter().all(|c| {
-                        let value = c.eval(self.state.decision_tracker.map());
-                        value == Some(false)
-                    }) {
-                        // The condition is not satisfied, skip this clause.
-                        continue;
-                    }
-                }
-
-                // Get the candidates for the individual version sets.
-                let version_set_candidates = &self.state.requirement_to_sorted_candidates[*deps];
-
-                // Iterate over all version sets in the requirement and find the first version
-                // set that we can act on, or if a single candidate (from any version set) makes
-                // the clause true.
-                //
-                // NOTE: We zip the version sets from the requirements and the variables that we
-                // previously cached. This assumes that the order of the version sets is the
-                // same in both collections.
-                for (version_set, candidates) in deps
-                    .version_sets(self.provider())
-                    .zip(version_set_candidates)
-                {
-                    // Find the first candidate that is not yet assigned a value or find the first
-                    // value that makes this clause true.
-                    candidate = candidates.iter().try_fold(
-                        match candidate {
-                            ControlFlow::Continue(x) => x,
-                            _ => None,
-                        },
-                        |first_candidate, &candidate| {
-                            let assigned_value =
-                                self.state.decision_tracker.assigned_value(candidate);
-                            ControlFlow::Continue(match assigned_value {
-                                Some(true) => {
-                                    // This candidate has already been assigned so the clause is
-                                    // already true. Skip it.
-                                    return ControlFlow::Break(());
-                                }
-                                Some(false) => {
-                                    // This candidate has already been assigned false, continue the
-                                    // search.
-                                    first_candidate
-                                }
-                                None => match first_candidate {
-                                    Some((
-                                        first_candidate,
-                                        candidate_version_set,
-                                        mut candidate_count,
-                                        package_activity,
-                                    )) => {
-                                        // We found a candidate that has not been assigned yet, but
-                                        // it is not the first candidate.
-                                        if candidate_version_set == version_set {
-                                            // Increment the candidate count if this is a candidate
-                                            // in the same version set.
-                                            candidate_count += 1u32;
-                                        }
-                                        Some((
-                                            first_candidate,
-                                            candidate_version_set,
-                                            candidate_count,
-                                            package_activity,
-                                        ))
-                                    }
-                                    None => {
-                                        // We found the first candidate that has not been assigned
-                                        // yet.
-                                        let package_activity = self
-                                            .state
-                                            .name_activity
-                                            .get(self.provider().version_set_name(version_set));
-                                        Some((candidate, version_set, 1, package_activity))
-                                    }
-                                },
-                            })
-                        },
-                    );
-
-                    // Stop searching if we found a candidate that makes the clause true.
-                    if candidate.is_break() {
-                        break;
-                    }
-                }
-
-                match candidate {
-                    ControlFlow::Break(_) => {
-                        // A candidate has been assigned true which means the clause is already
-                        // true, and we can skip it.
-                        continue;
-                    }
-                    ControlFlow::Continue(None) => {
-                        unreachable!(
-                            "when we get here it means that all candidates have been assigned false. This should not be able to happen at this point because during propagation the solvable should have been assigned false as well."
-                        )
-                    }
-                    ControlFlow::Continue(Some((
-                        candidate,
-                        _version_set_id,
-                        candidate_count,
-                        package_activity,
-                    ))) => {
-                        let decision = (candidate, solvable_id, *clause_id);
-                        best_decision = Some(match &best_decision {
-                            None => PossibleDecision {
-                                is_explicit_requirement,
-                                package_activity,
-                                candidate_count,
-                                decision,
-                            },
-                            Some(best_decision) => {
-                                // Prefer decisions on explicit requirements over non-explicit
-                                // requirements. This optimizes direct dependencies over transitive
-                                // dependencies.
-                                if best_decision.is_explicit_requirement && !is_explicit_requirement
-                                {
-                                    continue;
-                                }
-
-                                // Prefer decisions with a higher package activity score to root out
-                                // conflicts faster.
-                                if best_decision.package_activity >= package_activity {
-                                    continue;
-                                }
-
-                                if best_decision.candidate_count <= candidate_count {
-                                    continue;
-                                }
-
-                                PossibleDecision {
-                                    is_explicit_requirement,
-                                    package_activity,
-                                    candidate_count,
-                                    decision,
-                                }
-                            }
-                        })
-                    }
-                }
-            }
-        }
-
-        if let Some(PossibleDecision {
-            candidate_count,
-            package_activity,
-            decision: (candidate, _solvable_id, clause_id),
+        let provider = self.cache.provider();
+        let SolverState {
+            decide_queue,
+            decision_tracker,
+            requirement_to_sorted_candidates,
+            disjunctions,
+            name_activity,
+            max_activity,
             ..
-        }) = &best_decision
-        {
+        } = &mut self.state;
+
+        let floor = decision_tracker.take_sync_floor();
+        decide_queue.sync(
+            floor,
+            decision_tracker.assignments(),
+            decision_tracker.map(),
+        );
+        let decision = decide_queue.next_decision(
+            decision_tracker.map(),
+            requirement_to_sorted_candidates,
+            disjunctions,
+            name_activity,
+            *max_activity,
+            provider,
+        );
+
+        #[cfg(debug_assertions)]
+        decide_queue.debug_assert_invariants(
+            decision_tracker.map(),
+            requirement_to_sorted_candidates,
+            disjunctions,
+            name_activity,
+            *max_activity,
+            provider,
+        );
+
+        if let Some(decision) = &decision {
             tracing::trace!(
                 "deciding to assign {}, ({}, {} activity score, {} possible candidates)",
-                candidate.display(&self.state.variable_map, self.provider()),
-                self.state.clauses.kinds[clause_id.to_index()]
+                decision
+                    .candidate
                     .display(&self.state.variable_map, self.provider()),
-                package_activity,
-                candidate_count,
+                self.state.clauses.kinds[decision.clause_id.to_index()]
+                    .display(&self.state.variable_map, self.provider()),
+                decision.package_activity,
+                decision.candidate_count,
             );
         }
 
-        // Could not find a requirement that needs satisfying.
-        best_decision.map(
-            |PossibleDecision {
-                 decision: (candidate, required_by, via),
-                 ..
-             }| { (candidate, required_by, via) },
-        )
+        decision.map(|decision| (decision.candidate, decision.required_by, decision.clause_id))
     }
 
     /// Executes one iteration of the CDCL loop
@@ -1102,6 +1132,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         attempted_value,
                         conflicting_clause,
                     )?;
+                    level = self.maybe_restart(level);
                 }
             }
         }
@@ -1171,6 +1202,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
         let (new_level, learned_clause_id, literal) =
             self.analyze(level, conflicting_solvable, conflicting_clause);
+        self.state.conflicts_since_restart += 1;
         let old_level = level;
         level = new_level;
 
@@ -1199,6 +1231,91 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
 
         Ok(level)
+    }
+
+    /// Fires a classic CDCL restart when the current `run_sat` call has
+    /// accumulated enough conflicts since the previous one (Luby pacing,
+    /// see [`RESTART_BASE_INTERVAL`]).
+    ///
+    /// A restart undoes every decision above the run's root install level
+    /// while keeping all learnt clauses and activity scores: the search
+    /// re-descends guided by what the conflicts taught it instead of
+    /// staying committed to early decisions that predate that knowledge.
+    /// See [`Solver::restart_to_run_root`] for the retract primitive and
+    /// its soundness argument, and [`RESTART_FUTILITY_REPEATS`] for the
+    /// futility gate that makes a cycling run commit instead.
+    ///
+    /// Called only after [`Solver::learn_from_conflict`] has had its chance
+    /// to declare the problem unsolvable (a level-1 conflict returns before
+    /// we get here), so a refutation that bottoms out at the run root is
+    /// never mistaken for a restart opportunity.
+    fn maybe_restart(&mut self, level: u32) -> u32 {
+        // The count comparison is the hot-path check: on a run that never
+        // restarts it is the operand that returns, so test it first and
+        // consult the suppression flag only once a restart could fire.
+        if self.state.conflicts_since_restart < self.state.restart_limit
+            || self.state.restarts_suppressed
+        {
+            return level;
+        }
+
+        let signature = (level, self.state.decision_tracker.assignments().len());
+        let fired = self
+            .state
+            .restart_signatures
+            .entry(signature)
+            .or_insert(0u32);
+        *fired += 1;
+        if *fired >= RESTART_FUTILITY_REPEATS {
+            tracing::debug!(
+                "├─ Suppressing restarts: {} fired from level {level} with trail length {}",
+                *fired,
+                signature.1
+            );
+            self.state.restarts_suppressed = true;
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state.propagation_counters.restart_suppressions += 1;
+            }
+            return level;
+        }
+
+        self.state.conflicts_since_restart = 0;
+        self.state.restarts_performed += 1;
+        self.state.restart_limit = RESTART_BASE_INTERVAL * luby(self.state.restarts_performed);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.state.propagation_counters.restarts += 1;
+        }
+
+        if level > self.state.run_root_level {
+            tracing::debug!(
+                "├─ Restart {}: backtracking from level {level} to {}",
+                self.state.restarts_performed,
+                self.state.run_root_level
+            );
+        }
+        self.restart_to_run_root(level)
+    }
+
+    /// The restart primitive: retracts the trail to
+    /// [`SolverState::run_root_level`], the root install level of the
+    /// current run. Kept separate from [`Solver::maybe_restart`] so other
+    /// restart triggers can share one retract path.
+    ///
+    /// Everything below the root level (a preserved prior solution while a
+    /// soft requirement is being decided) survives by construction. Learnt
+    /// clauses and activity scores are untouched. Backtracking is the only
+    /// effect; assertions of single-literal learnt clauses are re-applied
+    /// by [`Solver::decide_learned`] on the next propagation round.
+    fn restart_to_run_root(&mut self, level: u32) -> u32 {
+        let root_level = self.state.run_root_level;
+        if level <= root_level {
+            // Already at (or below) the restart target.
+            return level;
+        }
+        self.state.decision_tracker.undo_until(root_level);
+        root_level
     }
 
     /// The propagate step of the CDCL algorithm
@@ -1646,10 +1763,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .as_solvable(&self.state.variable_map)
                 .map(|s| self.provider().solvable_name(s));
             if let Some(name_id) = name_id {
-                let activity = self.state.name_activity.get(name_id);
-                self.state
-                    .name_activity
-                    .set(name_id, activity + self.activity_add);
+                let activity = self.state.name_activity.get(name_id) + self.activity_add;
+                self.state.name_activity.set(name_id, activity);
+                if activity > self.state.max_activity {
+                    self.state.max_activity = activity;
+                }
+                self.state.decide_queue.mark_name_hot(name_id);
             }
         }
 
@@ -1687,10 +1806,34 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.name_activity.for_each_mut(|activity| {
             *activity *= self.activity_decay;
         });
+        // The same f32 multiplication applied to the identical value keeps
+        // `max_activity` bit-exact with the largest stored activity.
+        self.state.max_activity *= self.activity_decay;
     }
 }
 
 impl<D: DependencyProvider> SolverState<D> {
+    /// Registers a newly encoded requires clause with the incremental decide
+    /// queue.
+    pub(crate) fn add_requires_clause(
+        &mut self,
+        parent: VariableId,
+        requirement: Requirement,
+        condition: Option<DisjunctionId>,
+        clause_id: ClauseId,
+        names: impl IntoIterator<Item = D::NameId>,
+    ) {
+        self.decide_queue.register_clause(
+            parent,
+            requirement,
+            condition,
+            clause_id,
+            names,
+            &self.disjunctions,
+            self.decision_tracker.assigned_value(parent),
+        );
+    }
+
     /// Allocate a clause and, if it has watched literals, register them in
     /// the [`WatchMap`].
     pub(crate) fn add_clause(
@@ -1719,5 +1862,108 @@ impl<D: DependencyProvider> SolverState<D> {
                 None
             }
         })
+    }
+
+    /// Returns true if `solvable_id` has been assigned the value `true` in the
+    /// current decision state. A solvable that has never been interned as a
+    /// variable is treated as not decided.
+    pub(crate) fn is_positively_decided(&self, solvable_id: D::SolvableId) -> bool {
+        match self.variable_map.lookup_solvable(solvable_id) {
+            Some(variable) => self.decision_tracker.assigned_value(variable) == Some(true),
+            None => false,
+        }
+    }
+
+    /// Returns the `ConditionId`s of deferred requirements whose gating
+    /// disjunct currently holds. Entries are reported in insertion order so
+    /// that drain order is deterministic.
+    pub(crate) fn fired_deferred_conditions(&self) -> Vec<ConditionId> {
+        self.deferred_requirements
+            .iter()
+            .filter(|(_, entries)| {
+                entries.iter().any(|entry| {
+                    condition_disjunct_holds(&entry.disjunct, |s| self.is_positively_decided(s))
+                })
+            })
+            .map(|(condition, _)| *condition)
+            .collect()
+    }
+
+    /// Drain deferred requirements for `condition` whose disjunct currently
+    /// holds. Removed entries are returned. If, after draining, no entries
+    /// remain for `condition`, the key is removed from the map entirely.
+    pub(crate) fn drain_fired_deferred(
+        &mut self,
+        condition: ConditionId,
+    ) -> Vec<DeferredRequirement<D::SolvableId>> {
+        // Decide first which indices fire while only holding immutable
+        // borrows of the state, then mutate the deferred map. The two-pass
+        // structure avoids overlapping mutable and immutable borrows of
+        // `self`.
+        let fire_mask: Vec<bool> = match self.deferred_requirements.get(&condition) {
+            Some(entries) => entries
+                .iter()
+                .map(|entry| {
+                    condition_disjunct_holds(&entry.disjunct, |s| self.is_positively_decided(s))
+                })
+                .collect(),
+            None => return Vec::new(),
+        };
+
+        let entries = self
+            .deferred_requirements
+            .get_mut(&condition)
+            .expect("entries existed in the immutable phase");
+        let mut fired = Vec::new();
+        // Use `remove` instead of `swap_remove`: it preserves the relative
+        // order of the entries that stay in the deferred map, so that any
+        // subsequent drain visits them in the same order regardless of how
+        // many drains have happened before. Walk indices in reverse so each
+        // `remove` does not shift the indices we still need to inspect.
+        for (i, _) in fire_mask
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|&(_, &did_fire)| did_fire)
+        {
+            fired.push(entries.remove(i));
+        }
+
+        if entries.is_empty() {
+            self.deferred_requirements.swap_remove(&condition);
+        }
+
+        // We pushed in reverse order; restore insertion order for determinism.
+        fired.reverse();
+        fired
+    }
+
+    /// Register a new deferred requirement. Used by the encoder when it
+    /// detects that a conditional requirement's disjunct does not yet hold.
+    pub(crate) fn push_deferred(&mut self, entry: DeferredRequirement<D::SolvableId>) {
+        self.deferred_requirements
+            .entry(entry.condition)
+            .or_default()
+            .push(entry);
+    }
+
+    /// Total number of deferred per-disjunct entries still waiting for their
+    /// condition to fire.
+    pub(crate) fn deferred_requirements_count(&self) -> usize {
+        self.deferred_requirements
+            .values()
+            .map(|entries| entries.len())
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::luby;
+
+    #[test]
+    fn luby_produces_the_textbook_sequence() {
+        let observed: Vec<u64> = (0..15).map(luby).collect();
+        assert_eq!(observed, vec![1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8]);
     }
 }
