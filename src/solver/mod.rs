@@ -414,6 +414,16 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.clauses.kinds.len()
     }
 
+    /// Returns whether the solver encoded clauses for `name` during solving —
+    /// that is, whether the package entered the search's working set. Because
+    /// encoding is lazy this is a strict subset of the static dependency
+    /// closure, and is only meaningful after [`Self::solve`] has run (or been
+    /// cancelled). Intended for profiling which part of the graph a solve
+    /// actually touched.
+    pub fn encoded_package(&self, name: D::NameId) -> bool {
+        self.state.clauses_added_for_package.contains(name)
+    }
+
     /// Total number of deferred per-disjunct conditional requirements still
     /// waiting for their condition to fire. Useful to verify the "remove on
     /// first fire" invariant of the lazy-conditional-candidates path.

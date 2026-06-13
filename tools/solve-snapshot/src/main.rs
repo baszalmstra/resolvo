@@ -72,6 +72,14 @@ struct Opts {
     /// be joined to correlate hub structure with solve time. Does not solve.
     #[clap(long)]
     profile: bool,
+
+    /// Like `--profile`, but each problem is *solved* and the hub metrics are
+    /// computed over the subgraph the solver actually encoded (its working set)
+    /// rather than the full static closure, alongside the solve time. Writes
+    /// `profile_visited.csv`. This is the honest test of whether hub structure
+    /// predicts hardness once never-visited packages are excluded.
+    #[clap(long)]
+    profile_visited: bool,
 }
 
 /// Per-problem static hub profile (see [`Opts::profile`]).
@@ -182,7 +190,11 @@ fn hub_divergence(
 /// traversal is by package name: once a name is reached, every one of its
 /// solvables (and their dependencies) is included, mirroring how the solver
 /// encodes a package wholesale once it becomes involved.
-fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> ProfileRecord {
+fn profile_problem(
+    snapshot: &DependencySnapshot,
+    root_names: &[NameId],
+    is_encoded: impl Fn(NameId) -> bool,
+) -> ProfileRecord {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     let mut closure: HashSet<NameId> = HashSet::new();
@@ -195,10 +207,12 @@ fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> Prof
 
     let mut parent_refs: HashMap<NameId, usize> = HashMap::new();
     let mut vsets_per_name: HashMap<NameId, HashSet<VersionSetId>> = HashMap::new();
-    let mut total_requires = 0usize;
 
     // Resolve a requirement to its target version sets, counting each as an
-    // in-edge to the referenced package name and enqueueing that name.
+    // in-edge to the referenced package name and enqueueing that name. Edges to
+    // names `is_encoded` rejects are skipped entirely, so passing a predicate
+    // that admits only the solver's encoded packages restricts every metric to
+    // the subgraph the search actually touched.
     let visit_version_set =
         |vs: VersionSetId,
          parent_refs: &mut HashMap<NameId, usize>,
@@ -209,6 +223,9 @@ fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> Prof
                 return;
             };
             let target = version_set.name;
+            if !is_encoded(target) {
+                return;
+            }
             *parent_refs.entry(target).or_default() += 1;
             vsets_per_name.entry(target).or_default().insert(vs);
             if closure.insert(target) {
@@ -230,7 +247,6 @@ fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> Prof
             for req in &deps.requirements {
                 match req.requirement {
                     Requirement::Single(vs) => {
-                        total_requires += 1;
                         visit_version_set(
                             vs,
                             &mut parent_refs,
@@ -242,7 +258,6 @@ fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> Prof
                     Requirement::Union(union_id) => {
                         if let Some(members) = snapshot.version_set_unions.get(union_id) {
                             for &vs in members {
-                                total_requires += 1;
                                 visit_version_set(
                                     vs,
                                     &mut parent_refs,
@@ -257,16 +272,21 @@ fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> Prof
             }
             // `constrains` only pull a name into the closure (no install
             // pressure), so they expand reachability but are not counted as
-            // in-degree.
+            // in-degree. Honour the encoded filter so a visited-set profile
+            // does not reach back out through unencoded packages.
             for &vs in &deps.constrains {
                 if let Some(version_set) = snapshot.version_sets.get(vs) {
-                    if closure.insert(version_set.name) {
+                    if is_encoded(version_set.name) && closure.insert(version_set.name) {
                         queue.push_back(version_set.name);
                     }
                 }
             }
         }
     }
+
+    // Every counted edge landed in `parent_refs`, so its total is the number of
+    // requires-edges within the kept subgraph.
+    let total_requires: usize = parent_refs.values().sum();
 
     let closure_solvables = closure
         .iter()
@@ -330,6 +350,26 @@ struct Record {
     duration: f64,
     error: Option<String>,
     records: Option<usize>,
+}
+
+/// One `--profile-visited` row: solve time joined with hub metrics computed
+/// over the solver's encoded working set, plus the full-closure name count for
+/// reference (so the dilution ratio is visible).
+#[derive(Debug, serde::Serialize)]
+struct VisitedRecord {
+    duration: f64,
+    records: Option<usize>,
+    timed_out: bool,
+    closure_names: usize,
+    visited_names: usize,
+    visited_solvables: usize,
+    visited_total_requires: usize,
+    hub_name: String,
+    hub_parent_refs: usize,
+    hub_candidates: usize,
+    hub_version_sets: usize,
+    hub_max_coverage: f64,
+    hub_top_exclusion: f64,
 }
 
 /// A rebuildable description of one root requirement. Package requirements
@@ -497,10 +537,15 @@ fn main() {
         .from_path("timings.csv")
         .unwrap();
 
-    let mut profile_writer = opts.profile.then(|| {
+    let mut profile_writer = (opts.profile || opts.profile_visited).then(|| {
+        let path = if opts.profile_visited {
+            "profile_visited.csv"
+        } else {
+            "profile.csv"
+        };
         WriterBuilder::new()
             .has_headers(true)
-            .from_path("profile.csv")
+            .from_path(path)
             .unwrap()
     });
 
@@ -579,13 +624,63 @@ fn main() {
         }
 
         if opts.profile {
-            let profile = profile_problem(&snapshot, &root_names);
+            let profile = profile_problem(&snapshot, &root_names, |_| true);
             profile_writer
                 .as_mut()
                 .expect("profile writer")
                 .serialize(profile)
                 .unwrap();
             if i % 50 == 0 {
+                profile_writer.as_mut().unwrap().flush().unwrap();
+            }
+            continue;
+        }
+
+        if opts.profile_visited {
+            let problem = Problem::default().requirements(requirements);
+            let mut solver = Solver::new(provider);
+            let start = Instant::now();
+            let result = solver.solve(problem);
+            let duration = start.elapsed();
+            let (records, timed_out) = match &result {
+                Ok(solution) => (Some(solution.len()), false),
+                Err(UnsolvableOrCancelled::Unsolvable(_)) => (None, false),
+                Err(UnsolvableOrCancelled::Cancelled(_)) => (None, true),
+            };
+            // Metrics over the encoded working set, and the full-closure name
+            // count for reference.
+            let visited = profile_problem(&snapshot, &root_names, |n| solver.encoded_package(n));
+            let full = profile_problem(&snapshot, &root_names, |_| true);
+            eprintln!(
+                "  [{:>4}] {:.2}s  visited {}/{} names  hub {} (refs {}, cov {:.2})",
+                i,
+                duration.as_secs_f64(),
+                visited.closure_names,
+                full.closure_names,
+                visited.hub_name,
+                visited.hub_parent_refs,
+                visited.hub_max_coverage,
+            );
+            profile_writer
+                .as_mut()
+                .expect("profile writer")
+                .serialize(VisitedRecord {
+                    duration: duration.as_secs_f64(),
+                    records,
+                    timed_out,
+                    closure_names: full.closure_names,
+                    visited_names: visited.closure_names,
+                    visited_solvables: visited.closure_solvables,
+                    visited_total_requires: visited.total_requires,
+                    hub_name: visited.hub_name,
+                    hub_parent_refs: visited.hub_parent_refs,
+                    hub_candidates: visited.hub_candidates,
+                    hub_version_sets: visited.hub_version_sets,
+                    hub_max_coverage: visited.hub_max_coverage,
+                    hub_top_exclusion: visited.hub_top_exclusion,
+                })
+                .unwrap();
+            if i % 10 == 0 {
                 profile_writer.as_mut().unwrap().flush().unwrap();
             }
             continue;
