@@ -1348,7 +1348,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // boundary prefix assignments that were pushed together
                     // with the member's trail entry; their own propagation
                     // walks the derived falsifications.
-                    if self.state.decision_tracker.map().package_heavy(package) != Some(true) {
+                    if self
+                        .state
+                        .decision_tracker
+                        .map()
+                        .package_prefix_count(package)
+                        == 0
+                    {
                         self.propagate_package_event(package, level, 0, usize::MAX)?;
                     }
                 }

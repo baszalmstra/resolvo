@@ -109,21 +109,6 @@ pub enum AmoEncoding {
     /// learning like the sequential (ladder) encoding.
     VirtualLadder,
 
-    /// Per-package adaptive virtual encoding: a package with fewer than
-    /// `threshold` candidates uses the light [`AmoEncoding::Virtual`]
-    /// mechanism (a selection record, cheapest on the common small packages),
-    /// while a package with at least `threshold` candidates uses the heavy
-    /// [`AmoEncoding::VirtualLadder`] mechanism (boundary prefixes + range
-    /// learning, which pays off on the large packages that drive
-    /// backtracking storms and deep search). The mechanism is decided once,
-    /// on a package's first selection. This aims to combine the light
-    /// encoding's cheap-solve speed with the ladder's hard-case robustness.
-    VirtualAdaptive {
-        /// Candidate count at or above which a package uses the heavy
-        /// (ladder) mechanism.
-        threshold: usize,
-    },
-
     /// Pairwise clauses while the package has at most `threshold` candidates,
     /// switching to the binary encoding beyond that.
     ///
@@ -151,7 +136,6 @@ impl std::str::FromStr for AmoEncoding {
             "bimander" => Ok(AmoEncoding::Bimander { group_size: 2 }),
             "virtual" => Ok(AmoEncoding::Virtual),
             "virtual-ladder" => Ok(AmoEncoding::VirtualLadder),
-            "virtual-adaptive" => Ok(AmoEncoding::VirtualAdaptive { threshold: 32 }),
             _ => {
                 if let Some(threshold) = s.strip_prefix("hybrid:") {
                     let threshold = threshold
@@ -174,11 +158,6 @@ impl std::str::FromStr for AmoEncoding {
                         return Err("bimander group size must be at least 1".to_string());
                     }
                     Ok(AmoEncoding::Bimander { group_size })
-                } else if let Some(threshold) = s.strip_prefix("virtual-adaptive:") {
-                    let threshold = threshold
-                        .parse()
-                        .map_err(|e| format!("invalid virtual-adaptive threshold: {e}"))?;
-                    Ok(AmoEncoding::VirtualAdaptive { threshold })
                 } else {
                     Err(format!(
                         "unknown at-most-one encoding {s:?}, expected `pairwise`, `binary`, \
@@ -317,9 +296,7 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
             AmoEncoding::Bimander { group_size } => {
                 self.add_bimander(variable, group_size.max(1), alloc_clause, alloc_var)
             }
-            AmoEncoding::Virtual
-            | AmoEncoding::VirtualLadder
-            | AmoEncoding::VirtualAdaptive { .. } => {
+            AmoEncoding::Virtual | AmoEncoding::VirtualLadder => {
                 unreachable!("the virtual encodings are handled directly by the encoder")
             }
             AmoEncoding::Hybrid { threshold } => {

@@ -1540,8 +1540,6 @@ fn test_amo_encodings_agree() {
         AmoEncoding::Hybrid { threshold: 3 },
         AmoEncoding::Virtual,
         AmoEncoding::VirtualLadder,
-        AmoEncoding::VirtualAdaptive { threshold: 2 },
-        AmoEncoding::VirtualAdaptive { threshold: 100 },
     ] {
         assert_eq!(
             solve_with(encoding),
