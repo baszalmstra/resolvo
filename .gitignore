@@ -29,3 +29,6 @@ snapshot_*.json
 bench-final/
 
 timings_*
+
+# Claude Code harness state (agent worktrees, local session data)
+.claude/
