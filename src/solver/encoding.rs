@@ -315,8 +315,10 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // round, so this is deferred.
         // Single-candidate requirements are already binary clauses; the
         // strengtheners only pay off for real ranges.
-        if matches!(self.state.amo_encoding, crate::AmoEncoding::VirtualLadder)
-            && condition.is_none()
+        if matches!(
+            self.state.amo_encoding,
+            crate::AmoEncoding::VirtualLadder | crate::AmoEncoding::VirtualAdaptive { .. }
+        ) && condition.is_none()
             && version_set_variables.len() == 1
             && version_set_variables[0].len() > 1
         {
@@ -738,16 +740,35 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         .map(move |candidate_var| (name_id, candidate_var))
                 })
         {
-            if matches!(
-                amo_encoding,
-                crate::AmoEncoding::Virtual | crate::AmoEncoding::VirtualLadder
-            ) {
+            // The selection mechanism per encoding:
+            // - Virtual: light (plain virtual), no prefix variables.
+            // - VirtualLadder: heavy (ladder), prefix variables.
+            // - VirtualAdaptive: prefix variables allocated eagerly; the
+            //   mechanism is decided per package on its first selection by
+            //   comparing its candidate count to `threshold`.
+            let virtual_mode = match amo_encoding {
+                crate::AmoEncoding::Virtual => Some((false, None)),
+                crate::AmoEncoding::VirtualLadder => Some((true, None)),
+                crate::AmoEncoding::VirtualAdaptive { threshold } => {
+                    Some((true, Some(threshold as u32)))
+                }
+                _ => None,
+            };
+            if let Some((with_prefix_vars, adaptive_threshold)) = virtual_mode {
+                // `heavy`: Some(false) light, Some(true) ladder, None adaptive.
+                let mode = match amo_encoding {
+                    crate::AmoEncoding::Virtual => Some(false),
+                    crate::AmoEncoding::VirtualLadder => Some(true),
+                    _ => None, // adaptive: decided on first selection
+                };
                 Self::register_virtual_candidate(
                     self.state,
                     &mut self.conflicting_clauses,
                     name_id,
                     candidate_var,
-                    matches!(amo_encoding, crate::AmoEncoding::VirtualLadder),
+                    with_prefix_vars,
+                    mode,
+                    adaptive_threshold,
                 );
                 continue;
             }
@@ -845,6 +866,8 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         name_id: D::NameId,
         candidate_var: VariableId,
         with_prefix_vars: bool,
+        mode: Option<bool>,
+        adaptive_threshold: Option<u32>,
     ) {
         let mut tracker = state
             .at_most_one_trackers
@@ -859,6 +882,16 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     let package = state.decision_tracker.map_mut().alloc_package();
                     state.virtual_package_names.push(name_id);
                     tracker.virtual_package = Some(package);
+                    state
+                        .decision_tracker
+                        .map_mut()
+                        .set_package_mode(package, mode);
+                    if let Some(threshold) = adaptive_threshold {
+                        state
+                            .decision_tracker
+                            .map_mut()
+                            .set_adaptive_threshold(threshold);
+                    }
                     package
                 }
             };
@@ -1045,9 +1078,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             // prune).
             const MIN_PACKAGE_SIZE: usize = 32;
             let member_count = map.package_member_count(package);
+            // Only heavy (ladder) packages have the prefix variables the
+            // strengtheners refer to; under the adaptive encoding a package
+            // that resolved to light has none.
             if !contiguous
                 || (max - min + 1) as usize != candidate_vars.len()
                 || map.package_prefix_count(package) == 0
+                || map.package_heavy(package) == Some(false)
                 || member_count < MIN_PACKAGE_SIZE
                 || (min == 0 && max as usize == member_count - 1)
             {

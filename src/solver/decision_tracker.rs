@@ -86,14 +86,19 @@ impl DecisionTracker {
                     // boundary prefix assignments pushed right behind the
                     // member's own trail entry.
                     PackageVar::Member { package, index } if decision.value => {
-                        if self.map.package_prefix_count(package) == 0 {
-                            self.map
-                                .set_selection(package, decision.variable, index, level);
-                        } else {
+                        // Heavy (ladder) packages express the selection through
+                        // boundary prefix assignments pushed behind the member;
+                        // light (plain virtual) packages through a selection
+                        // record. For the adaptive encoding this is the point
+                        // where an undecided package picks its mechanism.
+                        if self.map.resolve_package_heavy(package) {
                             self.stack.push(decision);
                             return self
                                 .push_selection_boundaries(package, index, level)
                                 .map(|_| true);
+                        } else {
+                            self.map
+                                .set_selection(package, decision.variable, index, level);
                         }
                     }
                     // An explicit prefix assignment narrows the allowed

@@ -155,6 +155,16 @@ struct PackageState {
     /// prefix variables, along with the driving variable and its level.
     hi: u32,
     hi_driver: Option<(VariableId, u32)>,
+    /// Whether this package uses the *heavy* (ladder) selection mechanism
+    /// (boundary prefix assignments + range learning) rather than the *light*
+    /// (plain virtual) one (a single selection record, derived on lookup).
+    ///
+    /// - `Some(true)`: ladder. `Some(false)`: plain virtual.
+    /// - `None`: adaptive and not yet decided — resolved on the package's first
+    ///   selection by comparing its candidate count to the adaptive threshold
+    ///   ([`DecisionMap::resolve_package_heavy`]). Packages without prefix
+    ///   variables are always `Some(false)` since the ladder path needs them.
+    heavy: Option<bool>,
 }
 
 impl PackageState {
@@ -169,6 +179,7 @@ impl PackageState {
             lo_driver: None,
             hi: u32::MAX,
             hi_driver: None,
+            heavy: None,
         }
     }
 }
@@ -193,6 +204,12 @@ pub(crate) struct DecisionMap {
 
     /// State per tracked package.
     packages: Vec<PackageState>,
+
+    /// Candidate-count threshold for the adaptive encoding: a package with at
+    /// least this many candidates uses the heavy (ladder) mechanism, smaller
+    /// ones the light (plain virtual) one. `None` until set by the encoder
+    /// (treated as "never heavy").
+    adaptive_threshold: Option<u32>,
 
     /// Undo records for explicit prefix assignments, pushed by
     /// [`Self::apply_prefix_assignment`] in trail order: the package and its
@@ -350,6 +367,39 @@ impl DecisionMap {
         let index = self.packages.len() as u32;
         self.packages.push(PackageState::new());
         index
+    }
+
+    /// Sets the candidate-count threshold above which adaptive packages use
+    /// the heavy (ladder) selection mechanism.
+    pub fn set_adaptive_threshold(&mut self, threshold: u32) {
+        self.adaptive_threshold = Some(threshold);
+    }
+
+    /// Fixes a package's selection mechanism: `Some(true)` = heavy (ladder),
+    /// `Some(false)` = light (plain virtual), `None` = adaptive (decided on
+    /// first selection).
+    pub fn set_package_mode(&mut self, package: u32, heavy: Option<bool>) {
+        self.packages[package as usize].heavy = heavy;
+    }
+
+    /// Returns whether the package uses the heavy mechanism, deciding it now
+    /// for adaptive packages by comparing the candidate count to the adaptive
+    /// threshold. Called on the package's first selection.
+    pub fn resolve_package_heavy(&mut self, package: u32) -> bool {
+        if let Some(heavy) = self.packages[package as usize].heavy {
+            return heavy;
+        }
+        let threshold = self.adaptive_threshold.unwrap_or(u32::MAX);
+        let heavy = self.packages[package as usize].members.len() as u32 >= threshold;
+        self.packages[package as usize].heavy = Some(heavy);
+        heavy
+    }
+
+    /// Returns the package's decided mechanism, or `None` if adaptive and not
+    /// yet decided. Does not decide.
+    #[inline]
+    pub fn package_heavy(&self, package: u32) -> Option<bool> {
+        self.packages[package as usize].heavy
     }
 
     /// Registers `variable_id` as the next candidate of `package` and returns
