@@ -79,6 +79,86 @@ struct ProfileRecord {
     hub_version_sets: usize,
     /// Fraction of all requires-edges in the closure that point at the hub.
     hub_concentration: f64,
+    /// Of the distinct version sets constraining the hub, the largest fraction
+    /// satisfiable by a *single* hub candidate. 1.0 means one version (e.g. one
+    /// python) satisfies every constraint — no version conflict; lower values
+    /// mean the constraints fragment across incompatible versions (divergence).
+    hub_max_coverage: f64,
+    /// Fraction of the hub's constraining version sets that do NOT admit the
+    /// most-preferred (newest) hub candidate — i.e. how often the version the
+    /// solver guesses first is excluded, the direct driver of version thrash.
+    hub_top_exclusion: f64,
+    /// 1 if some hub candidate satisfies *every* constraining version set (a
+    /// globally compatible version exists), else 0.
+    hub_globally_compatible: u8,
+    /// Number of distinct hub candidates admitted by at least one constraint
+    /// (how spread the viable-version choice is).
+    hub_live_candidates: usize,
+}
+
+/// Measures how much the version sets constraining `hub` *diverge*: whether a
+/// single hub candidate can satisfy all of them, how often the preferred
+/// candidate is excluded, and how fragmented the viable choice is. Operates on
+/// the `matching_candidates` the snapshot already stores per version set, so it
+/// needs no version-spec parsing.
+fn hub_divergence(
+    snapshot: &DependencySnapshot,
+    hub: NameId,
+    hub_version_sets: &std::collections::HashSet<VersionSetId>,
+) -> (f64, f64, u8, usize) {
+    let Some(package) = snapshot.packages.get(hub) else {
+        return (1.0, 0.0, 1, 0);
+    };
+    let total_vs = hub_version_sets.len();
+    if total_vs == 0 {
+        return (1.0, 0.0, 1, package.solvables.len());
+    }
+
+    // Most-preferred (order 0) candidate of the hub package.
+    let preferred = package
+        .solvables
+        .iter()
+        .copied()
+        .min_by_key(|&s| snapshot.solvables.get(s).map(|sv| sv.order).unwrap_or(u32::MAX));
+
+    // Per-candidate coverage: how many constraining version sets admit it.
+    let mut max_coverage = 0usize;
+    let mut live_candidates = 0usize;
+    for &candidate in &package.solvables {
+        let coverage = hub_version_sets
+            .iter()
+            .filter(|&&vs| {
+                snapshot
+                    .version_sets
+                    .get(vs)
+                    .is_some_and(|v| v.matching_candidates.contains(&candidate))
+            })
+            .count();
+        if coverage > 0 {
+            live_candidates += 1;
+        }
+        max_coverage = max_coverage.max(coverage);
+    }
+
+    let top_excluded = match preferred {
+        Some(p) => hub_version_sets
+            .iter()
+            .filter(|&&vs| {
+                snapshot
+                    .version_sets
+                    .get(vs)
+                    .is_some_and(|v| !v.matching_candidates.contains(&p))
+            })
+            .count(),
+        None => total_vs,
+    };
+
+    (
+        max_coverage as f64 / total_vs as f64,
+        top_excluded as f64 / total_vs as f64,
+        u8::from(max_coverage == total_vs),
+        live_candidates,
+    )
 }
 
 /// Walks the dependency closure of `root_names` over the snapshot graph and
@@ -203,6 +283,16 @@ fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> Prof
         0.0
     };
 
+    let empty = std::collections::HashSet::new();
+    let hub_vs_set = hub_name_id
+        .and_then(|n| vsets_per_name.get(&n))
+        .unwrap_or(&empty);
+    let (hub_max_coverage, hub_top_exclusion, hub_globally_compatible, hub_live_candidates) =
+        match hub_name_id {
+            Some(hub) => hub_divergence(snapshot, hub, hub_vs_set),
+            None => (1.0, 0.0, 1, 0),
+        };
+
     ProfileRecord {
         closure_names: closure.len(),
         closure_solvables,
@@ -212,6 +302,10 @@ fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> Prof
         hub_candidates,
         hub_version_sets,
         hub_concentration,
+        hub_max_coverage,
+        hub_top_exclusion,
+        hub_globally_compatible,
+        hub_live_candidates,
     }
 }
 
