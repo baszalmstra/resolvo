@@ -171,6 +171,16 @@ impl PackageState {
             hi_driver: None,
         }
     }
+
+    /// Whether this package currently constrains any of its members: it has a
+    /// selection, or its allowed-index interval has been narrowed. When *no*
+    /// package is active, no variable can have a derived value, so value
+    /// lookups skip the package-state indirection entirely (see
+    /// [`DecisionMap::value`]).
+    #[inline]
+    fn is_active(&self) -> bool {
+        self.selected.is_some() || self.lo != 0 || self.hi != u32::MAX
+    }
 }
 
 /// A map of the assignments to solvables.
@@ -194,11 +204,30 @@ pub(crate) struct DecisionMap {
     /// State per tracked package.
     packages: Vec<PackageState>,
 
+    /// Compact, cache-dense mirror of [`PackageState::is_active`], co-indexed
+    /// with `packages`. The `value()` slow path (taken once any package is
+    /// active) consults this 1-byte flag before touching the large
+    /// `PackageState`, so members of *inactive* packages — the bulk of the
+    /// slow-path lookups during a forward solve, where a handful of packages
+    /// are pinned but most are not — return `None` without a cache-unfriendly
+    /// struct load.
+    package_active: Vec<bool>,
+
     /// Undo records for explicit prefix assignments, pushed by
     /// [`Self::apply_prefix_assignment`] in trail order: the package and its
     /// interval state before the assignment. Restoring is O(1) per pop,
     /// keeping backjumps over many prefix entries linear.
     interval_undo: Vec<IntervalUndo>,
+
+    /// The number of packages currently *active* (with a selection or a
+    /// narrowed interval; see [`PackageState::is_active`]). While this is zero
+    /// no variable can have a derived value, so [`Self::value`] and
+    /// [`Self::level`] take a fast path that consults only the explicit
+    /// assignment and never touches `var_roles` or any package state — the
+    /// state every plain Boolean assignment is in. This keeps the propagation
+    /// hot path of the virtual encodings as cheap as the clausal ones until a
+    /// package is actually constrained.
+    active_packages: usize,
 }
 
 /// The interval state of a package before a *tightening* prefix assignment,
@@ -231,6 +260,8 @@ impl DecisionMap {
             package.hi = u32::MAX;
             package.hi_driver = None;
         }
+        self.package_active.iter_mut().for_each(|a| *a = false);
+        self.active_packages = 0;
     }
 
     #[inline]
@@ -262,6 +293,8 @@ impl DecisionMap {
     pub fn level(&self, variable_id: VariableId) -> u32 {
         match self.map.get(variable_id.to_index()) {
             Some(d) if d.value().is_some() => d.level(),
+            // Fast path: with no active package, no value can be derived.
+            _ if self.active_packages == 0 => 0,
             _ => match self.derived_value_and_level(variable_id) {
                 Some((_, level)) => level,
                 None => 0,
@@ -273,6 +306,11 @@ impl DecisionMap {
     pub fn value(&self, variable_id: VariableId) -> Option<bool> {
         match self.map.get(variable_id.to_index()).and_then(|d| d.value()) {
             Some(value) => Some(value),
+            // Fast path: while no package is active (the common case on cheap,
+            // backtracking-free solves) no variable has a derived value, so we
+            // skip the `var_roles`/package-state indirection that
+            // `derived_value_and_level` would perform on every lookup.
+            None if self.active_packages == 0 => None,
             None => self
                 .derived_value_and_level(variable_id)
                 .map(|(value, _)| value),
@@ -291,6 +329,15 @@ impl DecisionMap {
     pub fn derived_value_and_level(&self, variable_id: VariableId) -> Option<(bool, u32)> {
         match self.var_role(variable_id) {
             PackageVar::None => None,
+            // Members and prefixes of an inactive package have no derived
+            // value. The compact `package_active` flag answers that without
+            // pulling the large `PackageState` into cache — the common case
+            // during a forward solve, where most packages are not yet pinned.
+            PackageVar::Member { package, .. } | PackageVar::Prefix { package, .. }
+                if !self.package_active[package as usize] =>
+            {
+                None
+            }
             PackageVar::Member { package, index } => {
                 let state = &self.packages[package as usize];
                 if let Some((selected, _, level)) = state.selected {
@@ -349,7 +396,24 @@ impl DecisionMap {
     pub fn alloc_package(&mut self) -> u32 {
         let index = self.packages.len() as u32;
         self.packages.push(PackageState::new());
+        self.package_active.push(false);
         index
+    }
+
+    /// Synchronizes the `active_packages` count and the compact
+    /// `package_active` flag of `package` after its [`PackageState`] was
+    /// mutated, given whether it was active *before* the mutation.
+    #[inline]
+    fn sync_active(&mut self, package: u32, was_active: bool) {
+        let is_active = self.packages[package as usize].is_active();
+        if is_active != was_active {
+            self.package_active[package as usize] = is_active;
+            if is_active {
+                self.active_packages += 1;
+            } else {
+                self.active_packages -= 1;
+            }
+        }
     }
 
     /// Registers `variable_id` as the next candidate of `package` and returns
@@ -425,12 +489,18 @@ impl DecisionMap {
     }
 
     pub fn set_selection(&mut self, package: u32, variable_id: VariableId, index: u32, level: u32) {
-        debug_assert!(self.packages[package as usize].selected.is_none());
-        self.packages[package as usize].selected = Some((variable_id, index, level));
+        let state = &mut self.packages[package as usize];
+        debug_assert!(state.selected.is_none());
+        let was_active = state.is_active();
+        state.selected = Some((variable_id, index, level));
+        self.sync_active(package, was_active);
     }
 
     pub fn clear_selection(&mut self, package: u32) {
-        self.packages[package as usize].selected = None;
+        let state = &mut self.packages[package as usize];
+        let was_active = state.is_active();
+        state.selected = None;
+        self.sync_active(package, was_active);
     }
 
     /// Updates the allowed-index interval of a package for an explicit prefix
@@ -455,6 +525,7 @@ impl DecisionMap {
         if !tightens {
             return;
         }
+        let was_active = state.is_active();
         self.interval_undo.push(IntervalUndo {
             trail_index,
             package,
@@ -472,6 +543,8 @@ impl DecisionMap {
             state.lo = index + 1;
             state.lo_driver = Some((variable_id, level));
         }
+        // A tightening assignment always leaves the package active.
+        self.sync_active(package, was_active);
     }
 
     /// Restores the interval state saved before the most recent prefix
@@ -488,10 +561,12 @@ impl DecisionMap {
         let undo = self.interval_undo.pop().expect("checked above");
         debug_assert_eq!(undo.package, package);
         let state = &mut self.packages[package as usize];
+        let was_active = state.is_active();
         state.lo = undo.lo;
         state.lo_driver = undo.lo_driver;
         state.hi = undo.hi;
         state.hi_driver = undo.hi_driver;
+        self.sync_active(package, was_active);
     }
 
     /// The number of registered candidates of `package`.
