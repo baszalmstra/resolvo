@@ -1790,9 +1790,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         if let Some(best_key) = cursor.filter(|_| best_decision.is_some()) {
             let mut hot_cursor = best_key;
             loop {
-                let best = best_decision.as_ref().expect("set in phase 1");
-                if best.candidate_count <= 1 || best.package_activity >= state.max_activity {
-                    break;
+                // Stop once nothing can beat the best: a replacement needs
+                // strictly fewer candidates (so a count of one is unbeatable)
+                // and, with standard activity parameters, strictly higher
+                // activity (so the global maximum is unbeatable).
+                {
+                    let best = best_decision.as_ref().expect("set in phase 1");
+                    if best.candidate_count <= 1 || best.package_activity >= state.max_activity {
+                        break;
+                    }
                 }
                 let Some((key, item_id)) = state.decide_queue.next_hot_after(hot_cursor) else {
                     break;
@@ -1806,19 +1812,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 if Self::decision_class(state, found.decision.0) != DecisionClass::Ordinary {
                     continue;
                 }
-                // The replacement rule (shared with the plain `next_decision`
-                // path): explicit-first, then strictly-higher activity, then
-                // strictly-fewer candidates.
-                if best.is_explicit_requirement && !found.is_explicit_requirement {
-                    continue;
-                }
-                if best.package_activity >= found.package_activity {
-                    continue;
-                }
-                if best.candidate_count <= found.candidate_count {
-                    continue;
-                }
-                best_decision = Some(found);
+                // Apply the shared replacement rule (explicit-first, then
+                // strictly-higher activity, then strictly-fewer candidates) —
+                // the same `consider` used to fold the deferral-class slots.
+                consider(&mut best_decision, found);
             }
         }
 

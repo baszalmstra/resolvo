@@ -700,6 +700,21 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ///
     /// See the module documentation and the universal-solve design document
     /// for the underlying algorithm.
+    ///
+    /// # Reproducibility
+    ///
+    /// The enumerated partition is a deterministic function of the problem
+    /// *and* of the order in which the encoder registers requires clauses:
+    /// that order is the `decide()` scan order, so it shapes which cell is
+    /// found first and hence the exact partition. Registration order is stable
+    /// under the default synchronous runtime (`NowOrNeverRuntime`, where
+    /// encoder futures resolve in submission order) and under the eager
+    /// conditional encoding that universal solving forces (see
+    /// [`SolverState::universal_mode`]). A runtime that resolves the provider's
+    /// futures in a nondeterministic order would make the registration order,
+    /// and therefore the cell partition, nondeterministic; for reproducible
+    /// solutions (e.g. lockfiles) drive `solve_universal` with a deterministic
+    /// runtime.
     #[allow(clippy::type_complexity)]
     pub fn solve_universal(
         &mut self,

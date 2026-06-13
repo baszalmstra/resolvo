@@ -39,9 +39,6 @@ use crate::{
 /// seconds in debug builds.
 const SEED_COUNT: u64 = 1000;
 
-/// Maximum number of accepted environment samples checked per solved seed.
-const MAX_SAMPLES_PER_SEED: usize = 20;
-
 /// Number of sampling attempts per seed; attempts whose sample does not
 /// satisfy the environment model are discarded.
 const SAMPLE_ATTEMPTS: usize = 200;
@@ -645,6 +642,32 @@ fn sample_env(rng: &mut Rng, universe: &Universe) -> EnvSample {
         .collect()
 }
 
+/// Every concrete environment the universe's packages can take: each package
+/// ranges over `0..ENV_VALUE_SPACE` plus, if it can be absent, `None`. With
+/// `env_count <= 3` this is at most `12^3 = 1728` environments, so callers can
+/// enumerate the whole space and verify coverage/disjointness directly rather
+/// than by sampling.
+fn enumerate_envs(universe: &Universe) -> Vec<EnvSample> {
+    let mut envs: Vec<EnvSample> = vec![Vec::new()];
+    for env_pkg in &universe.env_packages {
+        let mut next = Vec::with_capacity(envs.len() * (ENV_VALUE_SPACE as usize + 1));
+        for partial in &envs {
+            for value in 0..ENV_VALUE_SPACE {
+                let mut extended = partial.clone();
+                extended.push(Some(value));
+                next.push(extended);
+            }
+            if env_pkg.can_be_absent {
+                let mut extended = partial.clone();
+                extended.push(None);
+                next.push(extended);
+            }
+        }
+        envs = next;
+    }
+    envs
+}
+
 // ===========================================================================
 // The property test itself.
 // ===========================================================================
@@ -655,6 +678,7 @@ struct Stats {
     unsolvable: usize,
     samples_checked: usize,
     unsolvable_samples_checked: usize,
+    unsolvable_nonvacuous: usize,
     cells_total: usize,
     reseeded_identical: usize,
     fixed_point_identical: usize,
@@ -703,17 +727,16 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             let merged = solution.merged();
             let edges = solution.edges();
 
-            // (b) Sample concrete environments from the model.
-            let mut accepted = 0;
-            for _ in 0..SAMPLE_ATTEMPTS {
-                if accepted >= MAX_SAMPLES_PER_SEED {
-                    break;
-                }
-                let env = sample_env(&mut rng, &universe);
+            // (b) Exhaustively check every concrete environment the model
+            // admits. The modeled space is tiny (at most ~12^3), so this
+            // verifies coverage (every modeled environment matches a cell) and
+            // pairwise disjointness (it matches exactly one) directly, with an
+            // oracle fully independent of `solution.verify()` (which shares the
+            // witness engine and relation oracle with the solver).
+            for env in enumerate_envs(&universe) {
                 if !model_satisfied(&universe, &env) {
                     continue;
                 }
-                accepted += 1;
                 stats.samples_checked += 1;
 
                 // Exactly one cell must match, counted manually.
@@ -962,22 +985,22 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             stats.unsolvable += 1;
             let provider = solver.provider();
 
-            // Sample environments inside (model AND witness cell) and prove
-            // by brute force that no valid solution exists there. If the
-            // region is vacuous (an artifact of Unknown oracle answers) no
-            // sample is found, which proves nothing and is fine.
-            let mut accepted = 0;
-            for _ in 0..SAMPLE_ATTEMPTS {
-                if accepted >= 5 {
-                    break;
-                }
-                let env = sample_env(&mut rng, &universe);
+            // Exhaustively enumerate (model AND witness cell) and prove by
+            // brute force that no valid solution exists at any point. A
+            // vacuous region (an artifact of Unknown oracle answers) yields no
+            // points, which proves nothing; those are counted separately so
+            // the suite-level assertion can require that the bulk of
+            // unsolvable verdicts were checked against a non-empty region
+            // (otherwise a spurious "unsolvable" on a region the sampler never
+            // hit would go undetected).
+            let mut region_points = 0;
+            for env in enumerate_envs(&universe) {
                 if !model_satisfied(&universe, &env)
                     || !cell_condition_holds(provider, &env_name_ids, &cell, &env)
                 {
                     continue;
                 }
-                accepted += 1;
+                region_points += 1;
                 stats.unsolvable_samples_checked += 1;
                 assert!(
                     no_valid_solution_exists(&universe, &env),
@@ -985,6 +1008,9 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                      has a valid solution",
                     cell.display(provider),
                 );
+            }
+            if region_points > 0 {
+                stats.unsolvable_nonvacuous += 1;
             }
         }
         Err(UniversalFailure::Cancelled(_)) => {
@@ -1022,6 +1048,17 @@ fn test_universal_solve_property() {
     assert!(
         stats.samples_checked > 0,
         "at least some environment samples must have been checked"
+    );
+    // Most unsolvable verdicts must be checked against a non-empty
+    // (model AND witness) region; otherwise the brute-force soundness check
+    // proves nothing for them. A purely vacuous witness is legitimate (an
+    // artifact of Unknown oracle answers), but if the bulk of unsolvable
+    // verdicts were vacuous the unsolvable path would be hollow.
+    assert!(
+        stats.unsolvable_nonvacuous * 2 >= stats.unsolvable,
+        "most unsolvable verdicts should be brute-forced against a non-empty region (got {}/{})",
+        stats.unsolvable_nonvacuous,
+        stats.unsolvable,
     );
     // Regression floor for the stabilizing effect of seeding. The generator
     // is deliberately conflict-heavy, so a sizable share of partitions heals
