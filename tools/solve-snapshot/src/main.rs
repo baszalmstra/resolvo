@@ -16,7 +16,8 @@ use rand::{
     rngs::StdRng,
 };
 use resolvo::{
-    ConditionalRequirement, Problem, Solver, UnsolvableOrCancelled, snapshot::DependencySnapshot,
+    ConditionalRequirement, Dependencies, NameId, Problem, Requirement, Solver,
+    UnsolvableOrCancelled, VersionSetId, snapshot::DependencySnapshot,
 };
 
 #[derive(Parser)]
@@ -47,6 +48,171 @@ struct Opts {
     /// Enable tracing output (set RUST_LOG for verbosity, e.g. RUST_LOG=info)
     #[clap(long)]
     tracing: bool,
+
+    /// Static hub-profiling mode: instead of solving, compute each problem's
+    /// dependency closure and rank package names by in-degree (how many
+    /// requires-edges in the closure point at them). Writes `profile.csv`.
+    /// Uses the identical RNG sequence as a normal run, so row `i` lines up
+    /// with row `i` of a `timings.csv` from the same `--seed`, letting the two
+    /// be joined to correlate hub structure with solve time. Does not solve.
+    #[clap(long)]
+    profile: bool,
+}
+
+/// Per-problem static hub profile (see [`Opts::profile`]).
+#[derive(Debug, serde::Serialize)]
+struct ProfileRecord {
+    /// Number of distinct package names reachable from the root requirements.
+    closure_names: usize,
+    /// Total solvables across those names (≈ the "records" of a solve).
+    closure_solvables: usize,
+    /// Total requires-edges in the closure (denominator for hub concentration).
+    total_requires: usize,
+    /// The highest in-degree package name in the closure (the hub).
+    hub_name: String,
+    /// In-degree of the hub: requires-edges in the closure pointing at it.
+    hub_parent_refs: usize,
+    /// Number of candidates (solvables) the hub has.
+    hub_candidates: usize,
+    /// Distinct version sets over the hub that appear as requirements (the
+    /// number of distinct mutex constraints over the hub).
+    hub_version_sets: usize,
+    /// Fraction of all requires-edges in the closure that point at the hub.
+    hub_concentration: f64,
+}
+
+/// Walks the dependency closure of `root_names` over the snapshot graph and
+/// returns, per reachable name, its in-degree (requires-edges pointing at it)
+/// and the distinct version sets over it that appear as requirements. The
+/// traversal is by package name: once a name is reached, every one of its
+/// solvables (and their dependencies) is included, mirroring how the solver
+/// encodes a package wholesale once it becomes involved.
+fn profile_problem(snapshot: &DependencySnapshot, root_names: &[NameId]) -> ProfileRecord {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut closure: HashSet<NameId> = HashSet::new();
+    let mut queue: VecDeque<NameId> = VecDeque::new();
+    for &name in root_names {
+        if closure.insert(name) {
+            queue.push_back(name);
+        }
+    }
+
+    let mut parent_refs: HashMap<NameId, usize> = HashMap::new();
+    let mut vsets_per_name: HashMap<NameId, HashSet<VersionSetId>> = HashMap::new();
+    let mut total_requires = 0usize;
+
+    // Resolve a requirement to its target version sets, counting each as an
+    // in-edge to the referenced package name and enqueueing that name.
+    let visit_version_set =
+        |vs: VersionSetId,
+         parent_refs: &mut HashMap<NameId, usize>,
+         vsets_per_name: &mut HashMap<NameId, HashSet<VersionSetId>>,
+         closure: &mut HashSet<NameId>,
+         queue: &mut VecDeque<NameId>| {
+            let Some(version_set) = snapshot.version_sets.get(vs) else {
+                return;
+            };
+            let target = version_set.name;
+            *parent_refs.entry(target).or_default() += 1;
+            vsets_per_name.entry(target).or_default().insert(vs);
+            if closure.insert(target) {
+                queue.push_back(target);
+            }
+        };
+
+    while let Some(name) = queue.pop_front() {
+        let Some(package) = snapshot.packages.get(name) else {
+            continue;
+        };
+        for &solvable_id in &package.solvables {
+            let Some(solvable) = snapshot.solvables.get(solvable_id) else {
+                continue;
+            };
+            let Dependencies::Known(deps) = &solvable.dependencies else {
+                continue;
+            };
+            for req in &deps.requirements {
+                match req.requirement {
+                    Requirement::Single(vs) => {
+                        total_requires += 1;
+                        visit_version_set(
+                            vs,
+                            &mut parent_refs,
+                            &mut vsets_per_name,
+                            &mut closure,
+                            &mut queue,
+                        );
+                    }
+                    Requirement::Union(union_id) => {
+                        if let Some(members) = snapshot.version_set_unions.get(union_id) {
+                            for &vs in members {
+                                total_requires += 1;
+                                visit_version_set(
+                                    vs,
+                                    &mut parent_refs,
+                                    &mut vsets_per_name,
+                                    &mut closure,
+                                    &mut queue,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // `constrains` only pull a name into the closure (no install
+            // pressure), so they expand reachability but are not counted as
+            // in-degree.
+            for &vs in &deps.constrains {
+                if let Some(version_set) = snapshot.version_sets.get(vs) {
+                    if closure.insert(version_set.name) {
+                        queue.push_back(version_set.name);
+                    }
+                }
+            }
+        }
+    }
+
+    let closure_solvables = closure
+        .iter()
+        .filter_map(|&n| snapshot.packages.get(n))
+        .map(|p| p.solvables.len())
+        .sum();
+
+    let (hub_name_id, hub_parent_refs) = parent_refs
+        .iter()
+        .max_by_key(|(_, refs)| **refs)
+        .map(|(&n, &refs)| (Some(n), refs))
+        .unwrap_or((None, 0));
+
+    let hub_name = hub_name_id
+        .and_then(|n| snapshot.packages.get(n))
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
+    let hub_candidates = hub_name_id
+        .and_then(|n| snapshot.packages.get(n))
+        .map(|p| p.solvables.len())
+        .unwrap_or(0);
+    let hub_version_sets = hub_name_id
+        .and_then(|n| vsets_per_name.get(&n))
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let hub_concentration = if total_requires > 0 {
+        hub_parent_refs as f64 / total_requires as f64
+    } else {
+        0.0
+    };
+
+    ProfileRecord {
+        closure_names: closure.len(),
+        closure_solvables,
+        total_requires,
+        hub_name,
+        hub_parent_refs,
+        hub_candidates,
+        hub_version_sets,
+        hub_concentration,
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -76,6 +242,13 @@ fn main() {
         .from_path("timings.csv")
         .unwrap();
 
+    let mut profile_writer = opts.profile.then(|| {
+        WriterBuilder::new()
+            .has_headers(true)
+            .from_path("profile.csv")
+            .unwrap()
+    });
+
     // Generate a range of problems.
     let mut rng = StdRng::seed_from_u64(opts.seed);
     let requirement_dist = WeightedIndex::new([
@@ -100,6 +273,8 @@ fn main() {
 
         // Construct a problem with a random number of requirements.
         let mut requirements: Vec<ConditionalRequirement> = Vec::new();
+        // The root package names of this problem (for `--profile`).
+        let mut root_names: Vec<NameId> = Vec::new();
 
         // Determine the number of requirements to solve for.
         let num_requirements = rng.random_range(1..=10usize);
@@ -110,24 +285,44 @@ fn main() {
                     let (package, _) = snapshot.packages.iter().choose(&mut rng).unwrap();
                     let package_requirement = provider.add_package_requirement(package, "*");
                     requirements.push(package_requirement.into());
+                    root_names.push(package);
                 }
                 1 => {
                     // Add a version set requirement
-                    let (version_set_id, _) =
+                    let (version_set_id, version_set) =
                         snapshot.version_sets.iter().choose(&mut rng).unwrap();
                     requirements.push(version_set_id.into());
+                    root_names.push(version_set.name);
                 }
                 2 => {
                     // Add a version set union requirement
-                    let (version_set_union_id, _) =
+                    let (version_set_union_id, members) =
                         snapshot.version_set_unions.iter().choose(&mut rng).unwrap();
                     requirements.push(version_set_union_id.into());
+                    for &vs in members {
+                        if let Some(version_set) = snapshot.version_sets.get(vs) {
+                            root_names.push(version_set.name);
+                        }
+                    }
                 }
                 _ => unreachable!(),
             }
         }
 
         if i < opts.skip {
+            continue;
+        }
+
+        if opts.profile {
+            let profile = profile_problem(&snapshot, &root_names);
+            profile_writer
+                .as_mut()
+                .expect("profile writer")
+                .serialize(profile)
+                .unwrap();
+            if i % 50 == 0 {
+                profile_writer.as_mut().unwrap().flush().unwrap();
+            }
             continue;
         }
 
@@ -212,4 +407,7 @@ fn main() {
     }
 
     writer.flush().unwrap();
+    if let Some(mut profile_writer) = profile_writer {
+        profile_writer.flush().unwrap();
+    }
 }
