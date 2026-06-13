@@ -328,3 +328,41 @@ re-selected past a threshold (the storm signature — virtual's O(1)/selection).
 The per-package `bulk` flag needed for this already exists in the bulk
 prototype; promotion on re-selection count is the remaining piece. This is the
 motivated next step for a genuinely universal encoding.
+
+## Adaptive-by-size: a measured negative result (2026-06-13)
+
+`AmoEncoding::VirtualAdaptive { threshold }` routed each package to the light
+(plain-virtual) or heavy (ladder) mechanism by candidate count, decided on
+first selection. Measured (conda-forge seed 5, n=120, paired vs binary):
+
+| threshold | cheap band (median binary/X) | storm | V=500 |
+| --------- | ---------------------------- | ----- | ----- |
+| ladder    | 0.98× | 0.130 s | 3/3 16.5 s |
+| 16 / 64   | 0.97–0.98× (no change) | 0.129 s | 3/3 44.5 s |
+| 256       | 0.96× (worse) | — | — |
+
+It did not improve the cheap band, for two reasons:
+
+1. **The cheap-case tax lives in the large packages, which must stay heavy.**
+   Every real conda-forge solve touches big packages (hundreds of versions);
+   those need the ladder mechanism for storm/deep-search robustness, so they
+   keep paying the per-selection boundary cost regardless of threshold. Size
+   cannot separate the cost from the need — both are concentrated in the same
+   packages. (Making the big packages light is exactly what plain `Virtual`
+   does, and it is why plain `Virtual` wins the cheap band but times out on
+   hard problems.)
+2. **Eager prefix-variable allocation taxes light packages too**, so the light
+   mechanism under adaptive is not as cheap as true plain `Virtual` — which is
+   why a high threshold (mostly-light) came out *worse* than the ladder, not
+   better.
+
+Conclusion across all four attempts (bulk-materialize, generation cache,
+adaptive-by-size, and the inactive-package value() fast path):
+virtual-ladder's ~2–9 % cheap-band overhead is the irreducible price of its
+storm and deep-search robustness. The only untried separator is *dynamic*
+promotion on conflict/re-selection (conflict-involvement, unlike size, does
+distinguish a big package touched once cheaply from the same package driving
+a storm), but that requires either mid-solve light→heavy switching or
+decoupling cheap selection-record derivation from interval-based range
+learning — a deeper redesign left for future work. `VirtualAdaptive` was
+reverted as a non-improvement.
