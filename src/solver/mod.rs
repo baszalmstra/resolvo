@@ -1,6 +1,7 @@
 use std::{any::Any, fmt::Display, ops::ControlFlow};
 
 use ahash::{HashMap, HashSet};
+use assertion_scans::AssertionScans;
 pub use cache::SolverCache;
 use clause::{Clause, Literal, WatchedLiterals};
 use conditions::{Disjunction, DisjunctionId};
@@ -29,6 +30,7 @@ use crate::{
     utils::{IndexedSet, Mapping},
 };
 
+mod assertion_scans;
 mod binary_encoding;
 mod cache;
 pub(crate) mod clause;
@@ -235,6 +237,10 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// Activity score per package.
     name_activity: <D::NameId as SolverId>::Map<f32>,
 
+    /// Incremental scan state for [`Self::negative_assertions`] and
+    /// [`Self::learnt_clause_ids`]; see [`assertion_scans`].
+    assertion_scans: AssertionScans,
+
     #[cfg(feature = "diagnostics")]
     propagation_counters: PropagationCounters,
 }
@@ -259,6 +265,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             constrains_aux_vars: Default::default(),
             decision_tracker: Default::default(),
             name_activity: Default::default(),
+            assertion_scans: Default::default(),
             #[cfg(feature = "diagnostics")]
             propagation_counters: Default::default(),
         }
@@ -1233,6 +1240,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             return Err(PropagationError::Cancelled(value));
         };
 
+        // Re-arm the assertion scans: assertions whose verifying
+        // assignment was popped since the previous round must be
+        // re-applied below.
+        let assert_floor = self.state.decision_tracker.take_assert_floor();
+        self.state.assertion_scans.sync(assert_floor);
+
         // Add decisions from assertions and learned clauses. If any of these cause a
         // conflict, we will return an error.
         self.decide_assertions(level)?;
@@ -1385,67 +1398,129 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Add decisions for negative assertions derived from other rules
     /// (assertions are clauses that consist of a single literal, and
     /// therefore do not have watches).
+    ///
+    /// Incremental: re-verifies the inspected entries only when
+    /// backtracking may have popped one of their assignments, then
+    /// applies the appended tail. See [`assertion_scans`].
     fn decide_assertions(&mut self, level: u32) -> Result<(), PropagationError> {
-        for &(solvable_id, clause_id) in &self.state.negative_assertions {
-            let value = false;
-            let decided = self
-                .state
-                .decision_tracker
-                .try_add_decision(Decision::new(solvable_id, value, clause_id), level)
-                .map_err(|_| PropagationError::Conflict(solvable_id, value, clause_id))?;
-
-            if decided {
-                tracing::trace!(
-                    "Negative assertions derived from other rules: Propagate assertion {} = {}",
-                    solvable_id.display(&self.state.variable_map, self.provider()),
-                    value
-                );
+        if self.state.assertion_scans.negative.needs_rescan() {
+            // A conflict (`?`) leaves the flag set, so the remaining
+            // entries are re-checked next round.
+            for index in 0..self.state.assertion_scans.negative.cursor() {
+                let position = self.apply_negative_assertion(index, level)?;
+                self.state.assertion_scans.negative.record(position);
             }
+            self.state.assertion_scans.negative.mark_clean();
+        }
+        while self.state.assertion_scans.negative.cursor() < self.state.negative_assertions.len() {
+            let index = self.state.assertion_scans.negative.cursor();
+            let position = self.apply_negative_assertion(index, level)?;
+            self.state.assertion_scans.negative.record(position);
+            self.state.assertion_scans.negative.advance();
         }
         Ok(())
     }
 
-    /// Add decisions derived from learnt clauses.
+    /// Apply the negative assertion at `index`. Returns the trail
+    /// position at (or above) the assignment satisfying it.
+    fn apply_negative_assertion(
+        &mut self,
+        index: usize,
+        level: u32,
+    ) -> Result<usize, PropagationError> {
+        let (solvable_id, clause_id) = self.state.negative_assertions[index];
+        let value = false;
+        let decided = self
+            .state
+            .decision_tracker
+            .try_add_decision(Decision::new(solvable_id, value, clause_id), level)
+            .map_err(|_| PropagationError::Conflict(solvable_id, value, clause_id))?;
+
+        if decided {
+            tracing::trace!(
+                "Negative assertions derived from other rules: Propagate assertion {} = {}",
+                solvable_id.display(&self.state.variable_map, self.provider()),
+                value
+            );
+        }
+        // The variable is assigned (a fresh decision sits on top of the
+        // stack; an existing assignment sits at or below the top), so the
+        // stack is non-empty and `len - 1` bounds the assignment position.
+        Ok(self.state.decision_tracker.stack_len() - 1)
+    }
+
+    /// Add decisions derived from single-literal learnt clauses,
+    /// incrementally like [`Self::decide_assertions`]. Rescans walk only
+    /// the single-literal entries; multi-literal learnt clauses are
+    /// inspected once at ingest and never again (their literal lists are
+    /// immutable and watches handle them).
     fn decide_learned(&mut self, level: u32) -> Result<(), PropagationError> {
-        // Assertions derived from learnt rules
-        for learn_clause_idx in 0..self.state.learnt_clause_ids.len() {
-            let clause_id = self.state.learnt_clause_ids[learn_clause_idx];
-            let clause = self.state.clauses.kinds[clause_id.to_index()];
-            let Clause::Learnt(learnt_index) = clause else {
-                unreachable!();
-            };
-
-            let literals = &self.state.learnt_clauses[learnt_index];
-            if literals.len() > 1 {
-                continue;
+        if self.state.assertion_scans.learnt.needs_rescan() {
+            for k in 0..self.state.assertion_scans.learnt_single.len() {
+                let index = self.state.assertion_scans.learnt_single[k] as usize;
+                let position = self
+                    .apply_learnt_assertion(index, level)?
+                    .expect("only single-literal learnt clauses are tracked");
+                self.state.assertion_scans.learnt.record(position);
             }
-
-            debug_assert!(!literals.is_empty());
-
-            let literal = literals[0];
-            let decision = literal.satisfying_value();
-
-            let decided = self
-                .state
-                .decision_tracker
-                .try_add_decision(
-                    Decision::new(literal.variable(), decision, clause_id),
-                    level,
-                )
-                .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
-
-            if decided {
-                tracing::trace!(
-                    "├─ Propagate assertion {} = {}",
-                    literal
-                        .variable()
-                        .display(&self.state.variable_map, self.provider()),
-                    decision
-                );
+            self.state.assertion_scans.learnt.mark_clean();
+        }
+        while self.state.assertion_scans.learnt.cursor() < self.state.learnt_clause_ids.len() {
+            let index = self.state.assertion_scans.learnt.cursor();
+            if let Some(position) = self.apply_learnt_assertion(index, level)? {
+                self.state.assertion_scans.learnt.record(position);
+                self.state.assertion_scans.learnt_single.push(index as u32);
             }
+            self.state.assertion_scans.learnt.advance();
         }
 
         Ok(())
+    }
+
+    /// Apply the single-literal learnt clause at `index` of
+    /// `learnt_clause_ids`. Returns the trail position at (or above) the
+    /// satisfying assignment, or `None` for a multi-literal clause.
+    fn apply_learnt_assertion(
+        &mut self,
+        index: usize,
+        level: u32,
+    ) -> Result<Option<usize>, PropagationError> {
+        let clause_id = self.state.learnt_clause_ids[index];
+        let clause = self.state.clauses.kinds[clause_id.to_index()];
+        let Clause::Learnt(learnt_index) = clause else {
+            unreachable!();
+        };
+
+        let literals = &self.state.learnt_clauses[learnt_index];
+        if literals.len() > 1 {
+            return Ok(None);
+        }
+
+        debug_assert!(!literals.is_empty());
+
+        let literal = literals[0];
+        let decision = literal.satisfying_value();
+
+        let decided = self
+            .state
+            .decision_tracker
+            .try_add_decision(
+                Decision::new(literal.variable(), decision, clause_id),
+                level,
+            )
+            .map_err(|_| PropagationError::Conflict(literal.variable(), decision, clause_id))?;
+
+        if decided {
+            tracing::trace!(
+                "├─ Propagate assertion {} = {}",
+                literal
+                    .variable()
+                    .display(&self.state.variable_map, self.provider()),
+                decision
+            );
+        }
+
+        Ok(Some(self.state.decision_tracker.stack_len() - 1))
     }
 
     /// Adds the clause with `clause_id` to the current [`Conflict`]
