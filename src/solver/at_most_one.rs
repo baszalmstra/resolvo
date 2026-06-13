@@ -199,6 +199,11 @@ pub(crate) struct AtMostOnceTracker<V> {
     /// tracked variables themselves, level `k + 1` groups the commander
     /// variables of level `k`.
     commander_levels: Vec<CommanderLevel<V>>,
+    /// Reusable work stack for the commander encoding's level-up propagation.
+    /// Held on the tracker (which lives across every `add`) so the hot path
+    /// does not allocate a fresh `Vec` per call. It is always empty between
+    /// calls; only its capacity is retained.
+    commander_work: Vec<(usize, V)>,
     /// The package index in the decision map's registry, for the virtual
     /// encoding.
     pub(crate) virtual_package: Option<u32>,
@@ -238,6 +243,7 @@ impl<V> Default for AtMostOnceTracker<V> {
             variables: IndexSet::default(),
             helpers: Vec::new(),
             commander_levels: Vec::new(),
+            commander_work: Vec::new(),
             virtual_package: None,
         }
     }
@@ -409,8 +415,12 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
         self.variables.insert(variable.clone());
 
         // Insert the variable at level 0. Closing or opening a group produces
-        // commander variables that have to be inserted one level up.
-        let mut work = vec![(0usize, variable)];
+        // commander variables that have to be inserted one level up. The work
+        // stack is owned by the tracker and reused across calls; swap it out so
+        // the loop body can still borrow `self` freely.
+        let mut work = std::mem::take(&mut self.commander_work);
+        debug_assert!(work.is_empty());
+        work.push((0usize, variable));
         while let Some((level_idx, var)) = work.pop() {
             if self.commander_levels.len() <= level_idx {
                 self.commander_levels.push(CommanderLevel::default());
@@ -463,6 +473,10 @@ impl<V: Hash + Eq + Clone> AtMostOnceTracker<V> {
                 }
             }
         }
+
+        // Return the (now empty) work stack to the tracker so its capacity is
+        // reused on the next call.
+        self.commander_work = work;
 
         true
     }
