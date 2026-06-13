@@ -32,3 +32,6 @@ timings_*
 
 # Claude Code harness state (agent worktrees, local session data)
 .claude/
+
+# insta pending-snapshot artifacts (never commit)
+*.snap.new
