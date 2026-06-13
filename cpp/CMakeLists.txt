@@ -4,13 +4,20 @@ cmake_minimum_required(VERSION 3.21)
 # linking
 project(Resolvo LANGUAGES C CXX)
 
-# Add the Corrosion dependency (used to build Rust code)
 include(FetchContent)
-FetchContent_Declare(
-  Corrosion
-  GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-  GIT_TAG v0.5.1)
-FetchContent_MakeAvailable(Corrosion)
+
+# Add the Corrosion dependency (used to build Rust code). Prefer a Corrosion
+# already provided by the environment (e.g. the conda-forge `corrosion` package
+# used when building the Pixi package), which keeps the build hermetic. Fall
+# back to fetching it for plain in-tree builds where it isn't installed.
+find_package(Corrosion QUIET)
+if(NOT Corrosion_FOUND)
+  FetchContent_Declare(
+    Corrosion
+    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+    GIT_TAG v0.6.1)
+  FetchContent_MakeAvailable(Corrosion)
+endif()
 
 # Extract the version from the rust crate
 corrosion_parse_package_version("${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
@@ -195,4 +202,8 @@ install(
 
 if(RESOLVO_BUILD_TESTING)
   add_subdirectory(tests)
+endif()
+
+if(RESOLVO_BUILD_EXAMPLES)
+  add_subdirectory(examples)
 endif()
