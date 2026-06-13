@@ -284,3 +284,47 @@ package members; and every consumer of `Clause::Requires` literals —
 an interval-aware path that maps prefix literals back to version-set ranges.
 This is a larger-surface change than the virtual encoding itself and should
 be attempted as its own project.
+
+## Materialization vs derivation: the measured tradeoff (2026-06-13)
+
+Callgrind located the cheap-case regression precisely: `derived_value_and_level`
+(the per-lookup sibling derivation) costs +8.26 B instructions on real
+conda-forge solves (9.21 B vs Binary's 0.95 B), while virtual-ladder is
+*cheaper* than Binary in propagation/run_sat (fewer clauses). Two fixes were
+prototyped and measured same-epoch (conda-forge seed 5, n=120 paired vs
+binary; storm n=1400; V=500 ×3):
+
+| approach | cheap band (median binary/X) | storm n=1400 | V=500 |
+| --- | --- | --- | --- |
+| virtual-ladder (current) | 0.98× (slightly slower) | 0.14 s (1.6× vs bin) | 3/3, 16 s |
+| **bulk-materialize siblings** | **1.05× (faster!)** | 0.26 s + ~1 M clauses (slower than bin) | **0/3 (timeout)** |
+| generation-cached derivation | 0.99–1.02× (neutral) | — | — |
+
+Findings:
+
+- **Bulk-materialization confirms the cheap-case win is real**: writing the
+  sibling falsifications as trail entries at selection removes the per-lookup
+  derivation and makes the *median* cheap problem ~5 % faster than Binary
+  (vs virtual-ladder's ~2 % slower). It also matches Binary's solutions
+  exactly (0 divergences). BUT it reintroduces O(n) work per selection, which
+  is catastrophic where virtual was the whole point: it is slower than Binary
+  on the storm (and balloons to ~1 M memoized pairwise reason clauses) and
+  solves 0/3 V=500 instances. It is a trivial-solve specialist that sacrifices
+  exactly the uv/backtracking regime.
+- **The generation cache is a dud**: 82–89 % hit rates, but each hit's
+  `Cell` load + generation compare costs about as much as the derivation it
+  replaces, so wall-clock is net-neutral to slightly negative. High hit rate
+  did not convert to speed.
+- **There is no free lunch in a single static encoding.** The at-most-one
+  cost is paid either per-lookup (derive: taxes cheap solves, wins storms and
+  hard search) or per-selection (materialize/binary: wins cheap solves, taxes
+  storms and hard search). The two prototypes sit at opposite ends; neither
+  dominates.
+
+The only way to win both ends is **per-package adaptivity**: materialize
+siblings for packages selected rarely (the common case — cheap-solve speed of
+Binary/bulk), and switch a package to virtual derivation once it is
+re-selected past a threshold (the storm signature — virtual's O(1)/selection).
+The per-package `bulk` flag needed for this already exists in the bulk
+prototype; promotion on re-selection count is the remaining piece. This is the
+motivated next step for a genuinely universal encoding.
