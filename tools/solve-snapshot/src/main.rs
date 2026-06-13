@@ -16,7 +16,8 @@ use rand::{
     rngs::StdRng,
 };
 use resolvo::{
-    ConditionalRequirement, Problem, Solver, UnsolvableOrCancelled, snapshot::DependencySnapshot,
+    ConditionalRequirement, Interner, Problem, Solver, UnsolvableOrCancelled,
+    snapshot::DependencySnapshot,
 };
 
 #[derive(Parser)]
@@ -53,6 +54,9 @@ struct Record {
     duration: f64,
     error: Option<String>,
     records: Option<usize>,
+    /// The selected solvables, sorted and joined, so exact solutions can be
+    /// compared across encodings (not just their size).
+    solution: Option<String>,
 }
 
 fn main() {
@@ -156,6 +160,7 @@ fn main() {
         }
         let mut records = None;
         let mut error = None;
+        let mut solution_str = None;
         let result = solver.solve(problem);
         let duration = start.elapsed();
         match result {
@@ -169,7 +174,13 @@ fn main() {
                     ))
                     .green()
                 );
-                records = Some(solution.len())
+                records = Some(solution.len());
+                let mut displayed = solution
+                    .iter()
+                    .map(|&s| solver.provider().display_solvable(s).to_string())
+                    .collect::<Vec<_>>();
+                displayed.sort();
+                solution_str = Some(displayed.join("|"));
             }
             Err(UnsolvableOrCancelled::Unsolvable(problem)) => {
                 eprintln!(
@@ -200,6 +211,7 @@ fn main() {
                 duration: duration.as_secs_f64(),
                 error,
                 records,
+                solution: solution_str,
             })
             .unwrap();
 
