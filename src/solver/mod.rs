@@ -195,6 +195,14 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// the activity scores of each package are multiplied when a conflict is
     /// detected.
     activity_decay: f32,
+
+    /// In-degree decision seed, copied into the fresh state on each
+    /// [`Self::solve`]. See [`Self::with_indegree_seed`]. Held here (not in the
+    /// state) because `solve` re-initializes the state.
+    indegree_seed: f32,
+
+    /// Hot threshold paired with [`Self::indegree_seed`].
+    indegree_hot_threshold: f32,
 }
 
 pub(crate) struct SolverState<D: DependencyProvider> {
@@ -238,6 +246,19 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// when no remaining item can have a strictly higher activity.
     max_activity: f32,
 
+    /// Activity added to a package's score each time a requires clause that
+    /// references it is encoded (its in-degree). Seeds the decision heuristic so
+    /// heavily-required hub packages (e.g. `python`) are decided near the root
+    /// instead of after conflicts surface them. `0.0` disables it, leaving the
+    /// pure conflict-driven activity. See [`Solver::with_indegree_seed`].
+    indegree_seed: f32,
+
+    /// Once a package's seeded activity reaches this, it is marked hot so the
+    /// decision queue will actually consider it (replacements are drawn from the
+    /// hot queue only). Keeps the hot set to the genuine hubs rather than every
+    /// referenced name. Ignored when [`Self::indegree_seed`] is `0.0`.
+    indegree_hot_threshold: f32,
+
     /// Incremental work queue that tracks which requires clauses are eligible
     /// for the next decision. See [`decide_queue`].
     decide_queue: decide_queue::DecideQueue<D>,
@@ -280,6 +301,8 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             decision_tracker: Default::default(),
             name_activity: Default::default(),
             max_activity: 0.0,
+            indegree_seed: 0.0,
+            indegree_hot_threshold: f32::INFINITY,
             decide_queue: Default::default(),
             deferred_requirements: Default::default(),
             #[cfg(feature = "diagnostics")]
@@ -354,6 +377,8 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             state: SolverState::default(),
             activity_add: 1.0,
             activity_decay: 0.95,
+            indegree_seed: 0.0,
+            indegree_hot_threshold: f32::INFINITY,
         }
     }
 }
@@ -440,6 +465,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             state: self.state,
             activity_decay: self.activity_decay,
             activity_add: self.activity_add,
+            indegree_seed: self.indegree_seed,
+            indegree_hot_threshold: self.indegree_hot_threshold,
         }
     }
 
@@ -452,6 +479,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             activity_decay: decay,
             ..self
         }
+    }
+
+    /// Seed the decision heuristic by package in-degree: each time a requires
+    /// clause referencing a package is encoded, `seed` is added to that
+    /// package's activity, and once it reaches `hot_threshold` the package is
+    /// marked hot so the decision queue will consider it. This biases the solver
+    /// to decide heavily-required hub packages (e.g. `python`) near the root,
+    /// where wrong version guesses backtrack cheaply, instead of discovering
+    /// them only after conflicts. `seed == 0.0` (the default) disables it.
+    #[must_use]
+    pub fn with_indegree_seed(mut self, seed: f32, hot_threshold: f32) -> Self {
+        self.indegree_seed = seed;
+        self.indegree_hot_threshold = hot_threshold;
+        self
     }
 
     /// Solves the given [`Problem`].
@@ -488,6 +529,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ) -> Result<Vec<D::SolvableId>, UnsolvableOrCancelled> {
         // Re-initialize the solver state.
         self.state = SolverState::default();
+        self.state.indegree_seed = self.indegree_seed;
+        self.state.indegree_hot_threshold = self.indegree_hot_threshold;
 
         // The decision fold's activity-based shortcuts are only sound when
         // activities can never become negative and cold packages stay at
@@ -1624,6 +1667,35 @@ impl<D: DependencyProvider> SolverState<D> {
         clause_id: ClauseId,
         names: impl IntoIterator<Item = D::NameId>,
     ) {
+        let parent_value = self.decision_tracker.assigned_value(parent);
+        if self.indegree_seed == 0.0 {
+            self.decide_queue.register_clause(
+                parent,
+                requirement,
+                condition,
+                clause_id,
+                names,
+                &self.disjunctions,
+                parent_value,
+            );
+            return;
+        }
+
+        // In-degree seeding: bump the activity of every referenced package and
+        // mark it hot once it crosses the threshold, so hub packages rise in the
+        // decision queue as their referrers are encoded. Done before
+        // `register_clause` so the clause being registered inherits the hotness.
+        let names: Vec<D::NameId> = names.into_iter().collect();
+        for &name in &names {
+            let activity = self.name_activity.get(name) + self.indegree_seed;
+            self.name_activity.set(name, activity);
+            if activity > self.max_activity {
+                self.max_activity = activity;
+            }
+            if activity >= self.indegree_hot_threshold {
+                self.decide_queue.mark_name_hot(name);
+            }
+        }
         self.decide_queue.register_clause(
             parent,
             requirement,
@@ -1631,7 +1703,7 @@ impl<D: DependencyProvider> SolverState<D> {
             clause_id,
             names,
             &self.disjunctions,
-            self.decision_tracker.assigned_value(parent),
+            parent_value,
         );
     }
 

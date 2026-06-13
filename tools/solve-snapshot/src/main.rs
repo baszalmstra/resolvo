@@ -50,6 +50,16 @@ struct Opts {
     #[clap(long)]
     tracing: bool,
 
+    /// In-degree decision seeding: activity added to a package each time a
+    /// requires clause referencing it is encoded. 0 disables (default).
+    #[clap(long, default_value = "0")]
+    indegree_seed: f32,
+
+    /// Activity at which an in-degree-seeded package is marked hot (only used
+    /// when `--indegree-seed` is non-zero).
+    #[clap(long, default_value = "16")]
+    indegree_hot_threshold: f32,
+
     /// Pin-bisect mode: causally localize what makes one problem slow. Solves
     /// the selected problem (use `--skip K -n K+1` to pick problem K), then
     /// re-solves it repeatedly with one package at a time pinned to the version
@@ -712,6 +722,9 @@ fn main() {
 
         let problem = Problem::default().requirements(requirements);
         let mut solver = Solver::new(provider);
+        if opts.indegree_seed != 0.0 {
+            solver = solver.with_indegree_seed(opts.indegree_seed, opts.indegree_hot_threshold);
+        }
         let mut records = None;
         let mut error = None;
         let result = solver.solve(problem);
