@@ -60,6 +60,11 @@ struct Opts {
     #[clap(long, default_value = "16")]
     indegree_hot_threshold: f32,
 
+    /// Print the solution (sorted solvable display strings) to stdout. Use with
+    /// `--skip K -n K+1` to dump one problem's solution for comparison.
+    #[clap(long)]
+    dump_solution: bool,
+
     /// Pin-bisect mode: causally localize what makes one problem slow. Solves
     /// the selected problem (use `--skip K -n K+1` to pick problem K), then
     /// re-solves it repeatedly with one package at a time pinned to the version
@@ -740,6 +745,17 @@ fn main() {
                     ))
                     .green()
                 );
+                if opts.dump_solution {
+                    use resolvo::Interner;
+                    let mut lines: Vec<String> = solution
+                        .iter()
+                        .map(|&s| solver.provider().display_solvable(s).to_string())
+                        .collect();
+                    lines.sort();
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
                 records = Some(solution.len())
             }
             Err(UnsolvableOrCancelled::Unsolvable(problem)) => {
