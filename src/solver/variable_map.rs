@@ -1,5 +1,7 @@
 use std::fmt::Display;
 
+use ahash::HashMap;
+
 use crate::{
     DenseIndex, Interner, VariableId, VersionSetId,
     internal::solver_id::SolvableIdOrRoot,
@@ -22,6 +24,19 @@ pub(crate) struct VariableMap<N: SolverId, S: SolverId> {
     /// Invariant: every allocated variable has its slot pushed in the same step
     /// it is handed out. Do not insert gaps; [`Self::origin`] indexes directly.
     origins: Vec<VariableOrigin<N, S>>,
+
+    /// Maps a version set (on an environment package) to the variable that
+    /// represents the "matches" literal `L_S` for that version set.
+    env_matches_to_variable: HashMap<VersionSetId, VariableId>,
+
+    /// Per-package list of all version sets for which a matches literal has
+    /// been interned. Used to find sibling literals when computing oracle
+    /// consistency clauses.
+    env_matches_by_name: HashMap<N, Vec<VersionSetId>>,
+
+    /// Maps an environment package name to the variable that represents the
+    /// "absent" literal `Ab_p` for that package.
+    env_absent_to_variable: HashMap<N, VariableId>,
 }
 
 /// Describes the origin of a variable.
@@ -43,6 +58,14 @@ pub(crate) enum VariableOrigin<N, S> {
     /// A variable that indicates that a candidate excluded by a constraint's
     /// version set is installed.
     ConstrainsViolation(VersionSetId),
+
+    /// A variable that represents the environment literal `L_S`: the
+    /// environment package is present and its value matches version set `S`.
+    EnvMatches(VersionSetId),
+
+    /// A variable that represents the absent literal `Ab_p`: the environment
+    /// package with name `N` is absent from the environment.
+    EnvAbsent(N),
 }
 
 impl<N: SolverId, S: SolverId> Default for VariableMap<N, S> {
@@ -51,6 +74,9 @@ impl<N: SolverId, S: SolverId> Default for VariableMap<N, S> {
             solvable_to_variable: Default::default(),
             // Index 0 is reserved for the root variable.
             origins: vec![VariableOrigin::Root],
+            env_matches_to_variable: HashMap::default(),
+            env_matches_by_name: HashMap::default(),
+            env_absent_to_variable: HashMap::default(),
         }
     }
 }
@@ -127,6 +153,80 @@ impl<N: SolverId, S: SolverId> VariableMap<N, S> {
         self.alloc(VariableOrigin::ConstrainsViolation(version_set))
     }
 
+    /// Intern the "matches" literal `L_S` for a version set on an environment
+    /// package. If this is a new version set, returns the newly allocated
+    /// variable plus:
+    ///   - the previously interned version sets for the same package (to be
+    ///     used by the caller to emit oracle consistency clauses), and
+    ///   - the absent variable for the same package, if it was already interned.
+    ///
+    /// On a repeat call (same version set id) the existing variable is returned
+    /// and both secondary outputs are empty / None.
+    pub fn intern_env_matches(
+        &mut self,
+        version_set_id: VersionSetId,
+        package_name: N,
+    ) -> (VariableId, Vec<VersionSetId>, Option<VariableId>) {
+        if let Some(&var) = self.env_matches_to_variable.get(&version_set_id) {
+            return (var, Vec::new(), None);
+        }
+
+        // Snapshot siblings before mutating.
+        let previously_for_pkg: Vec<VersionSetId> = self
+            .env_matches_by_name
+            .get(&package_name)
+            .cloned()
+            .unwrap_or_default();
+        let absent_var: Option<VariableId> =
+            self.env_absent_to_variable.get(&package_name).copied();
+
+        let var = self.alloc(VariableOrigin::EnvMatches(version_set_id));
+        self.env_matches_to_variable.insert(version_set_id, var);
+        self.env_matches_by_name
+            .entry(package_name)
+            .or_default()
+            .push(version_set_id);
+
+        (var, previously_for_pkg, absent_var)
+    }
+
+    /// Intern the "absent" literal `Ab_p` for an environment package.
+    ///
+    /// Returns `(variable, is_new, previously_interned_version_sets_for_pkg)`.
+    /// If the variable already exists `is_new` is false and the third field
+    /// is empty.
+    pub fn intern_env_absent(&mut self, package_name: N) -> (VariableId, bool, Vec<VersionSetId>) {
+        if let Some(&var) = self.env_absent_to_variable.get(&package_name) {
+            return (var, false, Vec::new());
+        }
+
+        let previously_for_pkg: Vec<VersionSetId> = self
+            .env_matches_by_name
+            .get(&package_name)
+            .cloned()
+            .unwrap_or_default();
+
+        let var = self.alloc(VariableOrigin::EnvAbsent(package_name));
+        self.env_absent_to_variable.insert(package_name, var);
+
+        (var, true, previously_for_pkg)
+    }
+
+    /// Look up an already-interned "matches" literal for a version set.
+    /// Returns `None` if the literal has not been interned yet.
+    pub fn get_env_matches(&self, version_set_id: VersionSetId) -> Option<VariableId> {
+        self.env_matches_to_variable.get(&version_set_id).copied()
+    }
+
+    /// Look up an already-interned "absent" literal for a package name.
+    /// Returns `None` if the literal has not been interned yet.
+    // Only used from unit tests today; the M2 cell extraction will use it
+    // from non-test code, at which point this allow can be dropped.
+    #[allow(dead_code)]
+    pub fn get_env_absent(&self, package_name: N) -> Option<VariableId> {
+        self.env_absent_to_variable.get(&package_name).copied()
+    }
+
     /// Returns the origin of a variable. The origin describes the semantics of
     /// a variable.
     #[inline]
@@ -194,6 +294,16 @@ impl<I: Interner> Display for VariableDisplay<'_, I> {
                         .display_name(self.interner.version_set_name(version_set)),
                     self.interner.display_version_set(version_set)
                 )
+            }
+            VariableOrigin::EnvMatches(version_set_id) => {
+                write!(
+                    f,
+                    "env-matches({})",
+                    self.interner.display_version_set(version_set_id)
+                )
+            }
+            VariableOrigin::EnvAbsent(name) => {
+                write!(f, "env-absent({})", self.interner.display_name(name))
             }
         }
     }

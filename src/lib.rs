@@ -7,6 +7,24 @@
 //! libsolv is, however, very low level C, so if you are looking for an
 //! introduction to CDCL, you are encouraged to look at the paper instead or to
 //! keep reading through this codebase and its comments.
+//!
+//! # Universal solving
+//!
+//! Besides classic single-environment resolution ([`Solver::solve`]), resolvo
+//! supports *universal* multi-environment resolution via
+//! [`Solver::solve_universal`]: a single solve whose result is valid for a
+//! whole family of environments (for example all glibc versions in a range,
+//! or machines with and without CUDA). Properties of the target environment
+//! are modeled as *environment packages*: packages whose value is unknown at
+//! solve time, declared by returning [`PackageCandidates::Environment`] from
+//! [`DependencyProvider::get_candidates`] and related through the
+//! [`DependencyProvider::environment_version_set_relation`] oracle. A
+//! [`UniversalProblem`] bounds the environment space with an explicit
+//! [`EnvironmentModel`]; the solver partitions that space into disjoint
+//! cells, each paired with the solvables valid throughout the cell, returned
+//! as a [`UniversalSolution`] (or a [`UniversalFailure`] carrying a conflict
+//! scoped to the unsolvable region). See the `solver::universal` module
+//! documentation in the source for a worked end-to-end example.
 
 #![deny(missing_docs)]
 #![deny(unnameable_types)]
@@ -34,9 +52,205 @@ pub use id::{
 };
 use itertools::Itertools;
 pub use requirement::Requirement;
-pub use solver::{EmptySolvables, Problem, Solver, SolverCache, UnsolvableOrCancelled};
+#[cfg(feature = "diagnostics")]
+pub use solver::CellPinCounts;
+pub use solver::{
+    CellEdge, EmptySolvables, EnvironmentModel, Problem, Solver, SolverCache, UniversalFailure,
+    UniversalProblem, UniversalSolution, UnsolvableOrCancelled, Violation,
+};
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
+
+/// The relation between two version sets that refer to the same environment
+/// package.
+///
+/// Soundness contract: answers other than `Unknown` must be correct. When in
+/// doubt return `Unknown`. A wrong `Disjoint` or `Subset` produces broken
+/// lockfiles; `Unknown` merely risks describing environment regions no real
+/// machine has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum VersionSetRelation {
+    /// No value matches both version sets.
+    Disjoint,
+    /// Every value matching `a` also matches `b`.
+    Subset,
+    /// Every value matching `b` also matches `a`.
+    Superset,
+    /// `a` and `b` match exactly the same values.
+    Equal,
+    /// Overlapping, or the relation cannot be determined.
+    Unknown,
+}
+
+/// Describes an environment package: a package whose value is unknown at solve
+/// time. Returned by [`DependencyProvider::get_candidates`] via
+/// [`PackageCandidates::Environment`].
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EnvironmentPackage {
+    /// Whether the environment may lack this package entirely. Controls
+    /// creation of the absent literal.
+    pub can_be_absent: bool,
+}
+
+/// The return type of [`DependencyProvider::get_candidates`].
+///
+/// A package is either a normal package with concrete candidate solvables, or
+/// an environment package whose value is unknown at solve time.
+#[derive(Clone, Debug)]
+pub enum PackageCandidates<S = SolvableId> {
+    /// A normal package with concrete candidate solvables.
+    Candidates(Candidates<S>),
+    /// An environment package whose value is unknown at solve time.
+    Environment(EnvironmentPackage),
+}
+
+impl<S> From<Candidates<S>> for PackageCandidates<S> {
+    fn from(candidates: Candidates<S>) -> Self {
+        PackageCandidates::Candidates(candidates)
+    }
+}
+
+/// A signed environment literal: a reference to a version set (or the absent
+/// sentinel) for a specific environment package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvLiteral<N> {
+    /// The environment package this literal refers to.
+    pub package: N,
+    /// Whether this literal is a version-set match or the absent sentinel.
+    pub kind: EnvLiteralKind,
+}
+
+/// The kind of an [`EnvLiteral`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvLiteralKind {
+    /// The environment's value for this package exists and matches the given
+    /// version set.
+    Matches(VersionSetId),
+    /// The package is absent from the environment.
+    Absent,
+}
+
+/// A conjunction of signed environment literals.
+///
+/// An empty conjunction means "all environments".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellCondition<N>(pub Vec<(EnvLiteral<N>, bool)>);
+
+impl<N> CellCondition<N> {
+    /// Returns an object that formats the cell condition in a human readable
+    /// way, e.g. `cuda in >=11, <100 AND not (glibc in >=228, <1000)`. The
+    /// empty conjunction is formatted as `<all environments>`.
+    pub fn display<'a, I: Interner<NameId = N>>(
+        &'a self,
+        interner: &'a I,
+    ) -> CellConditionDisplay<'a, I> {
+        CellConditionDisplay {
+            condition: self,
+            interner,
+        }
+    }
+}
+
+/// A helper struct that implements [`Display`] for a [`CellCondition`]. See
+/// [`CellCondition::display`].
+pub struct CellConditionDisplay<'a, I: Interner> {
+    condition: &'a CellCondition<I::NameId>,
+    interner: &'a I,
+}
+
+impl<I: Interner> Display for CellConditionDisplay<'_, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.condition.0.is_empty() {
+            return write!(f, "<all environments>");
+        }
+        for (idx, (literal, positive)) in self.condition.0.iter().enumerate() {
+            if idx > 0 {
+                write!(f, " AND ")?;
+            }
+            if !positive {
+                write!(f, "not (")?;
+            }
+            match literal.kind {
+                EnvLiteralKind::Matches(version_set) => write!(
+                    f,
+                    "{} in {}",
+                    self.interner.display_name(literal.package),
+                    self.interner.display_version_set(version_set)
+                )?,
+                EnvLiteralKind::Absent => {
+                    write!(f, "{} absent", self.interner.display_name(literal.package))?
+                }
+            }
+            if !positive {
+                write!(f, ")")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A presence condition: a disjunction (logical OR) of [`CellCondition`]
+/// conjunctions, i.e. a formula in disjunctive normal form over signed
+/// environment literals.
+///
+/// A presence condition holds in a concrete environment when at least one of
+/// its disjuncts holds. A disjunct that is the empty conjunction holds in
+/// every environment, making the whole presence condition always true; an
+/// empty disjunction never holds.
+///
+/// Produced by [`UniversalSolution::merged`] and [`UniversalSolution::edges`],
+/// which OR together the conditions of the cells a solvable (or edge) appears
+/// in, simplified within the bounds of the environment model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Presence<N>(pub Vec<CellCondition<N>>);
+
+impl<N> Presence<N> {
+    /// Returns an object that formats the presence condition in a human
+    /// readable way, e.g. `(cuda in >=11, <100 AND rocm in >=5, <10) OR
+    /// cuda absent`. The always-true presence is formatted as
+    /// `<all environments>` and the empty disjunction as
+    /// `<no environments>`.
+    pub fn display<'a, I: Interner<NameId = N>>(
+        &'a self,
+        interner: &'a I,
+    ) -> PresenceDisplay<'a, I> {
+        PresenceDisplay {
+            presence: self,
+            interner,
+        }
+    }
+}
+
+/// A helper struct that implements [`Display`] for a [`Presence`]. See
+/// [`Presence::display`].
+pub struct PresenceDisplay<'a, I: Interner> {
+    presence: &'a Presence<I::NameId>,
+    interner: &'a I,
+}
+
+impl<I: Interner> Display for PresenceDisplay<'_, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let disjuncts = &self.presence.0;
+        if disjuncts.is_empty() {
+            return write!(f, "<no environments>");
+        }
+        for (idx, disjunct) in disjuncts.iter().enumerate() {
+            if idx > 0 {
+                write!(f, " OR ")?;
+            }
+            // Parenthesize multi-literal conjunctions when there are
+            // multiple disjuncts, so OR/AND precedence stays unambiguous.
+            if disjuncts.len() > 1 && disjunct.0.len() > 1 {
+                write!(f, "({})", disjunct.display(self.interner))?;
+            } else {
+                write!(f, "{}", disjunct.display(self.interner))?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// An object that is used by the solver to query certain properties of
 /// different internalized objects.
@@ -137,7 +351,34 @@ pub trait DependencyProvider: Sized + Interner {
 
     /// Obtains a list of solvables that should be considered when a package
     /// with the given name is requested.
-    async fn get_candidates(&self, name: Self::NameId) -> Option<Candidates<Self::SolvableId>>;
+    ///
+    /// Return `None` to indicate that the package name is unknown.
+    /// Return `Some(PackageCandidates::Candidates(...))` for a normal package.
+    /// Return `Some(PackageCandidates::Environment(...))` to declare this name
+    /// as an environment package whose value is unknown at solve time.
+    async fn get_candidates(
+        &self,
+        name: Self::NameId,
+    ) -> Option<PackageCandidates<Self::SolvableId>>;
+
+    /// Returns the relation between two version sets that refer to the same
+    /// environment package.
+    ///
+    /// Only called for version sets whose `version_set_name` is an environment
+    /// package. The default implementation panics because providers that
+    /// declare no environment packages should never have this called.
+    ///
+    /// Soundness contract: answers other than `Unknown` must be correct; when
+    /// in doubt return `Unknown`. A wrong `Disjoint` or `Subset` answer
+    /// produces broken lockfiles; `Unknown` merely risks describing environment
+    /// regions no real machine has.
+    fn environment_version_set_relation(
+        &self,
+        _a: VersionSetId,
+        _b: VersionSetId,
+    ) -> VersionSetRelation {
+        unreachable!("provider declared no environment packages")
+    }
 
     /// Sort the specified solvables based on which solvable to try first. The
     /// solver will iteratively try to select the highest version. If a

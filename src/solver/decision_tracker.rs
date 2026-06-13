@@ -26,6 +26,16 @@ pub(crate) struct DecisionTracker {
     /// was both pushed and popped in between is in neither range; it has no
     /// net effect, so a consumer comparing snapshots never needs to see it.
     sync_floor: usize,
+
+    /// The lowest stack length observed since the last call to
+    /// [`Self::take_assert_floor`]. The assertion watermark uses this to
+    /// find which verified assertions lost their assignment to
+    /// backtracking: any assignment at a stack position at or beyond the
+    /// floor has been popped since the previous observation. Unlike
+    /// `sync_floor` this floor is armed to `usize::MAX` when taken (no
+    /// truncation happened means nothing is invalidated); the `Default`
+    /// of zero after `clear()` invalidates everything, as it must.
+    assert_floor: usize,
 }
 
 impl DecisionTracker {
@@ -69,6 +79,15 @@ impl DecisionTracker {
 
     pub(crate) fn level(&self, variable_id: VariableId) -> u32 {
         self.map.level(variable_id)
+    }
+
+    /// The decision level of the deepest decision on the stack, or 0 when no
+    /// decisions have been made.
+    pub(crate) fn deepest_level(&self) -> u32 {
+        self.stack
+            .last()
+            .map(|decision| self.map.level(decision.variable))
+            .unwrap_or(0)
     }
 
     // Find the clause that caused the assignment of the specified solvable. If no assignment has
@@ -119,6 +138,7 @@ impl DecisionTracker {
 
         self.propagate_index = self.stack.len();
         self.sync_floor = self.sync_floor.min(self.stack.len());
+        self.assert_floor = self.assert_floor.min(self.stack.len());
 
         let top_decision = self.stack.last().unwrap();
         (decision, self.map.level(top_decision.variable))
@@ -133,53 +153,95 @@ impl DecisionTracker {
         self.propagate_index += 1;
         Some(decision)
     }
+
+    /// The number of decisions on the stack.
+    pub(crate) fn stack_len(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Returns the lowest stack length observed since the previous call and
+    /// re-arms the marker to `usize::MAX`.
+    ///
+    /// Every assignment that was popped since the previous call sat at a
+    /// stack position at or beyond the returned floor (a truncation to
+    /// length `n` pops exactly the positions `>= n`), so a consumer that
+    /// remembers the position of an assignment can detect its removal by
+    /// comparing the position against the floor. When nothing was undone
+    /// the floor is `usize::MAX` and no position qualifies. A fresh or
+    /// cleared tracker reports a floor of zero: everything is invalidated.
+    pub(crate) fn take_assert_floor(&mut self) -> usize {
+        std::mem::replace(&mut self.assert_floor, usize::MAX)
+    }
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
     use crate::DenseIndex;
 
-    fn var(i: usize) -> VariableId {
-        VariableId::from_index(i)
-    }
-
-    fn push(tracker: &mut DecisionTracker, i: usize, level: u32) {
-        tracker
-            .try_add_decision(Decision::new(var(i), true, ClauseId::install_root()), level)
-            .unwrap();
+    fn decision(index: usize, value: bool) -> Decision {
+        Decision::new(
+            VariableId::from_index(index),
+            value,
+            ClauseId::install_root(),
+        )
     }
 
     #[test]
-    fn take_sync_floor_tracks_minimum_stack_length() {
+    fn sync_floor_tracks_the_deepest_truncation_between_calls() {
         let mut tracker = DecisionTracker::default();
         assert_eq!(tracker.take_sync_floor(), 0);
 
-        push(&mut tracker, 0, 1);
-        push(&mut tracker, 1, 2);
-        push(&mut tracker, 2, 2);
+        for i in 1..=4 {
+            tracker
+                .try_add_decision(decision(i, true), i as u32)
+                .unwrap();
+        }
+        // Nothing was undone: the floor is the previous snapshot point.
         assert_eq!(tracker.take_sync_floor(), 0);
+        assert_eq!(tracker.assignments().len(), 4);
 
-        // An assignment made and undone between two observations cancels out:
-        // the floor only drops to the minimum length reached.
-        tracker.undo_last();
-        push(&mut tracker, 3, 2);
+        // Undo to level 2, then add new decisions on top: the floor must
+        // point at the truncation, not at the final length.
+        tracker.undo_until(2);
+        for i in 5..=7 {
+            tracker.try_add_decision(decision(i, false), 3).unwrap();
+        }
         assert_eq!(tracker.take_sync_floor(), 2);
+        assert_eq!(tracker.take_sync_floor(), 5);
 
-        // Two undos followed by new pushes report the deepest undo.
-        tracker.undo_last();
-        tracker.undo_last();
-        push(&mut tracker, 4, 2);
-        push(&mut tracker, 5, 2);
-        assert_eq!(tracker.take_sync_floor(), 1);
-
-        // Pushes alone never lower the floor: it stays at the stack length
-        // observed by the previous take (3), not the current length (4).
-        push(&mut tracker, 6, 2);
-        assert_eq!(tracker.take_sync_floor(), 3);
-
-        // Clearing resets the floor to zero.
+        // A full clear resets the floor to zero.
         tracker.clear();
         assert_eq!(tracker.take_sync_floor(), 0);
+    }
+
+    #[test]
+    fn assert_floor_reports_the_deepest_truncation_or_max_when_untouched() {
+        let mut tracker = DecisionTracker::default();
+        // A fresh tracker invalidates everything.
+        assert_eq!(tracker.take_assert_floor(), 0);
+        // Taking the floor re-arms it: nothing was undone since.
+        assert_eq!(tracker.take_assert_floor(), usize::MAX);
+
+        for i in 1..=4 {
+            tracker
+                .try_add_decision(decision(i, true), i as u32)
+                .unwrap();
+        }
+        // Additions alone never lower the floor.
+        assert_eq!(tracker.take_assert_floor(), usize::MAX);
+
+        // Undo to level 2 (stack length 2), then regrow: the floor reports
+        // the truncation point, not the final length.
+        tracker.undo_until(2);
+        for i in 5..=7 {
+            tracker.try_add_decision(decision(i, false), 3).unwrap();
+        }
+        assert_eq!(tracker.take_assert_floor(), 2);
+        assert_eq!(tracker.take_assert_floor(), usize::MAX);
+
+        // A full clear resets the floor to zero: everything is invalidated.
+        tracker.clear();
+        assert_eq!(tracker.take_assert_floor(), 0);
     }
 }

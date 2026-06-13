@@ -8,10 +8,11 @@
 //! the best decision from it.
 //!
 //! - Every requires clause is registered as a [`TrackedClause`], identified
-//!   by its [`ClausePosition`]: the parent's registration index and the
-//!   clause's position in the parent's list. Both are append-only, so
-//!   positions are stable, and iterating clauses by position visits them in
-//!   a fixed, deterministic order.
+//!   by its [`ClausePosition`]: a *segment* (requires clauses before
+//!   env-constrains clauses, see below), then the parent's registration
+//!   index, then the clause's position in the parent's list. All are
+//!   append-only, so positions are stable, and iterating clauses by position
+//!   visits them in a fixed, deterministic order.
 //! - [`DecideQueue::queue`] maps the position of each possibly-eligible
 //!   clause to its [`TrackedClauseId`]. It holds a *superset* of the
 //!   eligible clauses, restricted to clauses whose parent is assigned true:
@@ -33,6 +34,22 @@
 //! verified on every call in debug builds by
 //! [`DecideQueue::debug_assert_invariants`], because a hole there does not
 //! crash or change solutions, it just silently degrades the search.
+//!
+//! # Universal solving
+//!
+//! Universal solving (see [`crate::solver::universal`]) adds a second kind of
+//! tracked clause, the *env-constrains* clause `(¬A v Ab_p v L_S)`, whose
+//! ordered candidates are the absent literal then the matches literal. These
+//! clauses live in the [`SEGMENT_ENV_CONSTRAINS`] segment, so they sort after
+//! every requires clause; combined with the env-literals-last ordering in
+//! `decide()` this keeps environment-literal decisions at the top of the
+//! trail. Env-constrains clauses share all the queue bookkeeping with requires
+//! clauses; only their eligibility walk differs (see [`DecideQueue::inspect`]).
+//! For the env-literals-last selection `decide()` drives the queue directly
+//! through the cursor accessors ([`DecideQueue::next_after`],
+//! [`DecideQueue::next_hot_after`], [`DecideQueue::item`],
+//! [`DecideQueue::inspect`] and [`DecideQueue::unqueue`]) instead of
+//! [`DecideQueue::next_decision`].
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -53,36 +70,71 @@ use super::{
 };
 
 /// Index of a [`TrackedClause`] in [`DecideQueue::clauses`].
-type TrackedClauseId = u32;
+pub(crate) type TrackedClauseId = u32;
 
-/// The position of a requires clause in the queue's registration order: the
-/// parent's registration index in the high bits, the clause's position in
-/// the parent's list in the low bits. Comparing positions orders clauses by
-/// parent first and list order second, which is the order in which
-/// [`DecideQueue::next_decision`] considers them.
+/// Requires clauses are scanned before env-constrains clauses, mirroring the
+/// two passes of the original `decide()` rescan and realizing the
+/// env-literals-last ordering: a requires decision is always preferred over an
+/// env-constrains decision.
+const SEGMENT_REQUIRES: u64 = 0;
+const SEGMENT_ENV_CONSTRAINS: u64 = 1;
+
+const PARENT_BITS: u32 = 31;
+const CLAUSE_BITS: u32 = 31;
+
+/// The position of a tracked clause in the queue's registration order: the
+/// segment in the high bits, then the parent's registration index, then the
+/// clause's position in the parent's list. Comparing positions orders clauses
+/// by segment first, parent second and list order last, which is the order in
+/// which [`DecideQueue::next_decision`] considers them.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(transparent)]
-struct ClausePosition(u64);
+pub(crate) struct ClausePosition(u64);
 
 impl ClausePosition {
-    fn new(parent_pos: usize, clause_pos: usize) -> Self {
+    fn new(segment: u64, parent_pos: usize, clause_pos: usize) -> Self {
         assert!(
-            parent_pos < u32::MAX as usize && clause_pos < u32::MAX as usize,
+            parent_pos < (1 << PARENT_BITS) && clause_pos < (1 << CLAUSE_BITS),
             "clause position exceeds the packed u64 layout"
         );
-        Self((parent_pos as u64) << 32 | clause_pos as u64)
+        Self(
+            (segment << (PARENT_BITS + CLAUSE_BITS))
+                | ((parent_pos as u64) << CLAUSE_BITS)
+                | clause_pos as u64,
+        )
     }
 }
 
-/// A requires clause as tracked by the queue.
+/// What kind of clause a [`TrackedClause`] represents, with the per-kind data
+/// the eligibility walk needs.
 #[derive(Copy, Clone)]
-struct TrackedClause {
-    position: ClausePosition,
-    parent: VariableId,
-    requirement: Requirement,
-    condition: Option<DisjunctionId>,
-    clause_id: ClauseId,
-    /// Whether any package name in the requirement has ever had its activity
+pub(crate) enum TrackedClauseKind {
+    /// A requires clause `(¬A v B1 .. v Bn)`. Its candidates are the sorted
+    /// candidate lists in `requirement_to_sorted_candidates`, walked through
+    /// the per-requirement cache.
+    Requires {
+        requirement: Requirement,
+        condition: Option<DisjunctionId>,
+    },
+    /// An env-constrains clause `(¬A v Ab_p v L_S)` (universal solving). Its
+    /// ordered candidates are the absent literal (if the package can be
+    /// absent) followed by the matches literal. `version_set` is the
+    /// constraint's version set, used for the package-activity lookup.
+    EnvConstrains {
+        absent_var: Option<VariableId>,
+        matches_var: VariableId,
+        version_set: VersionSetId,
+    },
+}
+
+/// A clause as tracked by the queue.
+#[derive(Copy, Clone)]
+pub(crate) struct TrackedClause {
+    pub(crate) position: ClausePosition,
+    pub(crate) parent: VariableId,
+    pub(crate) clause_id: ClauseId,
+    pub(crate) kind: TrackedClauseKind,
+    /// Whether any package name in the clause has ever had its activity
     /// bumped. Only hot clauses can replace a running best in
     /// [`DecideQueue::next_decision`]; cold clauses have package activity
     /// exactly zero.
@@ -149,9 +201,9 @@ pub(crate) struct DecideQueueCounters {
 }
 
 pub(crate) struct DecideQueue<D: DependencyProvider> {
-    /// All registered requires clauses, indexed by [`TrackedClauseId`].
+    /// All registered clauses, indexed by [`TrackedClauseId`].
     clauses: Vec<TrackedClause>,
-    /// The registration index of each parent variable: the high half of the
+    /// The registration index of each parent variable: the parent half of the
     /// [`ClausePosition`]s of its clauses, assigned on first registration.
     parent_positions: HashMap<VariableId, u32>,
     /// Clause ids per parent registration index.
@@ -167,8 +219,8 @@ pub(crate) struct DecideQueue<D: DependencyProvider> {
     /// an activity back to zero, which only makes the hot set a conservative
     /// superset.
     hot_names: <D::NameId as SolverId>::Set,
-    /// Name -> clauses whose requirement mentions that name, used to promote
-    /// clauses when a name first becomes hot.
+    /// Name -> clauses whose requirement (or env-constrains package) mentions
+    /// that name, used to promote clauses when a name first becomes hot.
     clauses_by_name: HashMap<D::NameId, Vec<TrackedClauseId>>,
 
     /// Candidate variable -> requirements whose walk inspected it. Registered
@@ -176,6 +228,10 @@ pub(crate) struct DecideQueue<D: DependencyProvider> {
     requirements_by_candidate: HashMap<VariableId, SmallVec<Requirement>>,
     /// Condition variable -> clauses whose condition disjunction mentions it.
     clauses_by_condition_variable: HashMap<VariableId, Vec<TrackedClauseId>>,
+    /// Environment-literal variable -> env-constrains clauses whose candidate
+    /// pair contains it. Used to re-enqueue an env-constrains clause when the
+    /// literal that satisfied it stops being true.
+    clauses_by_env_var: HashMap<VariableId, Vec<TrackedClauseId>>,
 
     /// The walk cache, one entry per requirement.
     requirement_states: RequirementMap<RequirementEntry>,
@@ -212,6 +268,7 @@ impl<D: DependencyProvider> Default for DecideQueue<D> {
             clauses_by_name: HashMap::default(),
             requirements_by_candidate: HashMap::default(),
             clauses_by_condition_variable: HashMap::default(),
+            clauses_by_env_var: HashMap::default(),
             requirement_states: RequirementMap::default(),
             clauses_by_requirement: RequirementMap::default(),
             mirror: Vec::new(),
@@ -250,6 +307,17 @@ impl<D: DependencyProvider> DecideQueue<D> {
         self.hot_only = standard;
     }
 
+    /// Allocates (or reuses) the parent registration index for `parent` and
+    /// returns it together with the next clause position in the parent's list.
+    fn allocate_position(&mut self, parent: VariableId) -> (usize, usize) {
+        let parent_pos = *self.parent_positions.entry(parent).or_insert_with(|| {
+            self.clauses_by_parent.push(Vec::new());
+            (self.clauses_by_parent.len() - 1) as u32
+        }) as usize;
+        let clause_pos = self.clauses_by_parent[parent_pos].len();
+        (parent_pos, clause_pos)
+    }
+
     /// Registers a newly encoded requires clause. Must be called exactly once
     /// per requires clause, in encoding order.
     #[allow(clippy::too_many_arguments)]
@@ -263,12 +331,8 @@ impl<D: DependencyProvider> DecideQueue<D> {
         disjunctions: &Arena<DisjunctionId, Disjunction>,
         parent_value: Option<bool>,
     ) {
-        let parent_pos = *self.parent_positions.entry(parent).or_insert_with(|| {
-            self.clauses_by_parent.push(Vec::new());
-            (self.clauses_by_parent.len() - 1) as u32
-        }) as usize;
-        let clause_pos = self.clauses_by_parent[parent_pos].len();
-        let position = ClausePosition::new(parent_pos, clause_pos);
+        let (parent_pos, clause_pos) = self.allocate_position(parent);
+        let position = ClausePosition::new(SEGMENT_REQUIRES, parent_pos, clause_pos);
         let id = self.clauses.len() as TrackedClauseId;
 
         // A union can mention the same package in several version sets;
@@ -309,9 +373,69 @@ impl<D: DependencyProvider> DecideQueue<D> {
         self.clauses.push(TrackedClause {
             position,
             parent,
-            requirement,
-            condition,
             clause_id,
+            kind: TrackedClauseKind::Requires {
+                requirement,
+                condition,
+            },
+            hot,
+        });
+
+        if parent_value == Some(true) {
+            self.queue.insert(position, id);
+            if hot {
+                self.hot_queue.insert(position, id);
+            }
+        }
+    }
+
+    /// Registers a newly encoded env-constrains clause (universal solving).
+    /// Must be called exactly once per env-constrains clause, in encoding
+    /// order. The clause is placed in the [`SEGMENT_ENV_CONSTRAINS`] segment,
+    /// so it sorts after every requires clause.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_env_constrains_clause(
+        &mut self,
+        parent: VariableId,
+        package_name: D::NameId,
+        absent_var: Option<VariableId>,
+        matches_var: VariableId,
+        version_set: VersionSetId,
+        clause_id: ClauseId,
+        parent_value: Option<bool>,
+    ) {
+        let (parent_pos, clause_pos) = self.allocate_position(parent);
+        let position = ClausePosition::new(SEGMENT_ENV_CONSTRAINS, parent_pos, clause_pos);
+        let id = self.clauses.len() as TrackedClauseId;
+
+        let hot = self.hot_names.contains(package_name);
+        self.clauses_by_name
+            .entry(package_name)
+            .or_default()
+            .push(id);
+
+        if let Some(absent_var) = absent_var {
+            self.clauses_by_env_var
+                .entry(absent_var)
+                .or_default()
+                .push(id);
+        }
+        self.clauses_by_env_var
+            .entry(matches_var)
+            .or_default()
+            .push(id);
+
+        self.clauses_by_parent[parent_pos].push(id);
+
+        self.clauses.push(TrackedClause {
+            position,
+            parent,
+            clause_id,
+            kind: TrackedClauseKind::EnvConstrains {
+                absent_var,
+                matches_var,
+                version_set,
+            },
             hot,
         });
 
@@ -398,6 +522,7 @@ impl<D: DependencyProvider> DecideQueue<D> {
             hot_queue,
             requirements_by_candidate,
             clauses_by_condition_variable,
+            clauses_by_env_var,
             requirement_states,
             clauses_by_requirement,
             ..
@@ -452,6 +577,20 @@ impl<D: DependencyProvider> DecideQueue<D> {
         if let Some(woken) = clauses_by_condition_variable.get(&variable) {
             for &id in woken {
                 enqueue_clause(queue, hot_queue, clauses, map, id);
+            }
+        }
+
+        // Env-constrains wake-up: an env-constrains clause is satisfied by its
+        // absent or matches literal being true and dequeued when it is. When
+        // such a literal stops being true (undo, or a net true-to-false flip
+        // between two syncs) the clause may be eligible again. A true
+        // assignment can only satisfy, never unsatisfy, so it needs no wake-up
+        // here (the parent wake-up already covers a freshly installed parent).
+        if value != Some(true) {
+            if let Some(woken) = clauses_by_env_var.get(&variable) {
+                for &id in woken {
+                    enqueue_clause(queue, hot_queue, clauses, map, id);
+                }
             }
         }
     }
@@ -533,8 +672,11 @@ impl<D: DependencyProvider> DecideQueue<D> {
     }
 
     /// Checks whether a clause is eligible at the current assignment
-    /// snapshot. Returns the requirement frontier if it is.
-    fn inspect(
+    /// snapshot. Returns its decision frontier (the candidate to decide, the
+    /// version set that supplies the package activity, and the number of
+    /// undecided candidates) if it is, or `None` if the clause is ineligible
+    /// (parent not installed, condition not met, or already satisfied).
+    pub(crate) fn inspect(
         &mut self,
         clause: TrackedClause,
         map: &DecisionMap,
@@ -553,33 +695,61 @@ impl<D: DependencyProvider> DecideQueue<D> {
             return None;
         }
 
-        // If the clause has a condition that is not yet satisfied we need to
-        // skip it.
-        if let Some(condition) = clause.condition {
-            let literals = &disjunctions[condition].literals;
-            if !literals.iter().all(|c| c.eval(map) == Some(false)) {
-                return None;
-            }
-        }
+        match clause.kind {
+            TrackedClauseKind::Requires {
+                requirement,
+                condition,
+            } => {
+                // If the clause has a condition that is not yet satisfied we
+                // need to skip it.
+                if let Some(condition) = condition {
+                    let literals = &disjunctions[condition].literals;
+                    if !literals.iter().all(|c| c.eval(map) == Some(false)) {
+                        return None;
+                    }
+                }
 
-        match Self::eval_requirement(
-            &mut self.requirement_states,
-            &mut self.requirements_by_candidate,
-            clause.requirement,
-            map,
-            sorted_candidates,
-            provider,
-            #[cfg(feature = "diagnostics")]
-            &mut self.counters,
-        ) {
-            RequirementState::Satisfied { .. } => None,
-            RequirementState::Frontier {
-                candidate,
+                match Self::eval_requirement(
+                    &mut self.requirement_states,
+                    &mut self.requirements_by_candidate,
+                    requirement,
+                    map,
+                    sorted_candidates,
+                    provider,
+                    #[cfg(feature = "diagnostics")]
+                    &mut self.counters,
+                ) {
+                    RequirementState::Satisfied { .. } => None,
+                    RequirementState::Frontier {
+                        candidate,
+                        version_set,
+                        count,
+                    } => Some((candidate, version_set, count)),
+                    RequirementState::Dirty => {
+                        unreachable!("eval_requirement never leaves the entry dirty")
+                    }
+                }
+            }
+            TrackedClauseKind::EnvConstrains {
+                absent_var,
+                matches_var,
                 version_set,
-                count,
-            } => Some((candidate, version_set, count)),
-            RequirementState::Dirty => {
-                unreachable!("eval_requirement never leaves the entry dirty")
+            } => {
+                // Ordered candidates: absent first, then matches (the split
+                // policy of the env-constrains encoding).
+                let mut frontier: Option<(VariableId, u32)> = None;
+                for candidate in absent_var.into_iter().chain([matches_var]) {
+                    match map.value(candidate) {
+                        Some(true) => return None,
+                        Some(false) => {}
+                        None => match frontier.as_mut() {
+                            Some((_, count)) => *count += 1,
+                            None => frontier = Some((candidate, 1)),
+                        },
+                    }
+                }
+                let (candidate, count) = frontier?;
+                Some((candidate, version_set, count))
             }
         }
     }
@@ -590,6 +760,10 @@ impl<D: DependencyProvider> DecideQueue<D> {
     /// and strictly fewer remaining candidates (clauses of the root are
     /// always preferred over the rest). Ineligible clauses reached on the way
     /// are dequeued, which is what keeps the queue tight.
+    ///
+    /// Used for the env-ordering-off path (plain solves and universal solves
+    /// once the env ordering is suspended); the env-literals-last path in
+    /// `decide()` drives the queue through the cursor accessors instead.
     ///
     /// `max_activity` must be exactly the largest activity stored in
     /// `name_activity` (it is maintained next to the bumps and decays).
@@ -731,6 +905,54 @@ impl<D: DependencyProvider> DecideQueue<D> {
         })
     }
 
+    /// The clause tracked at `id`. Used by the env-literals-last selection in
+    /// `decide()` to read a queued clause's parent, kind and clause id.
+    pub(crate) fn item(&self, id: TrackedClauseId) -> TrackedClause {
+        self.clauses[id as usize]
+    }
+
+    /// The first queued clause whose position is strictly greater than
+    /// `cursor` (or the overall first when `cursor` is `None`). Used by the
+    /// env-literals-last selection in `decide()`.
+    pub(crate) fn next_after(
+        &self,
+        cursor: Option<ClausePosition>,
+    ) -> Option<(ClausePosition, TrackedClauseId)> {
+        let mut range = match cursor {
+            None => self.queue.range(..),
+            Some(position) => self
+                .queue
+                .range((Bound::Excluded(position), Bound::Unbounded)),
+        };
+        range.next().map(|(&position, &id)| (position, id))
+    }
+
+    /// The first queued *hot* clause whose position is strictly greater than
+    /// `cursor`. Used by the env-literals-last selection in `decide()`.
+    pub(crate) fn next_hot_after(
+        &self,
+        cursor: ClausePosition,
+    ) -> Option<(ClausePosition, TrackedClauseId)> {
+        self.hot_queue
+            .range((Bound::Excluded(cursor), Bound::Unbounded))
+            .next()
+            .map(|(&position, &id)| (position, id))
+    }
+
+    /// Removes a clause from the queue after an inspection proved it
+    /// ineligible. The wake-up rules re-insert it when any input of that
+    /// inspection changes. Used by the env-literals-last selection in
+    /// `decide()`; `next_decision` dequeues inline.
+    pub(crate) fn unqueue(&mut self, id: TrackedClauseId) {
+        let position = self.clauses[id as usize].position;
+        self.queue.remove(&position);
+        self.hot_queue.remove(&position);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.counters.dequeues += 1;
+        }
+    }
+
     /// Verifies the heuristic-independent queue invariants. Called on every
     /// `decide()` in debug builds; a violation means a wake-up, cache, or hot
     /// promotion hole, which would otherwise only show up as silently
@@ -755,35 +977,54 @@ impl<D: DependencyProvider> DecideQueue<D> {
             if map.value(clause.parent) != Some(true) {
                 continue;
             }
-            if let Some(condition) = clause.condition {
-                let literals = &disjunctions[condition].literals;
-                if !literals.iter().all(|c| c.eval(map) == Some(false)) {
-                    continue;
+            let eligible = match clause.kind {
+                TrackedClauseKind::Requires {
+                    requirement,
+                    condition,
+                } => {
+                    if let Some(condition) = condition {
+                        let literals = &disjunctions[condition].literals;
+                        if !literals.iter().all(|c| c.eval(map) == Some(false)) {
+                            continue;
+                        }
+                    }
+                    !sorted_candidates[requirement]
+                        .iter()
+                        .flatten()
+                        .any(|&candidate| map.value(candidate) == Some(true))
                 }
-            }
-            let satisfied = sorted_candidates[clause.requirement]
-                .iter()
-                .flatten()
-                .any(|&candidate| map.value(candidate) == Some(true));
-            if satisfied {
+                TrackedClauseKind::EnvConstrains {
+                    absent_var,
+                    matches_var,
+                    ..
+                } => !absent_var
+                    .into_iter()
+                    .chain([matches_var])
+                    .any(|candidate| map.value(candidate) == Some(true)),
+            };
+            if !eligible {
                 continue;
             }
             assert!(
                 self.queue.contains_key(&clause.position),
-                "eligible requires clause {id} is not queued"
+                "eligible clause {id} is not queued"
             );
         }
 
         // Hot flags match the hot name set, and the hot queue mirrors the
         // queue for hot clauses.
         for (id, clause) in self.clauses.iter().enumerate() {
-            let should_be_hot = clause
-                .requirement
-                .version_sets(provider)
-                .any(|version_set| {
-                    self.hot_names
-                        .contains(provider.version_set_name(version_set))
-                });
+            let should_be_hot = match clause.kind {
+                TrackedClauseKind::Requires { requirement, .. } => {
+                    requirement.version_sets(provider).any(|version_set| {
+                        self.hot_names
+                            .contains(provider.version_set_name(version_set))
+                    })
+                }
+                TrackedClauseKind::EnvConstrains { version_set, .. } => self
+                    .hot_names
+                    .contains(provider.version_set_name(version_set)),
+            };
             assert_eq!(
                 clause.hot, should_be_hot,
                 "clause {id} hot flag out of sync with the hot name set"

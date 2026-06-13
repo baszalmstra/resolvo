@@ -40,8 +40,9 @@ use itertools::Itertools;
 pub use pack::Pack;
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, KnownDependencies, NameId, SolvableId, SolverCache,
-    StringId, VersionSetId, VersionSetUnionId, snapshot::DependencySnapshot, utils::Pool,
+    EnvironmentPackage, HintDependenciesAvailable, Interner, KnownDependencies, NameId,
+    PackageCandidates, SolvableId, SolverCache, StringId, VersionSetId, VersionSetRelation,
+    VersionSetUnionId, snapshot::DependencySnapshot, utils::Pool,
 };
 pub use spec::Spec;
 use version_ranges::Ranges;
@@ -67,6 +68,9 @@ pub struct BundleBoxProvider {
     /// requirement itself is encoded.
     pub hint_dependencies_available: bool,
 
+    /// Environment packages declared via [`BundleBoxProvider::add_environment_package`].
+    environment_packages: HashMap<String, EnvironmentPackage>,
+
     // A mapping of packages that we have requested candidates for. This way we can keep track of
     // duplicate requests.
     requested_candidates: RefCell<HashSet<NameId>>,
@@ -89,6 +93,18 @@ impl BundleBoxProvider {
         self.pool
             .lookup_package_name(&name.to_string())
             .expect("package missing")
+    }
+
+    /// Declares a package as an environment package. Environment packages
+    /// have no concrete candidate solvables; their value is unknown at solve
+    /// time.
+    ///
+    /// `can_be_absent` controls whether an absent literal is created for the
+    /// package.
+    pub fn add_environment_package(&mut self, name: &str, can_be_absent: bool) {
+        self.pool.intern_package_name(name);
+        self.environment_packages
+            .insert(name.to_owned(), EnvironmentPackage { can_be_absent });
     }
 
     pub fn intern_condition(&mut self, condition: &SpecCondition) -> ConditionId {
@@ -339,7 +355,7 @@ impl DependencyProvider for BundleBoxProvider {
         });
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
         let concurrent_requests = self.concurrent_requests.fetch_add(1, Ordering::SeqCst);
         self.concurrent_requests_max.set(
             self.concurrent_requests_max
@@ -353,6 +369,14 @@ impl DependencyProvider for BundleBoxProvider {
         );
 
         let package_name = self.pool.resolve_package_name(name);
+
+        // Check environment packages before the regular packages map.
+        if let Some(env_pkg) = self.environment_packages.get(package_name) {
+            return self
+                .maybe_delay(Some(PackageCandidates::Environment(*env_pkg)))
+                .await;
+        }
+
         let Some(package) = self.packages.get(package_name) else {
             return self.maybe_delay(None).await;
         };
@@ -385,7 +409,8 @@ impl DependencyProvider for BundleBoxProvider {
             }
         }
 
-        self.maybe_delay(Some(candidates)).await
+        self.maybe_delay(Some(PackageCandidates::Candidates(candidates)))
+            .await
     }
 
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
@@ -451,5 +476,123 @@ impl DependencyProvider for BundleBoxProvider {
         } else {
             None
         }
+    }
+
+    fn environment_version_set_relation(
+        &self,
+        a: VersionSetId,
+        b: VersionSetId,
+    ) -> VersionSetRelation {
+        let range_a = self.pool.resolve_version_set(a);
+        let range_b = self.pool.resolve_version_set(b);
+
+        // Check for equality first.
+        if range_a == range_b {
+            return VersionSetRelation::Equal;
+        }
+
+        // a and b are disjoint when their intersection is empty.
+        let intersection = range_a.clone().intersection(range_b);
+        if intersection.is_empty() {
+            return VersionSetRelation::Disjoint;
+        }
+
+        // Check subset: every value matching a also matches b, i.e. a is a
+        // subset of b.
+        if range_a.subset_of(range_b) {
+            return VersionSetRelation::Subset;
+        }
+
+        // Check superset: every value matching b also matches a, i.e. b is a
+        // subset of a.
+        if range_b.subset_of(range_a) {
+            return VersionSetRelation::Superset;
+        }
+
+        VersionSetRelation::Unknown
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+
+    /// Helper: intern two version-set specs and return their ids.
+    ///
+    /// We use a closed upper-bound notation ("5..10" means version in [5,10))
+    /// because the BundleBox DSL parser does not support open-ended ranges.
+    /// The oracle logic is the same regardless.
+    fn make_vs_pair(
+        provider: &mut BundleBoxProvider,
+        spec_a: &str,
+        spec_b: &str,
+    ) -> (VersionSetId, VersionSetId) {
+        let id_a = provider.version_sets(&[spec_a])[0];
+        let id_b = provider.version_sets(&[spec_b])[0];
+        (id_a, id_b)
+    }
+
+    fn new_env_provider() -> BundleBoxProvider {
+        let mut provider = BundleBoxProvider::new();
+        provider.add_environment_package("env", true);
+        provider
+    }
+
+    /// "env 11..100" vs "env 12..100": the first range is a superset
+    /// (every version in [12,100) is also in [11,100), but [11,12) is only
+    /// in the first).
+    #[test]
+    fn test_oracle_superset() {
+        let mut provider = new_env_provider();
+        let (a, b) = make_vs_pair(&mut provider, "env 11..100", "env 12..100");
+        assert_eq!(
+            provider.environment_version_set_relation(a, b),
+            VersionSetRelation::Superset,
+        );
+    }
+
+    /// "env 12..100" vs "env 11..100": the first range is a subset.
+    #[test]
+    fn test_oracle_subset() {
+        let mut provider = new_env_provider();
+        let (a, b) = make_vs_pair(&mut provider, "env 12..100", "env 11..100");
+        assert_eq!(
+            provider.environment_version_set_relation(a, b),
+            VersionSetRelation::Subset,
+        );
+    }
+
+    /// "env 0..2" vs "env 3..5": no overlap, disjoint.
+    #[test]
+    fn test_oracle_disjoint() {
+        let mut provider = new_env_provider();
+        let (a, b) = make_vs_pair(&mut provider, "env 0..2", "env 3..5");
+        assert_eq!(
+            provider.environment_version_set_relation(a, b),
+            VersionSetRelation::Disjoint,
+        );
+    }
+
+    /// Same range: equal.
+    #[test]
+    fn test_oracle_equal() {
+        let mut provider = new_env_provider();
+        let (a, b) = make_vs_pair(&mut provider, "env 5..10", "env 5..10");
+        assert_eq!(
+            provider.environment_version_set_relation(a, b),
+            VersionSetRelation::Equal,
+        );
+    }
+
+    /// "env 0..5" vs "env 3..8": overlapping but neither is a subset of the
+    /// other; the oracle must return Unknown.
+    #[test]
+    fn test_oracle_unknown_overlap() {
+        let mut provider = new_env_provider();
+        let (a, b) = make_vs_pair(&mut provider, "env 0..5", "env 3..8");
+        assert_eq!(
+            provider.environment_version_set_relation(a, b),
+            VersionSetRelation::Unknown,
+        );
     }
 }

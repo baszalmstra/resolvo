@@ -11,13 +11,14 @@
 
 use std::{any::Any, collections::VecDeque, fmt::Display, time::SystemTime};
 
-use ahash::HashSet;
+use ahash::{HashMap, HashSet};
 use futures::FutureExt;
 
 use crate::{
     Candidates, Condition, ConditionId, DenseIndex, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, Mapping, NameId, Requirement, SolvableId, SolverCache,
-    StringId, VersionSetId, VersionSetUnionId,
+    EnvironmentPackage, HintDependenciesAvailable, Interner, Mapping, NameId, PackageCandidates,
+    Requirement, SolvableId, SolverCache, StringId, VersionSetId, VersionSetRelation,
+    VersionSetUnionId,
 };
 
 /// A single solvable in a [`DependencySnapshot`].
@@ -72,6 +73,16 @@ pub struct Package {
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub excluded: Vec<(SolvableId, StringId)>,
+
+    /// When set, this package is an environment package for universal
+    /// solving. The `solvables` then describe the concrete candidates of a
+    /// simulated machine, which are only presented when the provider runs in
+    /// concrete mode (see [`SnapshotProvider::with_universal_mode`]).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub environment: Option<EnvironmentPackage>,
 }
 
 /// A snapshot of an object that implements [`DependencyProvider`].
@@ -119,6 +130,17 @@ pub struct DependencySnapshot {
         serde(default, skip_serializing_if = "Mapping::is_empty")
     )]
     pub conditions: Mapping<ConditionId, Condition>,
+
+    /// Pairwise relations between version sets that target environment
+    /// packages, precomputed by the snapshot generator. Each pair is stored
+    /// in one order only; the provider answers the flipped order by
+    /// inverting `Subset`/`Superset`. Missing entries (and entries for pairs
+    /// never queried) mean [`VersionSetRelation::Unknown`].
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub environment_version_set_relations: Vec<(VersionSetId, VersionSetId, VersionSetRelation)>,
 }
 
 impl DependencySnapshot {
@@ -172,6 +194,7 @@ impl DependencySnapshot {
             packages: Mapping::new(),
             strings: Mapping::new(),
             conditions: Mapping::new(),
+            environment_version_set_relations: Vec::new(),
         };
 
         let mut queue = names
@@ -186,7 +209,17 @@ impl DependencySnapshot {
             match element {
                 Element::Package(name) => {
                     let display = cache.provider().display_name(name).to_string();
-                    let candidates = cache.get_or_cache_candidates(name).await?;
+                    let package_candidates = cache.get_or_cache_candidates(name).await?;
+                    let candidates = match package_candidates {
+                        PackageCandidates::Candidates(c) => c,
+                        PackageCandidates::Environment(_) => {
+                            return Err(Box::new(format!(
+                                "cannot snapshot environment package '{}'; \
+                                 snapshotting environment packages is not supported",
+                                display
+                            )));
+                        }
+                    };
                     for solvable in candidates.candidates.iter() {
                         if seen.insert(Element::Solvable(*solvable)) {
                             queue.push_back(Element::Solvable(*solvable));
@@ -213,6 +246,7 @@ impl DependencySnapshot {
                         name: display,
                         solvables: candidates.candidates.clone(),
                         excluded: candidates.excluded.clone(),
+                        environment: None,
                     };
 
                     result.packages.insert(name, package);
@@ -368,6 +402,20 @@ pub struct SnapshotProvider<'s> {
 
     additional_version_sets: Vec<VersionSet>,
     stop_time: Option<SystemTime>,
+
+    /// Whether packages marked as environment packages present themselves as
+    /// [`PackageCandidates::Environment`] (universal mode) instead of their
+    /// concrete simulated-machine candidates (concrete mode, the default).
+    universal: bool,
+
+    /// Lookup index over the snapshot's precomputed relation table.
+    relations: HashMap<(VersionSetId, VersionSetId), VersionSetRelation>,
+
+    /// The first version set id available for `additional_version_sets`: one
+    /// past the highest id used by the snapshot. `Mapping::max` returns the
+    /// highest inserted id itself, so using it directly would shadow the
+    /// snapshot's last version set.
+    additional_base: usize,
 }
 
 impl<'s> From<&'s DependencySnapshot> for SnapshotProvider<'s> {
@@ -379,10 +427,23 @@ impl<'s> From<&'s DependencySnapshot> for SnapshotProvider<'s> {
 impl<'s> SnapshotProvider<'s> {
     /// Create a new [`SnapshotProvider`] from a [`DependencySnapshot`].
     pub fn new(snapshot: &'s DependencySnapshot) -> Self {
+        let relations = snapshot
+            .environment_version_set_relations
+            .iter()
+            .map(|&(a, b, relation)| ((a, b), relation))
+            .collect();
+        let additional_base = if snapshot.version_sets.is_empty() {
+            0
+        } else {
+            snapshot.version_sets.max() + 1
+        };
         Self {
             snapshot,
             additional_version_sets: Vec::new(),
             stop_time: None,
+            universal: false,
+            relations,
+            additional_base,
         }
     }
 
@@ -395,14 +456,20 @@ impl<'s> SnapshotProvider<'s> {
         }
     }
 
+    /// Switches between universal and concrete mode. In universal mode
+    /// packages marked as environment packages in the snapshot are presented
+    /// as [`PackageCandidates::Environment`] and the relation oracle answers
+    /// from the snapshot's precomputed relation table. In concrete mode (the
+    /// default) the environment markers are ignored and those packages
+    /// present their concrete simulated-machine candidates.
+    pub fn with_universal_mode(self, universal: bool) -> Self {
+        Self { universal, ..self }
+    }
+
     /// Adds another requirement that matches any version of a package.
     /// If you use "*" as the matcher, it will match any version of the package.
     pub fn add_package_requirement(&mut self, name: NameId, matcher: &str) -> VersionSetId {
-        // Additional version sets are allocated directly after the highest
-        // index present in the snapshot. `Mapping::max()` returns the highest
-        // inserted *index* (not a count), so the first free index is one past
-        // it.
-        let id = self.snapshot.version_sets.max() + 1 + self.additional_version_sets.len();
+        let id = self.additional_base + self.additional_version_sets.len();
         let package = self.package(name);
 
         let matching_candidates = package
@@ -444,13 +511,8 @@ impl<'s> SnapshotProvider<'s> {
 
     fn version_set(&self, version_set: VersionSetId) -> &VersionSet {
         let idx = version_set.to_index();
-        let max_idx = self.snapshot.version_sets.max();
-        // Indices up to and including `max_idx` belong to the snapshot;
-        // anything beyond was allocated by `add_package_requirement`. Using
-        // `>=` here would shadow the snapshot's highest-index version set
-        // with the first additional one (and panic when none was added).
-        if idx > max_idx {
-            &self.additional_version_sets[idx - max_idx - 1]
+        if idx >= self.additional_base {
+            &self.additional_version_sets[idx - self.additional_base]
         } else {
             self.snapshot
                 .version_sets
@@ -524,9 +586,14 @@ impl DependencyProvider for SnapshotProvider<'_> {
             .collect()
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
         let package = self.package(name);
-        Some(Candidates {
+        if self.universal {
+            if let Some(environment) = package.environment {
+                return Some(PackageCandidates::Environment(environment));
+            }
+        }
+        Some(PackageCandidates::Candidates(Candidates {
             candidates: package.solvables.clone(),
             favored: None,
             locked: None,
@@ -539,7 +606,7 @@ impl DependencyProvider for SnapshotProvider<'_> {
                     .filter(|&s| self.solvable(s).hint_dependencies_available)
                     .collect(),
             ),
-        })
+        }))
     }
 
     async fn sort_candidates(&self, _solver: &SolverCache<Self>, solvables: &mut [SolvableId]) {
@@ -548,6 +615,27 @@ impl DependencyProvider for SnapshotProvider<'_> {
 
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
         self.solvable(solvable).dependencies.clone()
+    }
+
+    fn environment_version_set_relation(
+        &self,
+        a: VersionSetId,
+        b: VersionSetId,
+    ) -> VersionSetRelation {
+        if a == b {
+            return VersionSetRelation::Equal;
+        }
+        if let Some(&relation) = self.relations.get(&(a, b)) {
+            return relation;
+        }
+        if let Some(&relation) = self.relations.get(&(b, a)) {
+            return match relation {
+                VersionSetRelation::Subset => VersionSetRelation::Superset,
+                VersionSetRelation::Superset => VersionSetRelation::Subset,
+                symmetric => symmetric,
+            };
+        }
+        VersionSetRelation::Unknown
     }
 
     fn should_cancel_with_value(&self) -> Option<Box<dyn Any>> {

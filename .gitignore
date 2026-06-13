@@ -29,3 +29,9 @@ snapshot_*.json
 bench-final/
 
 timings_*
+
+bench-universal/
+*.pending-snap
+
+# Private bench-build target dir (see docs/design/night2-integration.md)
+target-bench/

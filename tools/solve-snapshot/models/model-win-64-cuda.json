@@ -1,0 +1,7 @@
+{
+  "clauses": [
+    [ {"package": "__win", "matches": "*"} ],
+    [ {"package": "__cuda", "absent": true}, {"package": "__cuda", "matches": ">=11,<14.0a0"} ],
+    [ {"package": "__archspec", "matches": "* x86_64"} ]
+  ]
+}

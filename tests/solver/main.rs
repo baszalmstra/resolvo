@@ -6,8 +6,9 @@ use bundle_box::{BundleBoxProvider, Pack};
 use insta::assert_snapshot;
 use itertools::Itertools;
 use resolvo::{
-    ConditionalRequirement, DependencyProvider, Interner, Problem, SolvableId, Solver,
-    UnsolvableOrCancelled, VersionSetId,
+    CellCondition, ConditionalRequirement, DependencyProvider, EnvLiteral, EnvLiteralKind,
+    Interner, NameId, Problem, SolvableId, Solver, UniversalFailure, UniversalProblem,
+    UniversalSolution, UnsolvableOrCancelled, VersionSetId,
 };
 use tracing_test::traced_test;
 
@@ -2083,6 +2084,1269 @@ fn test_unsat_constrains_shared_encoding_multiple_parents() {
     insta::assert_snapshot!(error);
 }
 
+/// A solvable that violates a constraint it itself declares cannot be
+/// installed: `a=2` constrains `a 3..4` and is itself a non-matching
+/// candidate, so the degenerate Constrains clause `(not a=2 or not a=2)` is
+/// the assertion `not a=2` and the solver falls back to `a=1`. Found by the
+/// universal-solve property test; the bug predates universal solving (the
+/// encoder created a clause watching the same literal twice).
+#[test]
+fn test_self_constrains_falls_back_to_other_version() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("a", 2.into(), &[], &["a 3..4"]);
+    provider.add_package("a", 1.into(), &[], &[]);
+    insta::assert_snapshot!(solve_snapshot(provider, &["a"]), @r"
+    a=1
+    ");
+}
+
+/// The unsolvable variant of the self-constrains case: the only candidate
+/// violates its own constraint, so the requirement cannot be satisfied.
+#[test]
+fn test_self_constrains_unsolvable() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("a", 1.into(), &[], &["a 2..3"]);
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let result = solver.solve(problem);
+    assert!(matches!(result, Err(UnsolvableOrCancelled::Unsolvable(_))));
+}
+
+// ===========================================================================
+// M1: Environment literals in the encoder -- scenario tests
+// ===========================================================================
+//
+// These tests exercise the three env-package encoding paths through a plain
+// `solve()` call which gives the "baseline" solution: all environment literals
+// default to false / undecided. None of these tests need `solve_universal`.
+
+/// Conditional dependency on an environment package stays inactive in the
+/// baseline solve (environment literal is undecided = false, so the condition
+/// disjunction is not satisfied and the requirement is inactive).
+#[test]
+fn test_env_conditional_dep_inactive_in_baseline() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    // `a 1` has a conditional dep: requires `b 1..2` if `cuda 11..100`
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    // Baseline: cuda is undecided (false), so b is NOT pulled in.
+    assert_snapshot!(result, @r"
+    a=1
+    ");
+}
+
+/// A constraint on an env package that can be absent: in the baseline solve
+/// the absent literal is false/undecided so the EnvConstrains clause is
+/// satisfied by the absent literal (absent is undecided, counts as false, and
+/// propagation does nothing), and the solve completes without a conflict.
+#[test]
+fn test_env_constrains_absent_branch_baseline() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    // `a 1` constrains `cuda 11..100` (meaning: if a is installed the env
+    // must lack cuda or have cuda >=11).
+    provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    // Baseline: cuda absent/undecided; solve succeeds, only a is installed.
+    assert_snapshot!(result, @r"
+    a=1
+    ");
+}
+
+/// A requirement on an environment package forces that env literal to be true
+/// and the solve still succeeds (no concrete solvable is produced, but the
+/// solve does not fail).
+#[test]
+fn test_env_requirement_forces_literal_true() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+    // Root requires `cuda 11..100`. This should force L_{cuda>=11} = true.
+    let requirements = provider.requirements(&["cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    // No concrete solvables -- the env literal variable is true but not a
+    // solvable. The solution set of concrete solvables is empty.
+    assert_eq!(solved, vec![]);
+}
+
+/// A conditional dependency on an environment package becomes ACTIVE when
+/// the env literal is forced true by a requirement on the same version set:
+/// root requires `cuda 11..100`, so `L_{cuda 11..100}` is propagated true,
+/// which activates `a`'s conditional dependency on `b`.
+#[test]
+fn test_env_conditional_dep_active_when_literal_forced() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a", "cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    a=1
+    b=1
+    ");
+}
+
+/// Oracle Subset implication: root requires `cuda 12..100` (forcing
+/// `L_{12..100}` true) and `a` constrains `cuda 11..100`. Since every value
+/// in [12,100) is also in [11,100), the oracle emits
+/// `(not L_{12..100} or L_{11..100})` which forces `L_{11..100}` true and
+/// satisfies the constraint. With `can_be_absent = false` the EnvConstrains
+/// clause is the binary `(not a or L_{11..100})`, so a wrong-polarity or
+/// wrong-direction oracle clause would make this unsolvable.
+#[test]
+fn test_env_oracle_subset_satisfies_constraint() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+    provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
+
+    let requirements = provider.requirements(&["a", "cuda 12..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    a=1
+    ");
+}
+
+/// Oracle Disjoint exclusion: two root requirements on disjoint version sets
+/// of the same environment package force both literals true, which violates
+/// the oracle clause `(not L_{0..5} or not L_{11..100})`. The solve must
+/// fail. Without the disjoint oracle clause both literals could be true
+/// simultaneously and the solve would (incorrectly) succeed.
+#[test]
+fn test_env_oracle_disjoint_conflict() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let requirements = provider.requirements(&["cuda 0..5", "cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let result = solver.solve(problem);
+    // Conflict rendering for env literals is deferred to M5; only assert
+    // that the solve fails as unsolvable.
+    assert!(matches!(result, Err(UnsolvableOrCancelled::Unsolvable(_))));
+}
+
+/// `Requirement::Union` mixing an environment and a concrete version set is
+/// rejected in v1 with a clear panic.
+#[test]
+#[should_panic(expected = "mixing environment and concrete version sets")]
+fn test_env_union_mixing_concrete_panics() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["b 1..2 | cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let _ = solver.solve(problem);
+}
+
+/// Environment-package encoding must also work under a real async runtime
+/// (tokio with `sleep_before_return = true`): classification of environment
+/// packages happens inside the queued futures where awaiting is legal, not
+/// via synchronous cache peeks that only hold under `NowOrNeverRuntime`.
+///
+/// `a` requires the env package itself (forcing the literal true) and has a
+/// conditional dependency on `b` that becomes active because of it. `a` also
+/// constrains the env package, exercising the constraint path as well.
+#[test]
+fn test_env_encoding_under_async_runtime() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["cuda 11..100", "b 1..2; if cuda 11..100"],
+        &["cuda 5..100"],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    // `solve_snapshot` uses the tokio runtime and sets `sleep_before_return`.
+    let result = solve_snapshot(provider, &["a"]);
+    assert_snapshot!(result, @r"
+    a=1
+    b=1
+    ");
+}
+
+// ===========================================================================
+// M2: Universal solve (enumeration loop) -- scenario tests
+// ===========================================================================
+
+/// Parses a signed environment literal for the test DSL used in
+/// [`universal_solve_snapshot`]. `"cuda absent"` is the absent literal,
+/// anything else is parsed as a [`Spec`] (e.g. `"cuda 11..100"`). A
+/// `"not "` prefix negates the literal.
+fn parse_env_literal(
+    provider: &mut BundleBoxProvider,
+    literal: &str,
+) -> (EnvLiteral<NameId>, bool) {
+    let (literal, positive) = match literal.strip_prefix("not ") {
+        Some(rest) => (rest, false),
+        None => (literal, true),
+    };
+    let env_literal = match literal.strip_suffix(" absent") {
+        Some(name) => EnvLiteral {
+            package: provider.pool.intern_package_name(name),
+            kind: EnvLiteralKind::Absent,
+        },
+        None => {
+            let version_set = provider.version_sets(&[literal])[0];
+            EnvLiteral {
+                package: provider.version_set_name(version_set),
+                kind: EnvLiteralKind::Matches(version_set),
+            }
+        }
+    };
+    (env_literal, positive)
+}
+
+/// Runs a universal solve and formats the resulting cell partition (or the
+/// failure) as a string for inline snapshots. `model` is a CNF: each inner
+/// slice is a disjunction of signed environment literals in the DSL of
+/// [`parse_env_literal`].
+fn universal_solve_snapshot(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> String {
+    use std::fmt::Write;
+
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model);
+    match solver.solve_universal(problem) {
+        Ok(solution) => {
+            let mut buf = String::new();
+            for (condition, solvables) in &solution.cells {
+                writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
+                for solvable in solvables
+                    .iter()
+                    .map(|&s| solver.provider().display_solvable(s).to_string())
+                    .sorted()
+                {
+                    writeln!(buf, "  {solvable}").unwrap();
+                }
+            }
+            buf
+        }
+        Err(UniversalFailure::Unsolvable { cell, .. }) => {
+            format!("unsolvable in cell: {}", cell.display(solver.provider()))
+        }
+        Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+    }
+}
+
+/// Scenario (a): a conditional dependency on `cuda` with the model
+/// `cuda absent OR cuda >=11`. Two cells, baseline (cuda not matching, i.e.
+/// absent within the model) first. The first cell's condition comes from the
+/// conditional requires clause `(not a or not L_11 or b)`: with `a` installed
+/// and `b` not installed only `not L_11` supports the clause. The second
+/// cell's condition is empty after generalization (the dependency is
+/// satisfied by a concrete solvable) and is restored to `L_11` by the
+/// disjointness repair against the first cell.
+#[test]
+fn test_universal_conditional_dependency_two_cells() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["cuda absent", "cuda 11..100"]]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
+/// Scenario (b): candidate-level split. `pkg=2` (sorted first) requires
+/// `glibc >=2.28` and `pkg=1` requires `glibc >=2.17`; the model is
+/// `glibc >=2.17` (versions encoded as integers: 217, 228). The first cell
+/// records `L_228` (forced true by the requires clause of `pkg=2`). The
+/// second cell records `L_217` and must be generalized correctly: the repair
+/// step appends `not L_228` because the oracle cannot prove
+/// `glibc in 217..1000` disjoint from `glibc in 228..1000`.
+#[test]
+fn test_universal_candidate_split_generalization() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("pkg", Pack::new(2), &["glibc 228..1000"], &[]);
+    provider.add_package("pkg", Pack::new(1), &["glibc 217..1000"], &[]);
+
+    let result = universal_solve_snapshot(provider, &["pkg"], &[&["glibc 217..1000"]]);
+    assert_snapshot!(result, @r"
+    cell: glibc in >=228, <1000
+      pkg=2
+    cell: not (glibc in >=228, <1000) AND glibc in >=217, <1000
+      pkg=1
+    ");
+}
+
+/// Scenario (c): constrains split with an uncovered unsolvable gap. `a`
+/// constrains `cuda >=11` and the model allows `cuda absent OR cuda >=10`.
+/// The cells for `cuda absent` and `cuda >=11` are solvable, but the region
+/// `cuda present in [10, 11)` is inside the model and unsolvable, so the
+/// whole universal solve must fail with that witness region (total coverage
+/// semantics).
+#[test]
+fn test_universal_constrains_split_unsolvable_gap() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["cuda absent", "cuda 10..100"]]);
+    assert_snapshot!(result, @"unsolvable in cell: cuda in >=10, <100 AND not (cuda in >=11, <100) AND not (cuda absent)");
+}
+
+/// Scenario (d): non-fragmentation. An environment package that is declared
+/// (and even mentioned in the model) but never load bearing must yield
+/// exactly one cell with the empty condition.
+#[test]
+fn test_universal_non_fragmentation_single_cell() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["cuda absent", "cuda 11..100"]]);
+    assert_snapshot!(result, @r"
+    cell: <all environments>
+      a=1
+    ");
+}
+
+/// Scenario (e): an unsolvable region. The only build of `a` requires
+/// `glibc >=2.28`, but the model pins glibc to `[2.17, 2.28)`. The oracle
+/// proves the two ranges disjoint, so no cell is solvable and the failure
+/// must carry the witness region.
+#[test]
+fn test_universal_unsolvable_region() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("a", Pack::new(1), &["glibc 228..1000"], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
+    assert_snapshot!(result, @"unsolvable in cell: not (glibc in >=228, <1000) AND glibc in >=217, <228");
+}
+
+/// Two independent conditional dependencies on different environment
+/// packages. The first cell records both literals false, so its blocking
+/// clause consists of two positive literals; `decide()` must actively make
+/// progress on it (watches alone never fire when both literals stay
+/// undecided) or the enumeration loop would rediscover the baseline cell
+/// forever. The full cross product of the two conditions is enumerated:
+/// four pairwise disjoint cells.
+#[test]
+fn test_universal_independent_conditions_cross_product() {
+    let result = universal_solve_snapshot(cross_product_provider(), &["a"], &[]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <10)
+      a=1
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <10)
+      a=1
+      b=1
+    cell: cuda in >=11, <100 AND rocm in >=5, <10
+      a=1
+      b=1
+      c=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <10
+      a=1
+      c=1
+    ");
+}
+
+fn cross_product_provider() -> BundleBoxProvider {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100", "c 1..2; if rocm 5..10"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+    provider.add_package("c", Pack::new(1), &[], &[]);
+    provider
+}
+
+/// Solving the same universal problem twice in fresh solvers must produce
+/// identical output (deterministic cell order, conditions and solvables).
+#[test]
+fn test_universal_determinism() {
+    let first = universal_solve_snapshot(cross_product_provider(), &["a"], &[]);
+    let second = universal_solve_snapshot(cross_product_provider(), &["a"], &[]);
+    assert_eq!(first, second);
+}
+
+/// A plain (non-universal) `solve` over the same universe as
+/// [`test_universal_conditional_dependency_two_cells`] is completely
+/// unaffected by the universal machinery: it yields the baseline solution
+/// (all environment literals false, conditional dependency inactive).
+#[test]
+fn test_universal_plain_solve_unchanged() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    a=1
+    ");
+}
+
+/// A negative model literal: the model `not (cuda in 11..100)` excludes the
+/// matching region entirely, so the conditional dependency can never
+/// activate and the enumeration stops after the baseline cell. The cell is
+/// still conditioned on `not L_11` (the condition complement is load
+/// bearing), and the blocking clause `(L_11)` then contradicts the model
+/// assertion, which the witness check recognizes as full coverage.
+#[test]
+fn test_universal_negative_model_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["not cuda 11..100"]]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    ");
+}
+
+/// Cancellation during a universal solve propagates out as
+/// [`UniversalFailure::Cancelled`].
+#[test]
+fn test_universal_cancellation() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1).cancel_during_get_dependencies(), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["cuda absent", "cuda 11..100"]]);
+    assert_snapshot!(result, @"cancelled");
+}
+
+/// AND-condition over two environment packages where one literal is forced
+/// true by the model. The condition complement disjunction is
+/// `(not L_cuda or not L_rocm)` and the baseline solution has
+/// `L_rocm = true` (model assertion) and `L_cuda` undecided: the clause is
+/// supported by `not L_cuda` ALONE. The rocm literal must not be recorded
+/// NEGATIVELY (its complement is false and contributes nothing); recording
+/// it would claim the solution is valid where rocm does not match, which is
+/// wrong. In the second cell the condition holds and `b` is installed, so
+/// both guards are recorded POSITIVELY (the rocm pin is redundant within
+/// this model, but keeps the cell a faithful record of the guards the
+/// solution relied on).
+#[test]
+fn test_universal_and_condition_with_forced_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[&["rocm 5..100"]]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: rocm in >=5, <100 AND cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
+/// AND-condition where BOTH environment literals are false in the baseline:
+/// exactly the FIRST literal of the disjunction (in encoding order, cuda
+/// before rocm) is recorded, which pins the determinism rule and gives the
+/// most general baseline cell (it covers any rocm value). The partition is
+/// three cells, not a full cross product.
+#[test]
+fn test_universal_and_condition_baseline_records_first_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <100)
+      a=1
+    cell: cuda in >=11, <100 AND rocm in >=5, <100
+      a=1
+      b=1
+    ");
+}
+
+/// The supervisor reproduction variant where the rocm literal is forced
+/// true by a ROOT REQUIREMENT instead of (only) the model: the requirement
+/// clause `(not root or L_rocm)` is genuine support, so `rocm in 5..100`
+/// legitimately appears in every cell condition, while the rocm complement
+/// still contributes nothing to the conditional clause.
+#[test]
+fn test_universal_and_condition_with_required_env_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a", "rocm 5..100"], &[&["rocm 5..100"]]);
+    assert_snapshot!(result, @r"
+    cell: rocm in >=5, <100 AND not (cuda in >=11, <100)
+      a=1
+    cell: rocm in >=5, <100 AND cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
+/// OR-condition over two environment packages: the DNF machinery produces
+/// TWO conditional requires clauses, one per disjunct. Each clause records
+/// its own complement literal in the baseline, and the enumeration covers
+/// the space in three cells (the cuda cell generalizes over rocm because
+/// `b` is installed there regardless of rocm).
+#[test]
+fn test_universal_or_condition_dnf_partition() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 or rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <100
+      a=1
+      b=1
+    ");
+}
+
+// ===========================================================================
+// M3: Output layer (merged presence view and conditional edges)
+// ===========================================================================
+
+/// Runs a universal solve and formats the merged presence view and the
+/// aggregated conditional edges for inline snapshots.
+fn universal_merged_and_edges_snapshot(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> String {
+    use std::fmt::Write;
+
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model);
+    let solution = solver.solve_universal(problem).expect("solvable");
+    let provider = solver.provider();
+
+    let mut buf = String::new();
+    writeln!(buf, "merged:").unwrap();
+    for (solvable, presence) in solution.merged() {
+        writeln!(
+            buf,
+            "  {} -> {}",
+            provider.display_solvable(solvable),
+            presence.display(provider)
+        )
+        .unwrap();
+    }
+    writeln!(buf, "edges:").unwrap();
+    for (edge, presence) in solution.edges() {
+        let parent = match edge.parent {
+            Some(parent) => provider.display_solvable(parent).to_string(),
+            None => "<root>".to_string(),
+        };
+        let target = match edge.target {
+            Some(target) => provider.display_solvable(target).to_string(),
+            None => "<environment>".to_string(),
+        };
+        writeln!(
+            buf,
+            "  {parent} -> {} -> {target} [{}]",
+            edge.requirement.display(provider),
+            presence.display(provider)
+        )
+        .unwrap();
+    }
+    buf
+}
+
+/// merged() over the cross-product scenario: `a` is in every cell and gets
+/// the always-true presence; the cells containing `b` (resp. `c`) differ only
+/// in the sign of the rocm (resp. cuda) literal, so the pairwise merge drops
+/// it. The edges carry the same presences: the root edge to `a` is
+/// unconditional, the conditional dependencies of `a` are active exactly
+/// where their guard literal is true.
+#[test]
+fn test_universal_merged_and_edges_cross_product() {
+    let result = universal_merged_and_edges_snapshot(cross_product_provider(), &["a"], &[]);
+    assert_snapshot!(result, @r"
+    merged:
+      a=1 -> <all environments>
+      b=1 -> cuda in >=11, <100
+      c=1 -> rocm in >=5, <10
+    edges:
+      <root> -> a * -> a=1 [<all environments>]
+      a=1 -> b >=1, <2 -> b=1 [cuda in >=11, <100]
+      a=1 -> c >=1, <2 -> c=1 [rocm in >=5, <10]
+    ");
+}
+
+/// merged() with a presence that does not simplify to a single conjunction:
+/// in the OR-condition scenario `b` is installed in the `cuda` cell and in
+/// the `not cuda AND rocm` cell. The two disjuncts have different lengths,
+/// so they stay an OR (the multi-literal disjunct is parenthesized).
+#[test]
+fn test_universal_merged_or_condition_keeps_disjunction() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 or rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result = universal_merged_and_edges_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    merged:
+      a=1 -> <all environments>
+      b=1 -> cuda in >=11, <100 OR (not (cuda in >=11, <100) AND rocm in >=5, <100)
+    edges:
+      <root> -> a * -> a=1 [<all environments>]
+      a=1 -> b >=1, <2 -> b=1 [cuda in >=11, <100 OR (not (cuda in >=11, <100) AND rocm in >=5, <100)]
+    ");
+}
+
+/// An edge whose requirement is on an environment package has no target
+/// solvable: the environment itself satisfies it. The root edge to `rocm` is
+/// active in every cell and aggregates to the always-true presence.
+#[test]
+fn test_universal_edges_env_requirement_has_no_target() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["b 1..2; if cuda 11..100 and rocm 5..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let result =
+        universal_merged_and_edges_snapshot(provider, &["a", "rocm 5..100"], &[&["rocm 5..100"]]);
+    assert_snapshot!(result, @r"
+    merged:
+      a=1 -> <all environments>
+      b=1 -> rocm in >=5, <100 AND cuda in >=11, <100
+    edges:
+      <root> -> a * -> a=1 [<all environments>]
+      <root> -> rocm >=5, <100 -> <environment> [<all environments>]
+      a=1 -> b >=1, <2 -> b=1 [rocm in >=5, <100 AND cuda in >=11, <100]
+    ");
+}
+
+/// The environment model may only reference environment packages; a
+/// concrete package is reported with a clear panic.
+#[test]
+#[should_panic(expected = "is not an environment package")]
+fn test_universal_model_rejects_concrete_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let _ = universal_solve_snapshot(provider, &[], &[&["b 1..2"]]);
+}
+
+/// An absent literal in the model for a package declared with
+/// `can_be_absent: false` is reported with a clear panic.
+#[test]
+#[should_panic(expected = "can_be_absent: false")]
+fn test_universal_model_rejects_absent_literal_for_present_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let _ = universal_solve_snapshot(provider, &[], &[&["cuda absent"]]);
+}
+
+/// An empty disjunction in the model makes the model unsatisfiable and is
+/// reported with a clear panic.
+#[test]
+#[should_panic(expected = "empty disjunction")]
+fn test_universal_model_rejects_empty_disjunction() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+
+    let _ = universal_solve_snapshot(provider, &[], &[&[]]);
+}
+
+// ===========================================================================
+// M4: Seeded partition (assumptions)
+// ===========================================================================
+
+/// Runs a universal solve with a seed partition and returns the solver plus
+/// the raw result, for tests that compare full solutions (via their `Debug`
+/// representation) or feed one solve's cells into another solve's seeds.
+///
+/// Note for identity comparisons across two solver instances: identically
+/// constructed [`BundleBoxProvider`]s assign identical interned ids
+/// (`add_package` interns dependency version sets eagerly, in construction
+/// order), which is what makes `Debug` output comparable byte for byte.
+#[allow(clippy::type_complexity)]
+fn universal_solve_with_seeds(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+    seeds: Vec<CellCondition<NameId>>,
+) -> (
+    Solver<BundleBoxProvider>,
+    Result<UniversalSolution, UniversalFailure<NameId>>,
+) {
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model)
+        .seed_partition(seeds);
+    let result = solver.solve_universal(problem);
+    (solver, result)
+}
+
+/// Formats a universal solve result exactly like [`universal_solve_snapshot`]
+/// does, for tests that hold the result.
+fn format_universal_result(
+    solver: &Solver<BundleBoxProvider>,
+    result: &Result<UniversalSolution, UniversalFailure<NameId>>,
+) -> String {
+    use std::fmt::Write;
+    match result {
+        Ok(solution) => {
+            let mut buf = String::new();
+            for (condition, solvables) in &solution.cells {
+                writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
+                for solvable in solvables
+                    .iter()
+                    .map(|&s| solver.provider().display_solvable(s).to_string())
+                    .sorted()
+                {
+                    writeln!(buf, "  {solvable}").unwrap();
+                }
+            }
+            buf
+        }
+        Err(UniversalFailure::Unsolvable { cell, .. }) => {
+            format!("unsolvable in cell: {}", cell.display(solver.provider()))
+        }
+        Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+    }
+}
+
+/// Runs an unseeded universal solve followed by a re-solve of the same
+/// problem with the first result's cells as the seed partition, on the SAME
+/// solver. This is the real re-solve flow: the provider, and with it every
+/// lazily interned id, persists across the two calls (the solver state
+/// itself is reset per call). Returns the solver and both solutions.
+fn universal_resolve_with_own_cells(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> (
+    Solver<BundleBoxProvider>,
+    UniversalSolution,
+    UniversalSolution,
+) {
+    let requirements = provider.requirements(specs);
+    let environment_model: Vec<Vec<(EnvLiteral<NameId>, bool)>> = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let first = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements.clone())
+                .environment_model(environment_model.clone()),
+        )
+        .expect("solvable");
+
+    let seeds = first
+        .cells
+        .iter()
+        .map(|(condition, _)| condition.clone())
+        .collect();
+    let second = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(environment_model)
+                .seed_partition(seeds),
+        )
+        .expect("solvable");
+
+    (solver, first, second)
+}
+
+/// Seed stability (design doc 5.7 / M4 acceptance): re-solving the same
+/// universe with the previous result's cells as the seed partition
+/// reproduces the partition exactly: identical cells (conditions and
+/// solvables), identical environment model and identical edges. Each seed is
+/// solved first under assumptions; because each seed equals a recorded cell
+/// of the same universe, every inner solve replays the original solution,
+/// the disjointness repair re-derives the original conditions, and the
+/// trailing free enumeration finds the model already fully covered.
+#[test]
+fn test_universal_seed_reproduces_partition() {
+    let (solver, first, second) =
+        universal_resolve_with_own_cells(cross_product_provider(), &["a"], &[]);
+
+    // Byte-identical solutions: cells, environment model and per-cell edges.
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+    // And in human-readable form: the seeded partition is exactly the
+    // unseeded cross-product partition of the M2 test.
+    assert_snapshot!(format_universal_result(&solver, &Ok(second)), @r"
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <10)
+      a=1
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <10)
+      a=1
+      b=1
+    cell: cuda in >=11, <100 AND rocm in >=5, <10
+      a=1
+      b=1
+      c=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <10
+      a=1
+      c=1
+    ");
+}
+
+/// Determinism (M4 acceptance): the same seeded input solved twice, in two
+/// independent but identically constructed solvers, produces byte-identical
+/// output. (Identical construction drives identical lazy interning, so the
+/// ids embedded in the `Debug` output are comparable across the instances.)
+#[test]
+fn test_universal_seeded_determinism() {
+    let (_, _, first) = universal_resolve_with_own_cells(cross_product_provider(), &["a"], &[]);
+    let (_, _, second) = universal_resolve_with_own_cells(cross_product_provider(), &["a"], &[]);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+}
+
+/// A seed literal whose package is not an environment package is a caller
+/// error and panics with a clear message.
+#[test]
+#[should_panic(expected = "is not an environment package")]
+fn test_universal_seed_rejects_concrete_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let seed = CellCondition(vec![parse_env_literal(&mut provider, "b 1..2")]);
+    let _ = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+}
+
+/// An absent seed literal for a package declared with `can_be_absent: false`
+/// is a caller error and panics with a clear message.
+#[test]
+#[should_panic(expected = "can_be_absent: false")]
+fn test_universal_seed_rejects_absent_literal_for_present_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let seed = CellCondition(vec![parse_env_literal(&mut provider, "cuda absent")]);
+    let _ = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+}
+
+/// Assumption-boundary case named by the design doc: a conflict at exactly
+/// level n+1, the root install level of a seeded solve. The seed
+/// `not (cuda absent) AND not (cuda 11..100)` describes a region outside the
+/// model `cuda absent OR cuda 11..100`: the two assumptions occupy levels 1
+/// and 2, the root is installed at level 3 = n+1, and the very first
+/// propagation walks the model clause `(absent OR matches)`, whose two
+/// literals are both false by assumption, forcing a conflict at level n+1
+/// before any search decision is made. The solver must report the seed
+/// unsolvable as seeded (not a global conflict), drop it, and free
+/// enumeration must then produce exactly the unseeded partition.
+#[test]
+fn test_universal_seed_conflict_at_level_n_plus_one_drops_seed() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 11..100"),
+    ]];
+    let seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "not cuda absent"),
+        parse_env_literal(&mut provider, "not cuda 11..100"),
+    ]);
+
+    let mut solver = Solver::new(provider);
+    let unseeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements.clone())
+                .environment_model(model.clone()),
+        )
+        .expect("solvable");
+    let seeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(vec![seed]),
+        )
+        .expect("solvable");
+
+    assert_eq!(format!("{unseeded:?}"), format!("{seeded:?}"));
+    assert_snapshot!(format_universal_result(&solver, &Ok(seeded)), @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
+/// Re-seeding the candidate-split universe of
+/// [`test_universal_candidate_split_generalization`] with its own partition
+/// reproduces it byte-identically. Notably this run involves NO conflict at
+/// all: for the second seed (`glibc >=217 AND not (glibc >=228)`), pkg=2's
+/// requires clause `(not pkg2 or L_228)` already exists (encoded during the
+/// first seed's solve), so propagating the assumption `not L_228` excludes
+/// pkg=2 before any decision is made and pkg=1 is chosen directly. The
+/// conflict-driven variant of the same universe, where the clause is only
+/// created mid-solve, is [`test_universal_seed_order_changes_generalization`].
+#[test]
+fn test_universal_seed_reproduces_candidate_split_partition() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("pkg", Pack::new(2), &["glibc 228..1000"], &[]);
+    provider.add_package("pkg", Pack::new(1), &["glibc 217..1000"], &[]);
+
+    let (solver, first, second) =
+        universal_resolve_with_own_cells(provider, &["pkg"], &[&["glibc 217..1000"]]);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    assert_snapshot!(format_universal_result(&solver, &Ok(second)), @r"
+    cell: glibc in >=228, <1000
+      pkg=2
+    cell: not (glibc in >=228, <1000) AND glibc in >=217, <1000
+      pkg=1
+    ");
+}
+
+/// Assumption-boundary case named by the design doc: a learnt clause whose
+/// raw backjump target lies INSIDE the assumption prefix and must be
+/// clamped to the root level directly above it.
+///
+/// The candidate-split universe is seeded with its SECOND cell first:
+/// `glibc >=217 AND not (glibc >=228)`, n = 2 assumptions at levels 1 and
+/// 2, root at level 3. pkg=2's requires clause does not exist yet when the
+/// assumptions are propagated (no earlier cell encoded it), so the solver
+/// decides pkg=2 (highest version) at level 4 and only then encodes
+/// `(not pkg2 or L_228)`, whose candidates are all false under the
+/// assumptions; after the resulting restart pkg=2 is re-decided at level 4
+/// and propagation now conflicts at level 4 > n+1. Analysis learns
+/// `(L_228 or not pkg2)` whose lone non-UIP literal sits at assumption
+/// level 2, giving a raw backjump target of 2 INSIDE the assumption
+/// prefix; jumping there would pop the root install (and nothing would
+/// reinstall it), so the target is clamped to the root level n+1 = 3,
+/// where `not pkg2` is asserted and the solve completes with pkg=1. The
+/// learnt clause is a valid resolvent of real clauses (assumptions appear
+/// only as literals, never as resolution steps) and safely persists.
+///
+/// The test also documents two effects of seed order: (1) with no earlier
+/// cell to stay disjoint from, the recorded cell generalizes to all of
+/// `glibc >=217` (pkg=1 is valid for the entire model), and (2) the second
+/// seed `glibc >=228` then contradicts the first cell's blocking clause
+/// during its first propagation and is dropped. The partition legitimately
+/// DIFFERS from the unseeded one (which prefers pkg=2 where possible) but
+/// is a valid cover; this is why the shuffled-seed property test asserts
+/// validity, not equality: generalization depends on which cells were
+/// recorded before, so seed order can change the partition's content.
+#[test]
+fn test_universal_seed_order_changes_generalization() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("pkg", Pack::new(2), &["glibc 228..1000"], &[]);
+    provider.add_package("pkg", Pack::new(1), &["glibc 217..1000"], &[]);
+
+    let requirements = provider.requirements(&["pkg"]);
+    let model = vec![vec![parse_env_literal(&mut provider, "glibc 217..1000")]];
+    let seeds = vec![
+        CellCondition(vec![
+            parse_env_literal(&mut provider, "glibc 217..1000"),
+            parse_env_literal(&mut provider, "not glibc 228..1000"),
+        ]),
+        CellCondition(vec![parse_env_literal(&mut provider, "glibc 228..1000")]),
+    ];
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(seeds),
+        )
+        .expect("solvable");
+
+    // The partition is a valid, disjoint, covering one.
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_snapshot!(format_universal_result(&solver, &Ok(solution)), @r"
+    cell: glibc in >=217, <1000
+      pkg=1
+    ");
+}
+
+/// A seed invalidated by a changed universe is dropped and its region is
+/// re-enumerated; full coverage is still achieved (M4 stability test). The
+/// "previous" universe split at cuda 11 and produced the (now stale) cells
+/// `cuda absent` and `cuda >=11 AND not (cuda >=12)`; the "new" universe
+/// constrains cuda to `>=12` and its model no longer admits cuda versions
+/// below 12. Seed 1 (`cuda absent`) still solves and is reproduced. Seed 2
+/// describes a region outside the new model: propagating its assumptions
+/// against the model clause `(absent OR matches >=12)` conflicts at level
+/// n+1 (the absent literal is excluded by the oracle, the matches literal
+/// by assumption), so the seed is dropped. Free enumeration then covers the
+/// remaining `cuda >=12` region, and the final partition passes the
+/// independent verifier.
+#[test]
+fn test_universal_invalidated_seed_dropped_region_reenumerated() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &[], &["cuda 12..100"]);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 12..100"),
+    ]];
+    let seeds = vec![
+        CellCondition(vec![parse_env_literal(&mut provider, "cuda absent")]),
+        CellCondition(vec![
+            parse_env_literal(&mut provider, "cuda 11..100"),
+            parse_env_literal(&mut provider, "not cuda 12..100"),
+        ]),
+    ];
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(seeds),
+        )
+        .expect("solvable");
+
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_snapshot!(format_universal_result(&solver, &Ok(solution)), @r"
+    cell: cuda absent
+      a=1
+    cell: cuda in >=12, <100
+      a=1
+    ");
+}
+
+/// An assumption-level conflict does not corrupt later cells (M4 stability
+/// test): a seed whose two assumptions contradict each other through an
+/// oracle consistency clause (`cuda 11..100` AND `cuda absent`) conflicts
+/// during its first propagation at level n+1 and is dropped. The full free
+/// enumeration that follows must be byte-identical to the unseeded solve of
+/// the same problem: no leftover decision, level, or assumption state may
+/// leak out of the dropped seed.
+#[test]
+fn test_universal_dropped_seed_then_free_enumeration_matches_unseeded() {
+    let mut provider = cross_product_provider();
+    let requirements = provider.requirements(&["a"]);
+    let bogus_seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "cuda 11..100"),
+        parse_env_literal(&mut provider, "cuda absent"),
+    ]);
+
+    let mut solver = Solver::new(provider);
+    let unseeded = solver
+        .solve_universal(UniversalProblem::new().requirements(requirements.clone()))
+        .expect("solvable");
+    let seeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .seed_partition(vec![bogus_seed]),
+        )
+        .expect("solvable");
+
+    assert_eq!(format!("{unseeded:?}"), format!("{seeded:?}"));
+}
+
+/// A stale over-specific seed heals (design doc 5.7): the recorded cell is
+/// the load-bearing support of the NEW solution, which may be more general
+/// than the seed. The seed pins both `cuda >=12` and `rocm 5..10`, but in
+/// the current universe the solution only depends on cuda; the recorded
+/// cell drops the rocm literal entirely and covers the whole model in one
+/// cell, instead of perpetuating the stale fragmentation.
+#[test]
+fn test_universal_stale_seed_heals_to_general_cell() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package("a", Pack::new(1), &["cuda 12..100"], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = vec![vec![parse_env_literal(&mut provider, "cuda 12..100")]];
+    let seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "cuda 12..100"),
+        parse_env_literal(&mut provider, "rocm 5..10"),
+    ]);
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model)
+                .seed_partition(vec![seed]),
+        )
+        .expect("solvable");
+
+    assert_snapshot!(format_universal_result(&solver, &Ok(solution)), @r"
+    cell: cuda in >=12, <100
+      a=1
+    ");
+}
+
+/// A seed that contradicts itself on the same literal (`cuda 11..100` both
+/// positive and negative) describes no environment at all: it is dropped at
+/// assumption setup (the second decision on the same variable fails) and the
+/// solve continues as if the seed was not given.
+#[test]
+fn test_universal_self_contradictory_seed_dropped() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let seed = CellCondition(vec![
+        parse_env_literal(&mut provider, "cuda 11..100"),
+        parse_env_literal(&mut provider, "not cuda 11..100"),
+    ]);
+    let (solver, result) = universal_solve_with_seeds(
+        provider,
+        &["a"],
+        &[&["cuda absent", "cuda 11..100"]],
+        vec![seed],
+    );
+    assert_snapshot!(format_universal_result(&solver, &result), @r"
+    cell: not (cuda in >=11, <100)
+      a=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
+    ");
+}
+
 /// Multiple constraints from different parents on the same package.
 #[test]
 fn test_constrains_multiple_parents() {
@@ -2216,3 +3480,698 @@ fn test_decide_queue_union_duplicate_name() {
 }
 
 mod decide_queue_prop;
+
+// ===========================================================================
+// M5: Conflict reporting for environment literals
+// ===========================================================================
+
+/// Formats a universal failure for inline snapshot assertions: shows the
+/// witness cell and the full conflict display. Used by M5 tests.
+fn universal_failure_snapshot(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> String {
+    use std::fmt::Write;
+
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model);
+    match solver.solve_universal(problem) {
+        Ok(_) => panic!("expected UniversalFailure::Unsolvable, but solve succeeded"),
+        Err(UniversalFailure::Unsolvable { cell, conflict }) => {
+            let mut buf = String::new();
+            writeln!(buf, "cell: {}", cell.display(solver.provider())).unwrap();
+            writeln!(buf, "{}", conflict.display_user_friendly(&solver)).unwrap();
+            buf
+        }
+        Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+    }
+}
+
+/// (M5-a) Scoped conflict for `test_universal_unsolvable_region`: `a=1`
+/// requires `glibc >=228`, but the only modeled region has `glibc in
+/// [217, 228)`.  After the scoped re-solve the conflict display must mention
+/// the requirement on the environment literal without panicking. Environment
+/// packages are symbolic: they must never be reported as "missing".
+#[test]
+fn test_m5_conflict_display_requires_env_package() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("glibc", false);
+    provider.add_package("a", Pack::new(1), &["glibc 228..1000"], &[]);
+
+    let result = universal_failure_snapshot(provider, &["a"], &[&["glibc 217..228"]]);
+    assert_snapshot!(result, @r"
+    cell: not (glibc in >=228, <1000) AND glibc in >=217, <228
+    The following packages are incompatible
+    └─ a * cannot be installed because there are no viable options:
+       └─ a 1 would require
+          └─ glibc >=228, <1000, which the environment cannot provide
+    ");
+}
+
+/// (M5-b) Plain solve with two disjoint requirements on the same env package:
+/// the requirements are rendered as environment requirements (never as
+/// missing packages) and the oracle consistency clause between them is
+/// rendered as a mutual-exclusivity conflict.
+#[test]
+fn test_m5_conflict_display_oracle_disjoint() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    let requirements = provider.requirements(&["cuda 0..5", "cuda 11..100"]);
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(requirements);
+    match solver.solve(problem) {
+        Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
+            let display = conflict.display_user_friendly(&solver).to_string();
+            // Must not panic, must mention both environment requirements and
+            // their mutual exclusivity, and must not claim candidates are
+            // missing.
+            assert_snapshot!(display, @r"
+            The following packages are incompatible
+            ├─ the environment must provide cuda >=0, <5
+            └─ the environment must provide cuda >=11, <100
+               └─ cuda >=11, <100 and cuda >=0, <5 are mutually exclusive environment requirements
+            ");
+        }
+        other => panic!("expected Unsolvable, got {other:?}"),
+    }
+}
+
+/// (M5-c) Scoped conflict for the constrains-split unsolvable-gap scenario:
+/// the conflict in the scoped re-solve mentions the env constraint on `cuda`,
+/// not a generic unscoped conflict.
+#[test]
+fn test_m5_conflict_display_env_constrains_scoped() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
+
+    let result = universal_failure_snapshot(provider, &["a"], &[&["cuda absent", "cuda 10..100"]]);
+    assert_snapshot!(result, @r"
+    cell: cuda in >=10, <100 AND not (cuda in >=11, <100) AND not (cuda absent)
+    The following packages are incompatible
+    └─ a * cannot be installed because there are no viable options:
+       └─ a 1 would constrain
+          └─ the environment to lack cuda or provide cuda >=11, <100, but this environment region provides cuda outside that range
+    ");
+}
+
+// ============================================================================
+// Snapshot support for universal solving (bench infrastructure)
+// ============================================================================
+
+/// Builds a tiny handcrafted [`resolvo::snapshot::DependencySnapshot`] with an
+/// environment package `__glibc` whose simulated machine candidate is 2.35,
+/// and a package `a` whose build 2 requires `__glibc >=3` and build 1
+/// requires `__glibc >=2`. The precomputed relation table holds the single
+/// cross entry `>=2 superset of >=3`.
+fn environment_snapshot() -> resolvo::snapshot::DependencySnapshot {
+    use resolvo::{
+        DenseIndex, Dependencies, EnvironmentPackage, KnownDependencies, Mapping,
+        VersionSetRelation,
+        snapshot::{DependencySnapshot, Package, Solvable, VersionSet},
+    };
+
+    let name_a = NameId::from_index(0);
+    let name_glibc = NameId::from_index(1);
+    let solvable_a2 = SolvableId::from_index(0);
+    let solvable_a1 = SolvableId::from_index(1);
+    let solvable_glibc = SolvableId::from_index(2);
+    let glibc_ge2 = VersionSetId::from_index(0);
+    let glibc_ge3 = VersionSetId::from_index(1);
+
+    let mut solvables = Mapping::default();
+    solvables.insert(
+        solvable_a2,
+        Solvable {
+            display: "a=2".to_string(),
+            name: name_a,
+            order: 0,
+            dependencies: Dependencies::Known(KnownDependencies {
+                requirements: vec![glibc_ge3.into()],
+                constrains: vec![],
+            }),
+            hint_dependencies_available: true,
+        },
+    );
+    solvables.insert(
+        solvable_a1,
+        Solvable {
+            display: "a=1".to_string(),
+            name: name_a,
+            order: 1,
+            dependencies: Dependencies::Known(KnownDependencies {
+                requirements: vec![glibc_ge2.into()],
+                constrains: vec![],
+            }),
+            hint_dependencies_available: true,
+        },
+    );
+    solvables.insert(
+        solvable_glibc,
+        Solvable {
+            display: "__glibc=2.35".to_string(),
+            name: name_glibc,
+            order: 0,
+            dependencies: Dependencies::Known(KnownDependencies {
+                requirements: vec![],
+                constrains: vec![],
+            }),
+            hint_dependencies_available: true,
+        },
+    );
+
+    let mut version_sets = Mapping::default();
+    version_sets.insert(
+        glibc_ge2,
+        VersionSet {
+            name: name_glibc,
+            display: ">=2".to_string(),
+            matching_candidates: [solvable_glibc].into_iter().collect(),
+        },
+    );
+    version_sets.insert(
+        glibc_ge3,
+        VersionSet {
+            name: name_glibc,
+            display: ">=3".to_string(),
+            matching_candidates: std::iter::empty().collect(),
+        },
+    );
+
+    let mut packages = Mapping::default();
+    packages.insert(
+        name_a,
+        Package {
+            name: "a".to_string(),
+            solvables: vec![solvable_a2, solvable_a1],
+            excluded: vec![],
+            environment: None,
+        },
+    );
+    packages.insert(
+        name_glibc,
+        Package {
+            name: "__glibc".to_string(),
+            solvables: vec![solvable_glibc],
+            excluded: vec![],
+            environment: Some(EnvironmentPackage {
+                can_be_absent: false,
+            }),
+        },
+    );
+
+    DependencySnapshot {
+        solvables,
+        version_set_unions: Mapping::default(),
+        version_sets,
+        packages,
+        strings: Mapping::default(),
+        conditions: Mapping::default(),
+        environment_version_set_relations: vec![(
+            glibc_ge2,
+            glibc_ge3,
+            VersionSetRelation::Superset,
+        )],
+    }
+}
+
+/// Regression test: additional version sets must not shadow the snapshot's
+/// last version set (`Mapping::max` returns the highest id, not the count).
+#[test]
+fn test_snapshot_additional_version_set_does_not_shadow_last() {
+    use resolvo::DenseIndex;
+
+    let snapshot = environment_snapshot();
+    let mut provider = snapshot.provider();
+    let req = provider.add_package_requirement(NameId::from_index(0), "*");
+    assert_eq!(
+        provider
+            .display_version_set(VersionSetId::from_index(1))
+            .to_string(),
+        ">=3"
+    );
+    assert_eq!(provider.display_version_set(req).to_string(), "*");
+}
+
+/// In concrete mode (the default) the environment marker is ignored: the
+/// machine candidate `__glibc=2.35` is a plain solvable, so `a=2`
+/// (requiring `__glibc >=3`) is uninstallable and the solver falls back to
+/// `a=1`.
+#[test]
+fn test_snapshot_concrete_mode_solves_machine_candidates() {
+    use resolvo::DenseIndex;
+
+    let snapshot = environment_snapshot();
+    let mut provider = snapshot.provider();
+    let req = provider.add_package_requirement(NameId::from_index(0), "*");
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new().requirements(vec![req.into()]);
+    let solved = solver.solve(problem).unwrap();
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    __glibc=2.35
+    a=1
+    ");
+}
+
+/// In universal mode the marked package becomes an environment package and
+/// the embedded relation table answers the oracle: the solve splits on the
+/// two glibc literals, and the disjointness repair needs the `Superset`
+/// answer (looked up in flipped order) to know `>=2` and `>=3` overlap.
+#[test]
+fn test_snapshot_universal_mode_enumerates_cells() {
+    use std::fmt::Write;
+
+    use resolvo::DenseIndex;
+
+    let snapshot = environment_snapshot();
+    let name_glibc = NameId::from_index(1);
+    let glibc_ge2 = VersionSetId::from_index(0);
+
+    let mut provider = snapshot.provider().with_universal_mode(true);
+    let req = provider.add_package_requirement(NameId::from_index(0), "*");
+    let mut solver = Solver::new(provider);
+    let model = vec![vec![(
+        EnvLiteral {
+            package: name_glibc,
+            kind: EnvLiteralKind::Matches(glibc_ge2),
+        },
+        true,
+    )]];
+    let problem = UniversalProblem::new()
+        .requirements(vec![req.into()])
+        .environment_model(model);
+    let solution = solver.solve_universal(problem).unwrap();
+
+    let mut buf = String::new();
+    for (condition, solvables) in &solution.cells {
+        writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
+        for solvable in solvables
+            .iter()
+            .map(|&s| solver.provider().display_solvable(s).to_string())
+            .sorted()
+        {
+            writeln!(buf, "  {solvable}").unwrap();
+        }
+    }
+    assert_snapshot!(buf, @r"
+    cell: __glibc in >=3
+      a=2
+    cell: __glibc in >=2 AND not (__glibc in >=3)
+      a=1
+    ");
+
+    // The independent verifier accepts the partition through the same
+    // table-backed oracle.
+    solution.verify(solver.provider()).unwrap();
+
+    // Projection onto simulated machines: glibc 2.x matches only `>=2`,
+    // glibc 3.x matches both literals.
+    let machine_2 = solution
+        .project(|literal| literal.kind == EnvLiteralKind::Matches(glibc_ge2))
+        .expect("a cell covers glibc 2.x machines");
+    assert_eq!(machine_2, &[SolvableId::from_index(1)]);
+    let machine_3 = solution
+        .project(|_| true)
+        .expect("a cell covers glibc 3.x machines");
+    assert_eq!(machine_3, &[SolvableId::from_index(0)]);
+}
+
+/// The environment marker and the relation table survive a JSON round trip.
+#[cfg(feature = "serde")]
+#[test]
+fn test_snapshot_environment_serde_roundtrip() {
+    use resolvo::{DenseIndex, VersionSetRelation, snapshot::DependencySnapshot};
+
+    let snapshot = environment_snapshot();
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let deserialized: DependencySnapshot = serde_json::from_str(&json).unwrap();
+    assert!(
+        deserialized
+            .packages
+            .get(NameId::from_index(1))
+            .unwrap()
+            .environment
+            .is_some()
+    );
+    assert_eq!(
+        deserialized.environment_version_set_relations,
+        vec![(
+            VersionSetId::from_index(0),
+            VersionSetId::from_index(1),
+            VersionSetRelation::Superset,
+        )]
+    );
+}
+
+// ===========================================================================
+// Trail-prefix preservation across universal cells
+// (docs/design/universal-trail-reuse.md)
+// ===========================================================================
+
+/// After recording a cell, the solver retracts the trail only far enough
+/// that the new blocking clause is no longer falsified and continues from
+/// the surviving prefix. The environment-independent part of the solution
+/// (the chain below `a`) is decided once and reused, so the second cell
+/// propagates strictly fewer decisions than the first.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_trail_reuse_second_cell_decides_less() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["c1", "b 1..2; if cuda 11..100"], &[]);
+    for i in 1..10 {
+        let name = format!("c{i}");
+        let dep = format!("c{}", i + 1);
+        provider.add_package(&name, Pack::new(1), &[dep.as_str()], &[]);
+    }
+    provider.add_package("c10", Pack::new(1), &[], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(UniversalProblem::new().requirements(requirements))
+        .expect("solvable");
+    solution.verify(solver.provider()).unwrap();
+
+    let cell_decisions = solver.universal_cell_decisions();
+    assert_eq!(
+        cell_decisions.len(),
+        solution.cells.len(),
+        "one counter entry per recorded cell"
+    );
+    assert_eq!(
+        cell_decisions.len(),
+        2,
+        "the conditional dependency splits the space in two"
+    );
+    assert!(
+        cell_decisions[1] < cell_decisions[0],
+        "the second cell must reuse the kept trail prefix and decide strictly \
+         fewer variables than the first (got {cell_decisions:?})"
+    );
+
+    // The pin counters attribute every cell literal to exactly one pinning
+    // rule, so per cell their total equals the condition length.
+    let pins = solver.universal_cell_pins();
+    assert_eq!(
+        pins.len(),
+        solution.cells.len(),
+        "one pin-count entry per recorded cell"
+    );
+    for (pin, (condition, _)) in pins.iter().zip(&solution.cells) {
+        assert_eq!(
+            pin.total() as usize,
+            condition.0.len(),
+            "every literal of the cell condition is attributed to exactly one \
+             pinning rule (got {pin:?} for a condition of {} literals)",
+            condition.0.len()
+        );
+    }
+}
+
+/// Environment literals must be decided at the top of the trail so that the
+/// retract target of every cell transition sits within a few levels of the
+/// trail depth (the env-literals-last decision ordering, see
+/// docs/design/universal-env-literals-last.md). Without the ordering, env
+/// literals are assigned at the level where the package requiring them is
+/// installed, and every transition that flips one re-derives the entire
+/// trail above that mid-trail level.
+///
+/// The universe is a two-axis variant grid: `v` has one build per `osver`
+/// region and `w` one build per `arch` region, plus a chain `c1..c8` of
+/// env-independent packages (two versions each, so each link is a real
+/// decision) that must end up below the env-sensitive tail of the trail.
+/// The variant parents exercise the cross-cell knowledge class (a build's
+/// requirement on an env package is only known after its clauses were
+/// encoded once), and the env literals themselves exercise the env-literal
+/// class (deferrable on sight, so even the first cell keeps them at the
+/// top).
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_env_literals_decided_last() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("osver", false);
+    provider.add_environment_package("arch", false);
+    provider.add_package("v", Pack::new(2), &["osver 2..3"], &[]);
+    provider.add_package("v", Pack::new(1), &["osver 1..2"], &[]);
+    provider.add_package("w", Pack::new(2), &["arch 2..3"], &[]);
+    provider.add_package("w", Pack::new(1), &["arch 1..2"], &[]);
+    for i in 1..8 {
+        let name = format!("c{i}");
+        let dep = format!("c{}", i + 1);
+        provider.add_package(&name, Pack::new(2), &[dep.as_str()], &[]);
+        provider.add_package(&name, Pack::new(1), &[dep.as_str()], &[]);
+    }
+    provider.add_package("c8", Pack::new(2), &[], &[]);
+    provider.add_package("c8", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["v", "w", "c1"]);
+    let environment_model = vec![
+        vec![
+            parse_env_literal(&mut provider, "osver 1..2"),
+            parse_env_literal(&mut provider, "osver 2..3"),
+        ],
+        vec![
+            parse_env_literal(&mut provider, "arch 1..2"),
+            parse_env_literal(&mut provider, "arch 2..3"),
+        ],
+    ];
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(environment_model),
+        )
+        .expect("solvable");
+    solution.verify(solver.provider()).unwrap();
+    assert_eq!(
+        solution.cells.len(),
+        4,
+        "one cell per osver x arch region of the model"
+    );
+
+    let retracts = solver.universal_cell_retracts();
+    assert_eq!(
+        retracts.len(),
+        4,
+        "one retract observation per free-phase cell"
+    );
+    // The first cell's env literals are decided last even without
+    // cross-cell knowledge (they are deferrable on sight), so its retract
+    // target must already sit at the top of the trail. Without the ordering
+    // they are decided right after the variant parents install, far below
+    // the chain, and the first retract throws most of the trail away.
+    let (first_target, first_depth) = retracts[0];
+    assert!(
+        first_target + 2 >= first_depth,
+        "cell 0: retract target {first_target} is far below the trail depth {first_depth}; \
+         an environment literal was assigned mid-trail (all retracts: {retracts:?})"
+    );
+
+    // At most one transition may retract deep: the first conflict against a
+    // variant parent that was positioned before its env-sensitivity was
+    // known rebuilds the trail in the deferred shape, and every transition
+    // after that keeps everything but the env-sensitive tail. Without the
+    // ordering every transition that flips an axis retracts deep.
+    let deep_transitions = retracts
+        .iter()
+        .filter(|&&(target, depth)| target + 2 < depth)
+        .count();
+    assert!(
+        deep_transitions <= 1,
+        "{deep_transitions} transitions retracted far below the trail depth; environment \
+         literals keep landing mid-trail (all retracts: {retracts:?})"
+    );
+
+    // A mechanical enumeration needs only a handful of conflicts per cell,
+    // so the refutation switch must never trip and take the ordering (and
+    // with it the cheap transitions above) away.
+    assert_eq!(
+        solver.env_ordering_suspensions(),
+        0,
+        "the refutation switch tripped on a conflict-light mechanical enumeration"
+    );
+}
+
+/// The refutation switch: a `run_sat` call that crosses the per-run
+/// conflict limit suspends the env-literals-last ordering for the rest of
+/// that run (refutations want env conflicts early, the deferral postpones
+/// them; see docs/design/universal-refutation-ordering.md).
+///
+/// The universe couples an env-dependent package `v` (so environment
+/// literals exist and the ordering is active) with an env-independent
+/// unsatisfiable core: every version of `a` needs a different exclusive
+/// version of `m` than every version of `b`, so refuting the formula takes
+/// one real conflict per candidate pairing. With the limit lowered to 2 the
+/// free-phase run must trip the switch, and the verdict must still be the
+/// correct unsolvable-region failure.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_refutation_switch_trips_and_keeps_verdict() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("v", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("v", Pack::new(1), &[], &[]);
+    for i in 1..=4u32 {
+        let a_dep = format!("m {i}..{}", i + 1);
+        let b_dep = format!("m {}..{}", i + 4, i + 5);
+        provider.add_package("a", Pack::new(i), &[a_dep.as_str()], &[]);
+        provider.add_package("b", Pack::new(i), &[b_dep.as_str()], &[]);
+        provider.add_package("m", Pack::new(i), &[], &[]);
+        provider.add_package("m", Pack::new(i + 4), &[], &[]);
+    }
+
+    let requirements = provider.requirements(&["v", "a", "b"]);
+    let environment_model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 11..100"),
+    ]];
+
+    let mut solver = Solver::new(provider);
+    solver.set_env_ordering_conflict_limit(2);
+    let result = solver.solve_universal(
+        UniversalProblem::new()
+            .requirements(requirements)
+            .environment_model(environment_model),
+    );
+
+    assert!(
+        matches!(result, Err(UniversalFailure::Unsolvable { .. })),
+        "the a/b/m core is unsolvable in every region"
+    );
+    assert!(
+        solver.env_ordering_suspensions() >= 1,
+        "a conflict-heavy refutation run must trip the refutation switch \
+         (got {} suspensions)",
+        solver.env_ordering_suspensions()
+    );
+}
+
+/// Stage 2 of the refutation switch: with the conflict limit out of reach,
+/// a run that keeps propagating after its first conflict must cross the
+/// work deadline and escalate to a restart with an activity reset, and the
+/// verdict must still be the correct unsolvable-region failure. Uses the
+/// same universe as the stage-1 test with a one-propagation work budget so
+/// the deadline trips immediately after the first conflict.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn test_universal_refutation_switch_work_deadline_restarts() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("v", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("v", Pack::new(1), &[], &[]);
+    for i in 1..=4u32 {
+        let a_dep = format!("m {i}..{}", i + 1);
+        let b_dep = format!("m {}..{}", i + 4, i + 5);
+        provider.add_package("a", Pack::new(i), &[a_dep.as_str()], &[]);
+        provider.add_package("b", Pack::new(i), &[b_dep.as_str()], &[]);
+        provider.add_package("m", Pack::new(i), &[], &[]);
+        provider.add_package("m", Pack::new(i + 4), &[], &[]);
+    }
+
+    let requirements = provider.requirements(&["v", "a", "b"]);
+    let environment_model = vec![vec![
+        parse_env_literal(&mut provider, "cuda absent"),
+        parse_env_literal(&mut provider, "cuda 11..100"),
+    ]];
+
+    let mut solver = Solver::new(provider);
+    solver.set_env_ordering_conflict_limit(u64::MAX);
+    solver.set_env_ordering_work_budget(0, 1);
+    let result = solver.solve_universal(
+        UniversalProblem::new()
+            .requirements(requirements)
+            .environment_model(environment_model),
+    );
+
+    assert!(
+        matches!(result, Err(UniversalFailure::Unsolvable { .. })),
+        "the a/b/m core is unsolvable in every region"
+    );
+    assert_eq!(
+        solver.env_ordering_suspensions(),
+        0,
+        "the conflict limit must be unreachable in this configuration"
+    );
+    assert!(
+        solver.env_ordering_restarts() >= 1,
+        "crossing the work deadline after a conflict must escalate to a \
+         rescoring restart (got {} restarts)",
+        solver.env_ordering_restarts()
+    );
+}
+
+/// A cell whose condition is a single literal (assigned mid-trail by the
+/// requires clause of `a=2`): the blocking clause is a single-literal
+/// assertion. After the partial retraction it must propagate immediately and
+/// flip the literal, steering the next solve to `a=1` instead of
+/// rediscovering the blocked cell (which would break the disjointness-repair
+/// invariant and loop forever).
+#[test]
+fn test_universal_trail_reuse_unit_blocking_clause_flips_literal() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("a", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["a"], &[]);
+    assert_snapshot!(result, @r"
+    cell: cuda in >=11, <100
+      a=2
+    cell: not (cuda in >=11, <100)
+      a=1
+    ");
+}
+
+/// A blocking clause that forces a different build of a package decided in
+/// the kept prefix: enumerating the cross product of two env-dependent
+/// version choices eventually requires flipping the cuda literal while `x=2`
+/// (which requires it) sits in the kept prefix. The conflict must backjump
+/// through the prefix like through any ordinary decision (the prefix is NOT
+/// an assumption), re-deciding `x=1`; the enumeration completes with a full
+/// disjoint cover instead of reporting unsolvable.
+#[test]
+fn test_universal_trail_reuse_conflict_backjumps_through_prefix() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_package("x", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("x", Pack::new(1), &[], &[]);
+    provider.add_package("y", Pack::new(2), &["rocm 5..100"], &[]);
+    provider.add_package("y", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["x", "y"], &[]);
+    assert_snapshot!(result, @r"
+    cell: cuda in >=11, <100 AND rocm in >=5, <100
+      x=2
+      y=2
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <100)
+      x=2
+      y=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <100
+      x=1
+      y=2
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <100)
+      x=1
+      y=1
+    ");
+}

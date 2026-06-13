@@ -20,8 +20,8 @@ use std::process;
 use resolvo::utils::{Pool, VersionSet};
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    HintDependenciesAvailable, Interner, KnownDependencies, NameId, Problem, SolvableId, Solver,
-    SolverCache, StringId, VersionSetId, VersionSetUnionId,
+    HintDependenciesAvailable, Interner, KnownDependencies, NameId, PackageCandidates, Problem,
+    SolvableId, Solver, SolverCache, StringId, VersionSetId, VersionSetUnionId,
 };
 
 // -- VersionSet implementation ------------------------------------------------
@@ -244,7 +244,7 @@ impl DependencyProvider for SudokuProvider {
             .collect()
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
         let cell = self.names.iter().position(|&n| n == name)?;
 
         let candidates: Vec<SolvableId> = (1..=9u8)
@@ -254,13 +254,13 @@ impl DependencyProvider for SudokuProvider {
         // If this cell has a pre-filled digit, lock the solver to that single candidate.
         let locked = self.givens[cell].map(|digit| self.solvable_id(cell, digit));
 
-        Some(Candidates {
+        Some(PackageCandidates::Candidates(Candidates {
             candidates,
             locked,
             favored: None,
             hint_dependencies_available: HintDependenciesAvailable::All,
             excluded: Vec::new(),
-        })
+        }))
     }
 
     async fn sort_candidates(&self, _solver: &SolverCache<Self>, solvables: &mut [SolvableId]) {

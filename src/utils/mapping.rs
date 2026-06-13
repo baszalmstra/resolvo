@@ -213,7 +213,11 @@ impl<'a, TId: DenseIndex, TValue> Iterator for MappingIter<'a, TId, TValue> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.offset >= self.mapping.len {
+            // `max` is the highest inserted id, so every slot up to and
+            // including it must be visited: a sparse mapping has holes, and
+            // stopping after `len` slots would drop entries above them. An
+            // empty mapping has no chunk storage to look at.
+            if self.mapping.len == 0 || self.offset > self.mapping.max {
                 return None;
             }
 
@@ -311,6 +315,31 @@ mod tests {
         assert_eq!(mapping.len(), 2);
         // And double number of slots due to resize
         assert_eq!(mapping.slots(), VALUES_PER_CHUNK * 2);
+    }
+
+    /// Regression test: iteration must visit every inserted id of a sparse
+    /// mapping. The iterator used to stop at offset `len` (the number of
+    /// inserted values), silently dropping all entries above the first
+    /// `len` slots when the mapping has holes.
+    #[test]
+    pub fn test_iter_sparse() {
+        let mut mapping = Mapping::new();
+        mapping.insert(Id::from_index(0), 1);
+        mapping.insert(Id::from_index(5), 2);
+        // Crosses a chunk boundary.
+        mapping.insert(Id::from_index(VALUES_PER_CHUNK * 2 + 3), 3);
+        itertools::assert_equal(
+            mapping.iter().map(|(id, &v)| (id.id, v)),
+            [(0, 1), (5, 2), (VALUES_PER_CHUNK * 2 + 3, 3)],
+        );
+    }
+
+    /// An empty mapping iterates nothing (and must not touch its empty
+    /// chunk storage).
+    #[test]
+    pub fn test_iter_empty() {
+        let mapping: Mapping<Id, i32> = Mapping::new();
+        assert_eq!(mapping.iter().count(), 0);
     }
 
     #[cfg(feature = "serde")]
