@@ -204,3 +204,49 @@ to sequential's clause count, but with zero watch-list traffic.
 - Pairwise is uniformly worse on anything but tiny candidate sets, both in
   time and in memory (O(n²) clauses; 259 MB peak RSS for four packages with
   2 000 candidates, vs ~3 MB for the others).
+
+## Authoritative 3-seed sweep (2026-06-13)
+
+3 seeds × 250 random conda-forge problems × 4 encodings = 3,000 solves, run
+strictly sequentially on one machine (clean timings), 30 s timeout, with the
+exact selected solvables captured for comparison.
+
+### Performance (aggregate over 750 problems)
+
+| encoding       | mean    | total    | timeouts |
+| -------------- | ------- | -------- | -------- |
+| binary         | 1.278 s | 958.6 s  | 3        |
+| commander:3    | 1.360 s | 1020.1 s | 5        |
+| sequential     | 1.399 s | 1049.6 s | 5        |
+| **virtual-ladder** | **0.991 s** | **743.6 s** | **0** |
+
+Virtual-ladder is the fastest on every individual seed (totals 235/279/229 s
+vs binary 285/422/251 s) and is the only encoding with zero timeouts — it
+resolves every problem on which the others hit the 30 s wall. The aggregate
+is ~22 % faster than the current binary default.
+
+### Solutions (the important correctness check)
+
+Verdicts (sat/unsat) are identical to binary on every problem under every
+encoding (0 mismatches, timeouts excluded). Solutions are byte-identical on
+the large majority of problems; a small number diverge to a *different but
+valid* solution:
+
+| encoding       | diverged solutions | of SAT problems |
+| -------------- | ------------------ | --------------- |
+| commander:3    | 4                  | 265             |
+| sequential     | 5                  | 264             |
+| virtual-ladder | 7                  | 266             |
+
+Divergence is **inherent to changing the at-most-one encoding, not specific
+to virtual-ladder**: resolvo is not a global optimizer — it stops at the
+first complete valid assignment, preferring higher versions in decision
+order, so any change to propagation changes the decision path and can land
+on a different valid solution. The clausal alternatives commander and
+sequential diverge from binary at the same rate, on the same problems
+(`inept`, `resolvo-cpp`, `usagestats`), with the same per-package version
+differences. Within a divergent solution the version differences go both
+directions (some packages higher, some lower), so there is no systematic
+solution-quality regression in either direction. Adopting virtual-ladder is,
+from a solution-stability standpoint, equivalent to adopting commander or
+sequential — all three are already-supported encodings.
