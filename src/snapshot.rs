@@ -368,6 +368,12 @@ pub struct SnapshotProvider<'s> {
 
     additional_version_sets: Vec<VersionSet>,
     stop_time: Option<SystemTime>,
+
+    /// Packages pinned to a single solvable: if a name is present here,
+    /// [`DependencyProvider::get_candidates`] reports that solvable as
+    /// `locked`, so the solver forbids every other candidate of the package.
+    /// Used to probe how much a given decision contributes to solve time.
+    locked: std::collections::HashMap<NameId, SolvableId>,
 }
 
 impl<'s> From<&'s DependencySnapshot> for SnapshotProvider<'s> {
@@ -383,6 +389,7 @@ impl<'s> SnapshotProvider<'s> {
             snapshot,
             additional_version_sets: Vec::new(),
             stop_time: None,
+            locked: std::collections::HashMap::new(),
         }
     }
 
@@ -393,6 +400,19 @@ impl<'s> SnapshotProvider<'s> {
             stop_time: Some(stop_time),
             ..self
         }
+    }
+
+    /// Pins a package to a single solvable: the solver will report it as
+    /// `locked` and forbid every other candidate of that package. Pinning a
+    /// package that is not installed in a solution has no effect; pinning one
+    /// that is removes its version decision from the search.
+    pub fn pin(&mut self, name: NameId, solvable: SolvableId) {
+        self.locked.insert(name, solvable);
+    }
+
+    /// Removes all pins added with [`Self::pin`].
+    pub fn clear_pins(&mut self) {
+        self.locked.clear();
     }
 
     /// Adds another requirement that matches any version of a package.
@@ -529,7 +549,7 @@ impl DependencyProvider for SnapshotProvider<'_> {
         Some(Candidates {
             candidates: package.solvables.clone(),
             favored: None,
-            locked: None,
+            locked: self.locked.get(&name).copied(),
             excluded: package.excluded.clone(),
             hint_dependencies_available: HintDependenciesAvailable::Some(
                 package

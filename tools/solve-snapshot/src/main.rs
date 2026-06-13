@@ -16,8 +16,9 @@ use rand::{
     rngs::StdRng,
 };
 use resolvo::{
-    ConditionalRequirement, Dependencies, NameId, Problem, Requirement, Solver,
-    UnsolvableOrCancelled, VersionSetId, snapshot::DependencySnapshot,
+    ConditionalRequirement, Dependencies, NameId, Problem, Requirement, SolvableId, Solver,
+    UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
+    snapshot::{DependencySnapshot, SnapshotProvider},
 };
 
 #[derive(Parser)]
@@ -48,6 +49,20 @@ struct Opts {
     /// Enable tracing output (set RUST_LOG for verbosity, e.g. RUST_LOG=info)
     #[clap(long)]
     tracing: bool,
+
+    /// Pin-bisect mode: causally localize what makes one problem slow. Solves
+    /// the selected problem (use `--skip K -n K+1` to pick problem K), then
+    /// re-solves it repeatedly with one package at a time pinned to the version
+    /// it took in the baseline solution, and reports how much each pin collapses
+    /// the solve time. The package whose pin recovers most of the gap to the
+    /// fully-pinned floor is the bottleneck decision.
+    #[clap(long)]
+    pin_bisect: bool,
+
+    /// How many packages to probe in `--pin-bisect`, ranked by candidate count
+    /// (most version freedom first).
+    #[clap(long, default_value = "15")]
+    pin_bisect_k: usize,
 
     /// Static hub-profiling mode: instead of solving, compute each problem's
     /// dependency closure and rank package names by in-degree (how many
@@ -317,6 +332,152 @@ struct Record {
     records: Option<usize>,
 }
 
+/// A rebuildable description of one root requirement. Package requirements
+/// allocate provider-specific version sets, so a problem cannot be replayed by
+/// keeping its `ConditionalRequirement`s; this records the snapshot-stable
+/// choice instead, letting the same problem be reconstructed on a fresh
+/// provider for each pin-bisect re-solve.
+#[derive(Clone)]
+enum ReqSpec {
+    Package(NameId),
+    VersionSet(VersionSetId),
+    Union(VersionSetUnionId),
+}
+
+/// Rebuilds a problem's requirements from its recipe on `provider`.
+fn build_requirements(
+    provider: &mut SnapshotProvider,
+    recipe: &[ReqSpec],
+) -> Vec<ConditionalRequirement> {
+    recipe
+        .iter()
+        .map(|spec| match spec {
+            ReqSpec::Package(name) => provider.add_package_requirement(*name, "*").into(),
+            ReqSpec::VersionSet(vs) => (*vs).into(),
+            ReqSpec::Union(u) => (*u).into(),
+        })
+        .collect()
+}
+
+/// Solves the recipe once on a fresh provider with `pins` applied, returning the
+/// wall-clock duration and the solution (or `None` if it was unsolvable or
+/// cancelled by the timeout).
+fn solve_with_pins(
+    snapshot: &DependencySnapshot,
+    recipe: &[ReqSpec],
+    pins: &[(NameId, SolvableId)],
+    timeout: Duration,
+) -> (Duration, Option<Vec<SolvableId>>) {
+    let mut provider = SnapshotProvider::new(snapshot).with_timeout(SystemTime::now().add(timeout));
+    for &(name, solvable) in pins {
+        provider.pin(name, solvable);
+    }
+    let requirements = build_requirements(&mut provider, recipe);
+    let problem = Problem::default().requirements(requirements);
+    let mut solver = Solver::new(provider);
+    let start = Instant::now();
+    let result = solver.solve(problem);
+    let duration = start.elapsed();
+    (duration, result.ok())
+}
+
+/// Runs the pin-bisect probe described by [`Opts::pin_bisect`].
+fn pin_bisect(snapshot: &DependencySnapshot, recipe: &[ReqSpec], opts: &Opts) {
+    use std::cmp::Reverse;
+
+    let timeout = Duration::from_secs(opts.timeout);
+    eprintln!("pin-bisect: baseline solve (timeout {}s)...", opts.timeout);
+    let (base, solution) = solve_with_pins(snapshot, recipe, &[], timeout);
+    let Some(solution) = solution else {
+        eprintln!(
+            "baseline did not produce a solution in {:.1}s (unsolvable or timed out); \
+             pin-bisect needs a solvable problem.",
+            base.as_secs_f64()
+        );
+        return;
+    };
+    eprintln!(
+        "baseline: {:.2}s, {} records",
+        base.as_secs_f64(),
+        solution.len()
+    );
+
+    // Map every installed package to the solvable it took.
+    let solved: Vec<(NameId, SolvableId)> = solution
+        .iter()
+        .filter_map(|&s| snapshot.solvables.get(s).map(|sv| (sv.name, s)))
+        .collect();
+
+    // Floor: pin the entire solution. This is essentially verification time and
+    // bounds how fast any single pin could make the solve.
+    let (floor, _) = solve_with_pins(snapshot, recipe, &solved, timeout);
+    eprintln!("floor (whole solution pinned): {:.3}s\n", floor.as_secs_f64());
+
+    // Probe the installed packages with the most version freedom first.
+    let mut ranked: Vec<(NameId, SolvableId, usize)> = solved
+        .iter()
+        .filter_map(|&(name, solvable)| {
+            let candidates = snapshot.packages.get(name)?.solvables.len();
+            (candidates > 1).then_some((name, solvable, candidates))
+        })
+        .collect();
+    ranked.sort_by_key(|&(_, _, candidates)| Reverse(candidates));
+    ranked.truncate(opts.pin_bisect_k);
+
+    // Cap each probe a little above the baseline: a pin that does not help is
+    // no faster than baseline, so there is nothing to learn past that point.
+    let probe_timeout = timeout.min(base.mul_f64(1.25) + Duration::from_secs(1));
+
+    let mut rows: Vec<(String, usize, f64, f64)> = Vec::new();
+    for (name, solvable, candidates) in ranked {
+        let display = snapshot
+            .packages
+            .get(name)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let (t, sol) = solve_with_pins(snapshot, recipe, &[(name, solvable)], probe_timeout);
+        let capped = sol.is_none() && t >= probe_timeout.mul_f64(0.98);
+        let secs = t.as_secs_f64();
+        let speedup = base.as_secs_f64() / secs.max(1e-6);
+        eprintln!(
+            "  pinned {:32} ({:3} cands) -> {:7.3}s  {:.1}x{}",
+            display,
+            candidates,
+            secs,
+            speedup,
+            if capped { " (capped)" } else { "" }
+        );
+        rows.push((display, candidates, secs, speedup));
+    }
+
+    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+    println!("\n=== pin-bisect report ===");
+    println!(
+        "baseline {:.2}s   floor {:.3}s   gap {:.2}s",
+        base.as_secs_f64(),
+        floor.as_secs_f64(),
+        (base - floor.min(base)).as_secs_f64()
+    );
+    println!("{:<34} {:>6} {:>9} {:>8}", "pinned package", "cands", "time", "speedup");
+    for (name, cands, secs, speedup) in &rows {
+        println!("{name:<34} {cands:>6} {secs:>8.3}s {speedup:>7.1}x");
+    }
+    if let Some((name, _, secs, speedup)) = rows.first() {
+        println!(
+            "\nbottleneck: pinning `{}` alone is {:.1}x faster ({:.3}s vs {:.2}s baseline){}",
+            name,
+            speedup,
+            secs,
+            base.as_secs_f64(),
+            if *secs <= floor.as_secs_f64() * 2.0 {
+                " — recovers essentially the whole gap to the floor"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
 fn main() {
     let opts: Opts = Opts::parse();
 
@@ -328,7 +489,7 @@ fn main() {
     }
 
     eprintln!("Loading snapshot ...");
-    let snapshot_file = BufReader::new(File::open(opts.snapshot).unwrap());
+    let snapshot_file = BufReader::new(File::open(&opts.snapshot).unwrap());
     let snapshot: DependencySnapshot = serde_json::from_reader(snapshot_file).unwrap();
 
     let mut writer = WriterBuilder::new()
@@ -369,6 +530,8 @@ fn main() {
         let mut requirements: Vec<ConditionalRequirement> = Vec::new();
         // The root package names of this problem (for `--profile`).
         let mut root_names: Vec<NameId> = Vec::new();
+        // A rebuildable recipe of this problem (for `--pin-bisect`).
+        let mut recipe: Vec<ReqSpec> = Vec::new();
 
         // Determine the number of requirements to solve for.
         let num_requirements = rng.random_range(1..=10usize);
@@ -380,6 +543,7 @@ fn main() {
                     let package_requirement = provider.add_package_requirement(package, "*");
                     requirements.push(package_requirement.into());
                     root_names.push(package);
+                    recipe.push(ReqSpec::Package(package));
                 }
                 1 => {
                     // Add a version set requirement
@@ -387,6 +551,7 @@ fn main() {
                         snapshot.version_sets.iter().choose(&mut rng).unwrap();
                     requirements.push(version_set_id.into());
                     root_names.push(version_set.name);
+                    recipe.push(ReqSpec::VersionSet(version_set_id));
                 }
                 2 => {
                     // Add a version set union requirement
@@ -398,6 +563,7 @@ fn main() {
                             root_names.push(version_set.name);
                         }
                     }
+                    recipe.push(ReqSpec::Union(version_set_union_id));
                 }
                 _ => unreachable!(),
             }
@@ -405,6 +571,11 @@ fn main() {
 
         if i < opts.skip {
             continue;
+        }
+
+        if opts.pin_bisect {
+            pin_bisect(&snapshot, &recipe, &opts);
+            break;
         }
 
         if opts.profile {
