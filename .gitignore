@@ -29,3 +29,8 @@ snapshot_*.json
 bench-final/
 
 timings_*
+
+# solve-snapshot tool output
+timings.csv
+profile.csv
+profile_visited.csv
