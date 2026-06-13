@@ -35,3 +35,4 @@ timings_*
 
 # insta pending-snapshot artifacts (never commit)
 *.snap.new
+timings.csv
