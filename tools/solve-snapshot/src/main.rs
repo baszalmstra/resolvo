@@ -37,6 +37,11 @@ struct Opts {
     #[clap(long, default_value = "0")]
     seed: u64,
 
+    /// Skip the first N problems (still generated, so the RNG advances
+    /// deterministically and `--skip K -n K+1` replays exactly problem K).
+    #[clap(long, default_value = "0")]
+    skip: usize,
+
     /// Enable tracing output (set RUST_LOG for verbosity, e.g. RUST_LOG=info)
     #[clap(long)]
     tracing: bool,
@@ -142,16 +147,32 @@ fn main() {
             })
             .to_string();
 
+        if i < opts.skip {
+            continue;
+        }
+
         let start = Instant::now();
 
         let problem = Problem::default().requirements(requirements);
         let mut solver = Solver::new(provider);
         let mut records = None;
         let mut error = None;
-        let result = solver.solve(problem);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| solver.solve(problem)));
         let duration = start.elapsed();
         match result {
-            Ok(solution) => {
+            Err(_) => {
+                eprintln!(
+                    "{}",
+                    style(format!(
+                        "==> PANIC after {:.2}ms",
+                        duration.as_secs_f64() * 1000.0
+                    ))
+                    .red()
+                );
+                error = Some("panic".to_string());
+            }
+            Ok(Ok(solution)) => {
                 eprintln!(
                     "{}",
                     style(format!(
@@ -163,7 +184,7 @@ fn main() {
                 );
                 records = Some(solution.len())
             }
-            Err(UnsolvableOrCancelled::Unsolvable(problem)) => {
+            Ok(Err(UnsolvableOrCancelled::Unsolvable(problem))) => {
                 eprintln!(
                     "{}",
                     style(format!(
@@ -174,7 +195,7 @@ fn main() {
                 );
                 error = Some(problem.display_user_friendly(&solver).to_string());
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 eprintln!(
                     "{}",
                     style(format!(
