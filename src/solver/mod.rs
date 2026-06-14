@@ -20,6 +20,7 @@ use crate::{
     internal::{
         arena::Arena,
         id::{ClauseId, LearntClauseId},
+        small_vec::SmallVec,
         solver_id::{SolvableIdOrRoot, WithRootSet},
     },
     requirement::RequirementMap,
@@ -1685,8 +1686,23 @@ impl<D: DependencyProvider> SolverState<D> {
         // mark it hot once it crosses the threshold, so hub packages rise in the
         // decision queue as their referrers are encoded. Done before
         // `register_clause` so the clause being registered inherits the hotness.
-        let names: Vec<D::NameId> = names.into_iter().collect();
-        for &name in &names {
+        //
+        // The names iterator is consumed both here and by `register_clause`, so
+        // it is buffered in a `SmallVec` (inline for the typical 1-2 names, no
+        // heap allocation). A negative seed is an "overhead only" control: it
+        // runs this buffering and iteration but applies no effect, leaving the
+        // search byte-identical to the baseline so the pure cost of the added
+        // code can be measured.
+        let overhead_only = self.indegree_seed < 0.0;
+        let mut names_buf: SmallVec<D::NameId> = SmallVec::empty();
+        for name in names {
+            names_buf.push(name);
+        }
+        for &name in names_buf.as_slice() {
+            if overhead_only {
+                std::hint::black_box(name);
+                continue;
+            }
             let activity = self.name_activity.get(name) + self.indegree_seed;
             self.name_activity.set(name, activity);
             if activity > self.max_activity {
@@ -1701,7 +1717,7 @@ impl<D: DependencyProvider> SolverState<D> {
             requirement,
             condition,
             clause_id,
-            names,
+            names_buf.as_slice().iter().copied(),
             &self.disjunctions,
             parent_value,
         );
