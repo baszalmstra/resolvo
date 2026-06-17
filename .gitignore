@@ -29,3 +29,4 @@ snapshot_*.json
 bench-final/
 
 timings_*
+.claude/worktrees/

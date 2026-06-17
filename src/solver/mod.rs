@@ -24,14 +24,14 @@ use crate::{
     },
     requirement::RequirementMap,
     runtime::{AsyncRuntime, NowOrNeverRuntime},
-    solver::binary_encoding::AtMostOnceTracker,
+    solver::commander_encoding::AtMostOnceTracker,
     solver_id::{IdMap, IdSet, SolverId},
     utils::{IndexedSet, Mapping},
 };
 
-mod binary_encoding;
 mod cache;
 pub(crate) mod clause;
+mod commander_encoding;
 mod conditions;
 mod decide_queue;
 mod decision;

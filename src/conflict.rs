@@ -241,24 +241,47 @@ impl Conflict {
                     graph.add_edge(root_node, node2_id, ConflictEdge::Conflict(conflict));
                 }
                 &Clause::ForbidMultipleInstances(instance1_id, instance2_id, _) => {
-                    let solvable1 = instance1_id
-                        .as_solvable_or_root(&state.variable_map)
-                        .expect("only solvables can be excluded");
+                    // The at-most-one ("forbid multiple") encoding emits binary
+                    // clauses of three shapes, distinguished by the origin of
+                    // the second variable:
+                    //   - `¬candidate ∨ commander` / `¬candidate ∨ ¬bit`: the
+                    //     second variable is a forbid helper. Such clauses link
+                    //     a candidate to its group, so consecutive candidates of
+                    //     the same package are chained via the helper's name.
+                    //   - `¬candidate ∨ ¬candidate`: a pairwise exclusion within
+                    //     a commander group; both are concrete candidates and
+                    //     get a direct conflict edge.
+                    //   - `¬commander ∨ ¬commander`: the recursive at-most-one
+                    //     over commanders; both are helpers and carry no
+                    //     candidate-level edge, so the clause is skipped.
+                    let Some(solvable1) = instance1_id.as_solvable_or_root(&state.variable_map)
+                    else {
+                        continue;
+                    };
                     let node1_id = Self::add_node(&mut graph, &mut nodes, solvable1);
 
-                    let VariableOrigin::ForbidMultiple(name) =
-                        state.variable_map.origin(instance2_id.variable())
-                    else {
-                        unreachable!("expected only forbid variables")
-                    };
-
-                    let previous_node = last_node_by_name.insert(name, node1_id);
-                    if let Some(previous_node) = previous_node {
-                        graph.add_edge(
-                            previous_node,
-                            node1_id,
-                            ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
-                        );
+                    match state.variable_map.origin(instance2_id.variable()) {
+                        VariableOrigin::ForbidMultiple(name) => {
+                            let previous_node = last_node_by_name.insert(name, node1_id);
+                            if let Some(previous_node) = previous_node {
+                                graph.add_edge(
+                                    previous_node,
+                                    node1_id,
+                                    ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                                );
+                            }
+                        }
+                        VariableOrigin::Solvable(solvable2) => {
+                            let node2_id = Self::add_node(&mut graph, &mut nodes, solvable2.into());
+                            graph.add_edge(
+                                node1_id,
+                                node2_id,
+                                ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                            );
+                        }
+                        _ => unreachable!(
+                            "a forbid clause's second variable is a candidate or forbid helper"
+                        ),
                     }
                 }
                 &Clause::Constrains(package_id, dep_id, version_set_id) => {

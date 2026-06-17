@@ -1,0 +1,20 @@
+---
+source: src/solver/commander_encoding.rs
+expression: "clauses.iter().format(\"\\n\")"
+---
+¬x2 ∨ ¬x1
+¬x3 ∨ ¬x1
+¬x3 ∨ ¬x2
+¬x1 ∨ v1
+¬x2 ∨ v1
+¬x3 ∨ v1
+¬x4 ∨ v2
+¬v2 ∨ ¬v1
+¬x5 ∨ ¬x4
+¬x5 ∨ v2
+¬x6 ∨ ¬x4
+¬x6 ∨ ¬x5
+¬x6 ∨ v2
+¬x7 ∨ v3
+¬v3 ∨ ¬v1
+¬v3 ∨ ¬v2
