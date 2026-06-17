@@ -30,3 +30,4 @@ bench-final/
 
 timings_*
 .claude/worktrees/
+/timings.csv
