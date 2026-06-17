@@ -587,6 +587,15 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         let (watched_literals, kind) = WatchedLiterals::any_of(gate, parent);
         let clause_id = self.state.add_clause(watched_literals, kind);
 
+        // Remember this requirer so a backtrack that unassigns the gate while
+        // `parent` stays installed can be repaired (see
+        // `SolverState::stuck_gates`).
+        self.state
+            .requires_gate_requirers
+            .entry(gate)
+            .or_default()
+            .push((parent, clause_id));
+
         // Honor assignments already made for either end of the implication, the
         // same way the other incremental encoders do.
         let forced = match (

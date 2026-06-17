@@ -235,6 +235,17 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// [`variable_map::VariableOrigin::RequiresGate`].
     requires_aux_vars: HashMap<Requirement, VariableId>,
 
+    /// For each requires-gate variable, the requirers that imply it together
+    /// with the implication clause (used as the decision reason). The shared
+    /// gate is force-decided at the encoder's current level, which can exceed
+    /// a requirer's decision level; a later backtrack may then unassign the
+    /// gate while the requirer stays true, leaving the implication
+    /// `(¬requirer ∨ gate)` unit but never re-propagated (watched literals
+    /// only re-fire when a watch becomes false, not when it is unassigned).
+    /// Such a "stuck" gate is re-forced before the solution is concluded
+    /// complete; see [`SolverState::stuck_gates`].
+    requires_gate_requirers: HashMap<VariableId, Vec<(VariableId, ClauseId)>>,
+
     pub(crate) decision_tracker: DecisionTracker,
 
     /// Activity score per package.
@@ -285,6 +296,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             at_least_one_tracker: Default::default(),
             constrains_aux_vars: Default::default(),
             requires_aux_vars: Default::default(),
+            requires_gate_requirers: Default::default(),
             decision_tracker: Default::default(),
             name_activity: Default::default(),
             max_activity: 0.0,
@@ -713,6 +725,24 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // has just started to hold. These have to be encoded before we can
             // conclude the solution is complete.
             let fired_conditions = self.state.fired_deferred_conditions();
+            let stuck_gates = self.state.stuck_gates();
+
+            // Re-force shared-requires gates whose requirer is installed but
+            // whose truth was lost to a backtrack (see `stuck_gates`). This
+            // lets the decide queue resume picking candidates for their
+            // disjunctions instead of silently dropping the requirement.
+            if !stuck_gates.is_empty() {
+                for (gate, reason) in &stuck_gates {
+                    let _ = self.state.decision_tracker.try_add_decision(
+                        Decision::new(*gate, true, *reason),
+                        level,
+                    );
+                }
+                if new_solvables.is_empty() && fired_conditions.is_empty() {
+                    // Only stuck gates were resolved; re-propagate and re-decide.
+                    continue;
+                }
+            }
 
             if new_solvables.is_empty() && fired_conditions.is_empty() {
                 // If no new literals were selected and no deferred conditions
@@ -1704,6 +1734,32 @@ impl<D: DependencyProvider> SolverState<D> {
     /// Drain deferred requirements for `condition` whose disjunct currently
     /// holds. Removed entries are returned. If, after draining, no entries
     /// remain for `condition`, the key is removed from the map entirely.
+    /// Returns shared-requires gates that are currently unassigned while at
+    /// least one requirer that implies them is positively decided, paired with
+    /// the implication clause to use as the decision reason. Such a gate must
+    /// be true (its requirer is installed) but propagation has not re-derived
+    /// it after a backtrack; forcing it lets the decide queue resume selecting
+    /// a candidate for the gated requirement. See
+    /// [`Self::requires_gate_requirers`].
+    pub(crate) fn stuck_gates(&self) -> Vec<(VariableId, ClauseId)> {
+        let mut out = Vec::new();
+        for (&gate, requirers) in &self.requires_gate_requirers {
+            // A gate that is already assigned is fine: `true` is satisfied and
+            // `false` with a true requirer is a real conflict that ordinary
+            // propagation reports.
+            if self.decision_tracker.map().value(gate).is_some() {
+                continue;
+            }
+            if let Some(&(_, reason)) = requirers
+                .iter()
+                .find(|(p, _)| self.decision_tracker.map().value(*p) == Some(true))
+            {
+                out.push((gate, reason));
+            }
+        }
+        out
+    }
+
     pub(crate) fn drain_fired_deferred(
         &mut self,
         condition: ConditionId,

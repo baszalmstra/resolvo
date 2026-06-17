@@ -2216,3 +2216,99 @@ fn test_decide_queue_union_duplicate_name() {
 }
 
 mod decide_queue_prop;
+
+#[test]
+fn bughunt_g542() {
+    struct R(u64);
+    impl R { fn next(&mut self)->u64{ self.0^=self.0<<13; self.0^=self.0>>7; self.0^=self.0<<17; self.0 } }
+    fn gen_graph(seed:u64)->(Vec<(String,u32,Vec<String>)>,Vec<String>){
+        let mut r=R(seed.wrapping_mul(0x9E3779B97F4A7C15)|1);
+        let n=5+(r.next()%6) as usize;
+        let names:Vec<String>=(0..n).map(|i|format!("p{i}")).collect();
+        let mut pkgs=Vec::new();
+        for (i,name) in names.iter().enumerate(){
+            let nv=1+(r.next()%5) as u32;
+            for v in 1..=nv{
+                let nd=(r.next()%4) as usize; let mut deps=Vec::new();
+                for _ in 0..nd{ let j=(r.next() as usize)%n; if j==i{continue;}
+                    if r.next()%3==0{ let lo=1+(r.next()%3) as u32; let hi=lo+1+(r.next()%3) as u32;
+                        deps.push(format!("{} {}..{}",names[j],lo,hi)); } else { deps.push(names[j].clone()); } }
+                pkgs.push((name.clone(),v,deps));
+            }
+        }
+        let nr=1+(r.next()%3) as usize;
+        let roots:Vec<String>=(0..nr).map(|_|names[(r.next() as usize)%n].clone()).collect();
+        (pkgs,roots)
+    }
+    let (pkgs,roots)=gen_graph(542);
+    eprintln!("ROOTS={roots:?}");
+    for (n,v,d) in &pkgs { eprintln!("  {n}=={v} -> {d:?}"); }
+    let pp:Vec<(&str,u32,Vec<&str>)>=pkgs.iter().map(|(n,v,d)|(n.as_str(),*v,d.iter().map(|s|s.as_str()).collect())).collect();
+    let mut bad=0;
+    for s in 2..=2u64 {
+        let mut provider=BundleBoxProvider::from_packages(&pp);
+        provider.sleep_before_return=true; provider.delay_seed=542000+s;
+        let rs:Vec<&str>=roots.iter().map(|s|s.as_str()).collect();
+        let reqs=provider.requirements(&rs);
+        let rt=tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let mut solver=Solver::new(provider).with_runtime(rt);
+        if let Ok(sv)=solver.solve(Problem::new().requirements(reqs)){
+            let sol:Vec<String>=sv.iter().map(|s|format!("{}",solver.provider().display_solvable(*s))).collect();
+            eprintln!("seed {} -> {sol:?}", 542000+s);
+            // p3==3 requires p7; if p3=3 present but no p7, bug
+            let has_p3v3=sol.iter().any(|l|l=="p3=3");
+            let has_p7=sol.iter().any(|l|l.starts_with("p7="));
+            if has_p3v3 && !has_p7 { bad+=1; }
+        }
+    }
+    eprintln!("BAD={bad}/12");
+}
+
+/// Regression for the PR #246 shared-requires gate: under async ordering a
+/// backtrack can unassign the gate variable while a requirer stays installed,
+/// after which the gate's implication is never re-propagated and the gated
+/// requirement (and its whole subtree) is silently dropped. This is a
+/// fuzzer-derived graph (`gen_graph(542)`) where `p3` requires `p7` (4
+/// versions => gated, also required by `p5==3`); several delay seeds yield the
+/// faulty order. Every returned solution must be COMPLETE.
+#[test]
+fn shared_requires_gate_survives_backtrack() {
+    struct R(u64);
+    impl R { fn next(&mut self)->u64{ self.0^=self.0<<13; self.0^=self.0>>7; self.0^=self.0<<17; self.0 } }
+    let seed=542u64;
+    let mut r=R(seed.wrapping_mul(0x9E3779B97F4A7C15)|1);
+    let n=5+(r.next()%6) as usize;
+    let names:Vec<String>=(0..n).map(|i|format!("p{i}")).collect();
+    let mut pkgs=Vec::new();
+    for (i,name) in names.iter().enumerate(){ let nv=1+(r.next()%5) as u32;
+        for v in 1..=nv{ let nd=(r.next()%4) as usize; let mut deps=Vec::new();
+            for _ in 0..nd{ let j=(r.next() as usize)%n; if j==i{continue;}
+                if r.next()%3==0{ let lo=1+(r.next()%3) as u32; let hi=lo+1+(r.next()%3) as u32; deps.push(format!("{} {}..{}",names[j],lo,hi)); } else { deps.push(names[j].clone()); } }
+            pkgs.push((name.clone(),v,deps)); } }
+    let nr=1+(r.next()%3) as usize; let roots:Vec<String>=(0..nr).map(|_|names[(r.next() as usize)%n].clone()).collect();
+
+    fn validate(pkgs:&[(String,u32,Vec<String>)], roots:&[String], sol:&[(String,u32)]) -> Result<(),String> {
+        use std::collections::HashMap;
+        let mut chosen:HashMap<&str,u32>=HashMap::new();
+        for (n,v) in sol { chosen.insert(n,*v); }
+        let sat=|spec:&str|->bool{ let mut it=spec.split_whitespace(); let name=it.next().unwrap();
+            let Some(&cv)=chosen.get(name) else { return false; };
+            match it.next(){ None=>true, Some(range)=>{ let mut p=range.split(".."); let lo:u32=p.next().unwrap().parse().unwrap(); let hi:u32=p.next().unwrap().parse().unwrap(); cv>=lo&&cv<hi } } };
+        for root in roots { if !sat(root){ return Err(format!("root {root} unsatisfied")); } }
+        for (n,v) in sol { for d in &pkgs.iter().find(|(pn,pv,_)|pn==n&&pv==v).unwrap().2 { if !sat(d){ return Err(format!("{n}=={v} requires `{d}` which is absent")); } } }
+        Ok(())
+    }
+    let pp:Vec<(&str,u32,Vec<&str>)>=pkgs.iter().map(|(n,v,d)|(n.as_str(),*v,d.iter().map(|s|s.as_str()).collect())).collect();
+    for s in 1..=12u64 {
+        let mut provider=BundleBoxProvider::from_packages(&pp);
+        provider.sleep_before_return=true; provider.delay_seed=542000+s;
+        let rs:Vec<&str>=roots.iter().map(|s|s.as_str()).collect();
+        let reqs=provider.requirements(&rs);
+        let rt=tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let mut solver=Solver::new(provider).with_runtime(rt);
+        if let Ok(sv)=solver.solve(Problem::new().requirements(reqs)){
+            let sol:Vec<(String,u32)>=sv.iter().map(|x|{ let l=format!("{}",solver.provider().display_solvable(*x)); let mut it=l.split('='); (it.next().unwrap().to_string(), it.last().unwrap().parse().unwrap()) }).collect();
+            validate(&pkgs,&roots,&sol).unwrap_or_else(|e| panic!("seed {} produced an INCOMPLETE solution: {e}", 542000+s));
+        }
+    }
+}

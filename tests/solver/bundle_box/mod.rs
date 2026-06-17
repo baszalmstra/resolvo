@@ -61,6 +61,10 @@ pub struct BundleBoxProvider {
     concurrent_requests: Arc<AtomicUsize>,
     pub concurrent_requests_max: Rc<Cell<usize>>,
     pub sleep_before_return: bool,
+    /// When non-zero, `maybe_delay` varies its sleep per call using a
+    /// seeded hash, exploring different async encoding orders across runs.
+    pub delay_seed: u64,
+    delay_counter: Cell<u64>,
     /// When set, candidates are returned with
     /// [`HintDependenciesAvailable::All`], which makes the solver prefetch
     /// (and encode) the dependencies of requirement candidates as soon as the
@@ -210,9 +214,26 @@ impl BundleBoxProvider {
     // runtime available)
     async fn maybe_delay<T: Send + 'static>(&self, value: T) -> T {
         if self.sleep_before_return {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            if self.delay_seed == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.concurrent_requests.fetch_sub(1, Ordering::SeqCst);
+                return value;
+            }
+            let n = self.delay_counter.get();
+            self.delay_counter.set(n + 1);
+            let mut h = self.delay_seed ^ n.wrapping_mul(0x9E3779B97F4A7C15);
+            h ^= h >> 30; h = h.wrapping_mul(0xBF58476D1CE4E5B9); h ^= h >> 27;
             self.concurrent_requests.fetch_sub(1, Ordering::SeqCst);
-            value
+            // Mimic prefetch cache hits: ~1/3 of calls return synchronously
+            // (no await -> no yield), the rest sleep a seeded amount. The
+            // mix of sync and async returns is what resolvo-uv produces.
+            match h % 3 {
+                0 => value,                                          // synchronous (cache hit)
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(1 + (h >> 2) % 20)).await;
+                    value
+                }
+            }
         } else {
             value
         }
