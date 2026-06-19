@@ -2242,10 +2242,9 @@ fn test_env_oracle_disjoint_conflict() {
 }
 
 /// `Requirement::Union` mixing an environment and a concrete version set is
-/// rejected during encoding with a clear panic.
+/// rejected in universal mode with an invalid-input error.
 #[test]
-#[should_panic(expected = "mixing environment and concrete version sets")]
-fn test_env_union_mixing_concrete_panics() {
+fn test_env_union_mixing_concrete_is_invalid_input() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", true);
     provider.add_package("b", Pack::new(1), &[], &[]);
@@ -2253,7 +2252,12 @@ fn test_env_union_mixing_concrete_panics() {
     let requirements = provider.requirements(&["b 1..2 | cuda 11..100"]);
     let mut solver = Solver::new(provider);
     let problem = UniversalProblem::new().requirements(requirements);
-    let _ = solver.solve_universal(problem);
+    assert!(matches!(
+        solver.solve_universal(problem),
+        Err(UniversalFailure::InvalidInput(
+            InvalidUniversalInput::MixedEnvironmentAndConcreteRequirement { .. }
+        ))
+    ));
 }
 
 /// Environment-package encoding must also work under a real async runtime
@@ -2437,6 +2441,164 @@ fn test_universal_conditional_dependency_two_cells() {
       a=1
       b=1
     ");
+}
+
+/// Red test for the review finding: a package that appears *only* as the
+/// target of a universal conditional requirement must still have its `locked`
+/// metadata encoded. Before the fix, `b` is never run through
+/// `on_candidates_available`, so the lock on `b=1` is not emitted and `b=2`
+/// (sorted first) is selected.
+#[test]
+fn test_universal_eager_conditional_target_package_lock_is_encoded() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 0..3; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+    provider.add_package("b", Pack::new(2), &[], &[]);
+    provider.set_locked("b", 1);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![parse_env_literal(
+        &mut provider,
+        "cuda 11..100",
+    )])]);
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model),
+        )
+        .expect("solvable");
+
+    let chosen = solution.cells()[0]
+        .solvables()
+        .iter()
+        .map(|&s| solver.provider().display_solvable(s).to_string())
+        .sorted()
+        .collect::<Vec<_>>();
+
+    assert!(chosen.contains(&"a=1".to_string()), "got {chosen:?}");
+    assert!(
+        chosen.contains(&"b=1".to_string()),
+        "the locked candidate b=1 must be chosen, got {chosen:?}"
+    );
+    assert!(
+        !chosen.contains(&"b=2".to_string()),
+        "b=2 must be forbidden by the package lock, got {chosen:?}"
+    );
+}
+
+/// Sibling of the lock test: an excluded candidate of a conditional-only
+/// target package must also be forbidden (same `on_candidates_available` path).
+#[test]
+fn test_universal_eager_conditional_target_package_excluded_is_encoded() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &["b 0..3; if cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &[], &[]);
+    provider.add_package("b", Pack::new(2), &[], &[]);
+    provider.exclude("b", 2, "broken");
+
+    let requirements = provider.requirements(&["a"]);
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![parse_env_literal(
+        &mut provider,
+        "cuda 11..100",
+    )])]);
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model),
+        )
+        .expect("solvable");
+
+    let chosen = solution.cells()[0]
+        .solvables()
+        .iter()
+        .map(|&s| solver.provider().display_solvable(s).to_string())
+        .sorted()
+        .collect::<Vec<_>>();
+
+    assert!(chosen.contains(&"b=1".to_string()), "got {chosen:?}");
+    assert!(!chosen.contains(&"b=2".to_string()), "got {chosen:?}");
+}
+
+/// Red test for the review finding: `project()` must reject a concrete
+/// environment that falls outside the environment model, even when the only
+/// cell is broad (no dependency is load-bearing on the env package). Before
+/// the fix, `project()` only checks cell conditions and returns the broad
+/// cell for an out-of-model machine.
+#[test]
+fn test_universal_project_respects_environment_model() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_package("a", Pack::new(1), &[], &[]);
+
+    let requirements = provider.requirements(&["a"]);
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![parse_env_literal(
+        &mut provider,
+        "cuda 11..100",
+    )])]);
+
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(requirements)
+                .environment_model(model),
+        )
+        .expect("solvable");
+
+    // `cuda` is not load-bearing, so the single cell is broader than the model.
+    assert_eq!(solution.cells().len(), 1);
+
+    // A machine where cuda>=11 is false is outside the model and must not
+    // project to a cell.
+    assert!(
+        solution.project(|_| false).is_none(),
+        "project() must reject environments outside the environment model"
+    );
+
+    // A machine satisfying the model still projects successfully.
+    assert!(
+        solution
+            .project(|literal| matches!(literal, EnvLiteral::Matches(_)))
+            .is_some(),
+        "an in-model machine must still project"
+    );
+}
+
+/// Red test for the review finding: an all-environment `Requirement::Union`
+/// can be allowed by encoding, but conflict display special-cases only
+/// `Requirement::Single` as an environment requirement. A failing all-env
+/// union must render (as an environment requirement) rather than fall through
+/// to concrete candidate lookup for an environment package and panic.
+#[test]
+fn test_env_only_union_conflict_display_does_not_panic() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+
+    // The union requires cuda in either [0,5) or [11,100), while the second
+    // root requirement forces cuda in [6,10). The oracle proves both union
+    // alternatives disjoint from the forced literal.
+    let requirements = provider.requirements(&["cuda 0..5 | cuda 11..100", "cuda 6..10"]);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new().requirements(requirements);
+    let conflict = match solver.solve_universal(problem) {
+        Err(UniversalFailure::Unsolvable { conflict, .. }) => conflict,
+        other => panic!("expected unsolvable env-union conflict, got {other:?}"),
+    };
+
+    let display = conflict.display_user_friendly(&solver).to_string();
+    assert!(
+        display.contains("environment"),
+        "env-only union conflicts should render as environment requirements; got:\n{display}"
+    );
 }
 
 /// Scenario (b): candidate-level split. `pkg=2` (sorted first) requires
@@ -3786,6 +3948,41 @@ fn test_m5_conflict_display_env_constrains_scoped() {
        └─ a 1 would constrain
           └─ the environment to lack cuda or provide cuda >=11, <100, but this environment region provides cuda outside that range
     ");
+}
+
+/// (M5-d) Regression: an environment package referenced only through a
+/// transitive dependency (never a root requirement, never named by an
+/// environment model) must still be recognised as environmental when the
+/// conflict graph is built. The interned env-matches literal is the reliable
+/// signal even if the package metadata map has not been populated yet.
+#[test]
+fn test_m5_conflict_display_transitive_env_requirement_does_not_panic() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", false);
+    // `cuda` appears only as a dependency of `a` and `b`, never as a root
+    // requirement. The two requirements are disjoint, so the solve is
+    // unsolvable.
+    provider.add_package("a", Pack::new(1), &["cuda 11..100"], &[]);
+    provider.add_package("b", Pack::new(1), &["cuda 0..5"], &[]);
+
+    let requirements = provider.requirements(&["a", "b"]);
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new().requirements(requirements);
+    let conflict = match solver.solve_universal(problem) {
+        Err(UniversalFailure::Unsolvable { conflict, .. }) => conflict,
+        other => panic!("expected unsolvable transitive env conflict, got {other:?}"),
+    };
+
+    // Building the graph is the operation that panicked before the fix.
+    let _ = conflict.graph(&solver);
+    let display = conflict.display_user_friendly(&solver).to_string();
+    // cuda must render as something the environment provides, not as a
+    // missing concrete package.
+    assert!(
+        display.contains("the environment cannot provide") && !display.contains("No candidates"),
+        "a transitive env requirement should render as an environment \
+         requirement, not a missing concrete package; got:\n{display}"
+    );
 }
 
 // ============================================================================

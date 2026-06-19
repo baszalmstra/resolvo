@@ -902,6 +902,19 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// cell is a broken pairwise-disjointness invariant: this is a
     /// `debug_assert`, and release builds return the first match.
     pub fn project(&self, eval: impl Fn(&EnvLiteral<N>) -> bool) -> Option<&[Id]> {
+        // The environment must satisfy the model the solution was bounded by:
+        // a cell can be broader than the model (when no dependency is
+        // load-bearing on an env literal), so matching a cell's condition is
+        // not sufficient. A machine outside the model has no cell.
+        let in_model = self.environment_model.clauses().all(|clause| {
+            clause
+                .literals()
+                .any(|signed| eval(&signed.literal) == signed.positive)
+        });
+        if !in_model {
+            return None;
+        }
+
         let mut found: Option<&[Id]> = None;
         for cell in &self.cells {
             let matches = cell
@@ -998,6 +1011,13 @@ pub enum InvalidUniversalInput<N = NameId> {
     /// The environment model contains an empty disjunction. An empty clause is
     /// unsatisfiable, so it would make the whole model unsatisfiable.
     EmptyModelDisjunction,
+    /// A caller-supplied requirement union mixes concrete package version sets
+    /// with environment package version sets. Such a union cannot share one
+    /// candidate list.
+    MixedEnvironmentAndConcreteRequirement {
+        /// The formatted requirement that mixed package kinds.
+        requirement: String,
+    },
 }
 
 impl<N: fmt::Debug> fmt::Display for InvalidUniversalInput<N> {
@@ -1018,6 +1038,13 @@ impl<N: fmt::Debug> fmt::Display for InvalidUniversalInput<N> {
                 "the environment model contains an empty disjunction, which makes the model \
                  unsatisfiable",
             ),
+            InvalidUniversalInput::MixedEnvironmentAndConcreteRequirement { requirement } => {
+                write!(
+                    f,
+                    "requirement `{requirement}` mixes environment and concrete version sets, \
+                     which cannot share one candidate list"
+                )
+            }
         }
     }
 }
@@ -1058,11 +1085,12 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// # Errors
     ///
     /// Structurally invalid inputs are rejected up front, before any solver
-    /// state is built, as [`UniversalFailure::InvalidInput`]: every literal in
+    /// state is built, as [`UniversalFailure::InvalidInput`]: root requirement
+    /// unions may not mix concrete and environment packages; every literal in
     /// the [`environment_model`](UniversalProblem::environment_model) and in
     /// every [`seed_partition`](UniversalProblem::seed_partition) condition
     /// must reference an environment package (one classified by
-    /// [`UniversalDependencyProvider::environment_package`](crate::UniversalDependencyProvider::environment_package)),
+    /// [`UniversalDependencyProvider::environment_package`](crate::UniversalDependencyProvider::environment_package));
     /// an [`Absent`](EnvLiteral::Absent) literal requires `can_be_absent: true`,
     /// and no model disjunction may be empty. (A [`Matches`](EnvLiteral::Matches)
     /// literal cannot name a version set of the wrong package: its package is
@@ -1150,7 +1178,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // panic buried in the encode/seed path. A valid problem that is merely
         // unsolvable is still reported by the enumeration below.
         self.universal_passes = 0;
-        self.validate_universal_input(&environment_model, &seed_partition)
+        self.validate_universal_input(&requirements, &environment_model, &seed_partition)
             .map_err(UniversalFailure::InvalidInput)?;
 
         // A seeded solve must return a reseed fixed point: enumerating with
@@ -1317,9 +1345,13 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// during enumeration).
     fn validate_universal_input(
         &self,
+        requirements: &[ConditionalRequirement],
         environment_model: &EnvironmentModel<D::NameId>,
         seed_partition: &[CellCondition<D::NameId>],
     ) -> Result<(), InvalidUniversalInput<D::NameId>> {
+        for requirement in requirements {
+            self.validate_requirement(&requirement.requirement)?;
+        }
         for clause in environment_model.clauses() {
             if clause.is_empty() {
                 return Err(InvalidUniversalInput::EmptyModelDisjunction);
@@ -1331,6 +1363,34 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         for seed in seed_partition {
             for signed in seed.literals() {
                 self.validate_env_literal(&signed.literal, EnvInputSource::SeedPartition)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates caller-supplied root requirements before solving. A union may
+    /// combine multiple concrete packages or multiple environment packages, but
+    /// not both: concrete candidates and symbolic environment literals cannot
+    /// share a single candidate list.
+    fn validate_requirement(
+        &self,
+        requirement: &Requirement,
+    ) -> Result<(), InvalidUniversalInput<D::NameId>> {
+        let mut has_environment = false;
+        let mut has_concrete = false;
+        for version_set in requirement.version_sets(self.provider()) {
+            let package = self.provider().version_set_name(version_set);
+            if self.provider().environment_package(package).is_some() {
+                has_environment = true;
+            } else {
+                has_concrete = true;
+            }
+            if has_environment && has_concrete {
+                return Err(
+                    InvalidUniversalInput::MixedEnvironmentAndConcreteRequirement {
+                        requirement: requirement.display(self.provider()).to_string(),
+                    },
+                );
             }
         }
         Ok(())

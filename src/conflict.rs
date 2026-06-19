@@ -207,19 +207,37 @@ impl Conflict {
                                 .unwrap_or_default(),
                         };
 
-                    // A requirement on an environment package is symbolic: no
+                    // A requirement on environment packages is symbolic: no
                     // concrete solvable candidates exist (and never will), so
                     // it must not be treated as a missing dependency. Instead
-                    // it becomes a requires edge to the environment-literal
-                    // node for the version set. Env-package requirements are
-                    // always Single; a Union requirement mixing environment
+                    // each environment version set becomes a requires edge to
+                    // its environment-literal node. This covers a `Single` env
+                    // requirement and an all-environment `Union` (e.g.
+                    // `cuda 0..5 | cuda 11..100`); a `Union` mixing environment
                     // and concrete packages is rejected during encoding.
-                    if let Requirement::Single(vs) = version_set_id {
-                        let pkg_name = solver.provider().version_set_name(vs);
-                        if state.env_packages.get(pkg_name).is_some() {
-                            tracing::trace!(
-                                "{package_id:?} requires env package {version_set_id:?}"
-                            );
+                    let env_version_sets: Vec<VersionSetId> =
+                        version_set_id.version_sets(solver.provider()).collect();
+                    let all_env = !env_version_sets.is_empty()
+                        && env_version_sets.iter().all(|&vs| {
+                            // A version set is on an environment package when the
+                            // encoder interned an env-matches literal for it. The
+                            // `env_packages` map is only populated when a package
+                            // is queued as a candidate task or referenced by the
+                            // environment model/seed, so it can miss a package that
+                            // appears solely as a dependency requirement; the
+                            // interned env-matches variable is the reliable signal
+                            // and `env_packages` is kept as a fallback.
+                            state.variable_map.get_env_matches(vs).is_some()
+                                || state
+                                    .env_packages
+                                    .get(solver.provider().version_set_name(vs))
+                                    .is_some()
+                        });
+                    if all_env {
+                        tracing::trace!(
+                            "{package_id:?} requires env package(s) {version_set_id:?}"
+                        );
+                        for &vs in &env_version_sets {
                             let target_node = *env_matches_nodes
                                 .entry(vs)
                                 .or_insert_with(|| graph.add_node(ConflictNode::EnvMatches(vs)));
@@ -231,8 +249,8 @@ impl Conflict {
                                     ConflictEdge::Requires(version_set_id),
                                 );
                             }
-                            continue;
                         }
+                        continue;
                     }
 
                     let candidates = solver.async_runtime.block_on(solver.cache.get_or_cache_sorted_candidates(version_set_id)).unwrap_or_else(|_| {
