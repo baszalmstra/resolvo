@@ -2,6 +2,7 @@ use std::{any::Any, fmt::Display};
 
 use ahash::{HashMap, HashSet};
 use assertion_scans::AssertionScans;
+use cache::EnvRelationHook;
 pub use cache::SolverCache;
 use clause::{Clause, EnvClause, EnvClauseKind, EnvConstrainsClause, Literal, WatchedLiterals};
 use conditions::{DeferredRequirement, Disjunction, DisjunctionId, condition_disjunct_holds};
@@ -485,7 +486,7 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     constrains_aux_vars: HashMap<VersionSetId, VariableId>,
 
     /// Records environment package metadata (particularly `can_be_absent`)
-    /// for packages declared via `PackageCandidates::Environment`. Populated
+    /// for packages the cache classified as environment packages. Populated
     /// in `on_candidates_available`.
     pub(crate) env_packages: <D::NameId as SolverId>::Map<Option<EnvironmentPackage>>,
 
@@ -3363,9 +3364,14 @@ impl<D: DependencyProvider> SolverState<D> {
     /// package.
     ///
     /// Returns the variable id of `L_S`.
+    ///
+    /// `env_relation` is the universal-solve relation oracle hook (installed on
+    /// the cache by [`Solver::solve_universal`]); this method is only reachable
+    /// while it is present, so a missing hook is a bug.
     pub(crate) fn intern_env_matches_with_oracle_clauses(
         &mut self,
         provider: &D,
+        env_relation: Option<EnvRelationHook<D>>,
         version_set_id: VersionSetId,
         package_name: D::NameId,
     ) -> VariableId {
@@ -3400,8 +3406,14 @@ impl<D: DependencyProvider> SolverState<D> {
 
             // Query the oracle with `a` = the literal being interned and
             // `b` = the previously interned literal; the match arms below
-            // depend on this argument order.
-            let relation = provider.environment_version_set_relation(version_set_id, *prior_vs);
+            // depend on this argument order. Only reachable during a universal
+            // solve, which installs the relation hook before encoding.
+            let relation = env_relation
+                .expect("env_relation hook must be installed for universal solves")(
+                provider,
+                version_set_id,
+                *prior_vs,
+            );
 
             match relation {
                 VersionSetRelation::Disjoint => {

@@ -592,7 +592,7 @@ impl resolvo::DependencyProvider for &DependencyProvider {
         result.into_iter().map(Into::into).collect()
     }
 
-    async fn get_candidates(&self, name: resolvo::NameId) -> Option<resolvo::PackageCandidates> {
+    async fn get_candidates(&self, name: resolvo::NameId) -> Option<resolvo::Candidates> {
         let mut candidates = Candidates {
             candidates: Vector::default(),
             favored: std::ptr::null(),
@@ -603,25 +603,23 @@ impl resolvo::DependencyProvider for &DependencyProvider {
         unsafe { (self.get_candidates)(self.data, name.into(), NonNull::from(&mut candidates)) };
 
         unsafe {
-            Some(resolvo::PackageCandidates::Candidates(
-                resolvo::Candidates {
-                    candidates: candidates.candidates.into_iter().map(Into::into).collect(),
-                    favored: candidates.favored.as_ref().copied().map(Into::into),
-                    locked: candidates.locked.as_ref().copied().map(Into::into),
-                    hint_dependencies_available: HintDependenciesAvailable::Some(
-                        candidates
-                            .hint_dependencies_available
-                            .into_iter()
-                            .map(Into::into)
-                            .collect(),
-                    ),
-                    excluded: candidates
-                        .excluded
-                        .iter()
-                        .map(|excluded| (excluded.solvable.into(), excluded.reason.into()))
+            Some(resolvo::Candidates {
+                candidates: candidates.candidates.into_iter().map(Into::into).collect(),
+                favored: candidates.favored.as_ref().copied().map(Into::into),
+                locked: candidates.locked.as_ref().copied().map(Into::into),
+                hint_dependencies_available: HintDependenciesAvailable::Some(
+                    candidates
+                        .hint_dependencies_available
+                        .into_iter()
+                        .map(Into::into)
                         .collect(),
-                },
-            ))
+                ),
+                excluded: candidates
+                    .excluded
+                    .iter()
+                    .map(|excluded| (excluded.solvable.into(), excluded.reason.into()))
+                    .collect(),
+            })
         }
     }
 

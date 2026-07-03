@@ -9,8 +9,8 @@ use ahash::HashMap;
 
 use crate::{
     Candidates, Condition, ConditionalRequirement, Dependencies, DependencyProvider,
-    EnvironmentPackage, Interner, KnownDependencies, NameId, PackageCandidates, SolvableId, Solver,
-    SolverCache, StringId, VersionSetId, VersionSetRelation, VersionSetUnionId,
+    EnvironmentPackage, Interner, KnownDependencies, NameId, SolvableId, Solver, SolverCache,
+    StringId, UniversalDependencyProvider, VersionSetId, VersionSetRelation, VersionSetUnionId,
     solver::clause::Clause, utils::Pool,
 };
 
@@ -144,20 +144,17 @@ impl DependencyProvider for EnvTestProvider {
             .collect()
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
-        if let Some(env_pkg) = self.env_packages.get(&name) {
-            return Some(PackageCandidates::Environment(*env_pkg));
-        }
+    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
         let candidates = self
             .pool
             .iter_solvables()
             .filter(|(_, solvable)| solvable.name == name)
             .map(|(id, _)| id)
             .collect();
-        Some(PackageCandidates::Candidates(Candidates {
+        Some(Candidates {
             candidates,
             ..Candidates::default()
-        }))
+        })
     }
 
     async fn sort_candidates(&self, _cache: &SolverCache<Self>, solvables: &mut [SolvableId]) {
@@ -175,6 +172,12 @@ impl DependencyProvider for EnvTestProvider {
                 .cloned()
                 .unwrap_or_default(),
         )
+    }
+}
+
+impl UniversalDependencyProvider for EnvTestProvider {
+    fn environment_package(&self, name: NameId) -> Option<EnvironmentPackage> {
+        self.env_packages.get(&name).copied()
     }
 
     fn environment_version_set_relation(

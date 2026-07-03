@@ -16,9 +16,9 @@
 //! whole family of environments (for example all glibc versions in a range,
 //! or machines with and without CUDA). Properties of the target environment
 //! are modeled as *environment packages*: packages whose value is unknown at
-//! solve time, declared by returning [`PackageCandidates::Environment`] from
-//! [`DependencyProvider::get_candidates`] and related through the
-//! [`DependencyProvider::environment_version_set_relation`] oracle. A
+//! solve time, classified by
+//! [`UniversalDependencyProvider::environment_package`] and related through the
+//! [`UniversalDependencyProvider::environment_version_set_relation`] oracle. A
 //! [`UniversalProblem`] bounds the environment space with an explicit
 //! [`EnvironmentModel`]; the solver partitions that space into disjoint
 //! cells, each paired with the solvables valid throughout the cell, returned
@@ -84,8 +84,7 @@ pub enum VersionSetRelation {
 }
 
 /// Describes an environment package: a package whose value is unknown at solve
-/// time. Returned by [`DependencyProvider::get_candidates`] via
-/// [`PackageCandidates::Environment`].
+/// time. Returned by [`UniversalDependencyProvider::environment_package`].
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnvironmentPackage {
@@ -94,22 +93,22 @@ pub struct EnvironmentPackage {
     pub can_be_absent: bool,
 }
 
-/// The return type of [`DependencyProvider::get_candidates`].
+/// Internal cache representation of a package: either a normal package with
+/// concrete candidate solvables, or an environment package whose value is
+/// unknown at solve time.
 ///
-/// A package is either a normal package with concrete candidate solvables, or
-/// an environment package whose value is unknown at solve time.
+/// This type never appears on the public [`DependencyProvider`] surface:
+/// [`DependencyProvider::get_candidates`] only ever produces the
+/// [`Candidates`](PackageCandidates::Candidates) case, and the environment
+/// classification is layered on by [`Solver::solve_universal`] via
+/// [`UniversalDependencyProvider::environment_package`]. It exists only so the
+/// solver cache can carry either kind uniformly.
 #[derive(Clone, Debug)]
-pub enum PackageCandidates<S = SolvableId> {
+pub(crate) enum PackageCandidates<S = SolvableId> {
     /// A normal package with concrete candidate solvables.
     Candidates(Candidates<S>),
     /// An environment package whose value is unknown at solve time.
     Environment(EnvironmentPackage),
-}
-
-impl<S> From<Candidates<S>> for PackageCandidates<S> {
-    fn from(candidates: Candidates<S>) -> Self {
-        PackageCandidates::Candidates(candidates)
-    }
 }
 
 /// A signed environment literal: a reference to a version set (or the absent
@@ -352,33 +351,17 @@ pub trait DependencyProvider: Sized + Interner {
     /// Obtains a list of solvables that should be considered when a package
     /// with the given name is requested.
     ///
-    /// Return `None` to indicate that the package name is unknown.
-    /// Return `Some(PackageCandidates::Candidates(...))` for a normal package.
-    /// Return `Some(PackageCandidates::Environment(...))` to declare this name
-    /// as an environment package whose value is unknown at solve time.
-    async fn get_candidates(
-        &self,
-        name: Self::NameId,
-    ) -> Option<PackageCandidates<Self::SolvableId>>;
-
-    /// Returns the relation between two version sets that refer to the same
-    /// environment package.
+    /// Return `None` to indicate that the package name is unknown, or the
+    /// [`Candidates`] for a normal package otherwise.
     ///
-    /// Only called for version sets whose `version_set_name` is an environment
-    /// package. The default implementation panics because providers that
-    /// declare no environment packages should never have this called.
-    ///
-    /// Soundness contract: answers other than `Unknown` must be correct; when
-    /// in doubt return `Unknown`. A wrong `Disjoint` or `Subset` answer
-    /// produces broken lockfiles; `Unknown` merely risks describing environment
-    /// regions no real machine has.
-    fn environment_version_set_relation(
-        &self,
-        _a: VersionSetId,
-        _b: VersionSetId,
-    ) -> VersionSetRelation {
-        unreachable!("provider declared no environment packages")
-    }
+    /// This method describes only *concrete* packages. Environment packages
+    /// (whose value is unknown at solve time) are not visible here: they are
+    /// classified separately by
+    /// [`UniversalDependencyProvider::environment_package`] and consulted only
+    /// during [`Solver::solve_universal`]. A concrete solve therefore never
+    /// sees an environment package, which this signature enforces at the type
+    /// level.
+    async fn get_candidates(&self, name: Self::NameId) -> Option<Candidates<Self::SolvableId>>;
 
     /// Sort the specified solvables based on which solvable to try first. The
     /// solver will iteratively try to select the highest version. If a
@@ -399,6 +382,46 @@ pub trait DependencyProvider: Sized + Interner {
     fn should_cancel_with_value(&self) -> Option<Box<dyn Any>> {
         None
     }
+}
+
+/// A [`DependencyProvider`] that additionally classifies package names as
+/// *environment packages* for universal solving (see
+/// [`Solver::solve_universal`]).
+///
+/// The methods of this trait are consulted only by
+/// [`Solver::solve_universal`]; a plain [`Solver::solve`] never calls them.
+/// Concrete solving therefore cannot observe environment packages, which is
+/// enforced by construction: the shared solver internals classify a package as
+/// an environment package only when the caller drove a universal solve through
+/// a provider that implements this trait.
+pub trait UniversalDependencyProvider: DependencyProvider {
+    /// Declares `name` as an environment package whose value is unknown at
+    /// solve time. Consulted (and cached) before
+    /// [`get_candidates`](DependencyProvider::get_candidates) during universal
+    /// solves; `None` means a normal concrete package.
+    ///
+    /// Sync by design: this is metadata classification, not a fetch. A package
+    /// classified as an environment package is never passed to
+    /// [`get_candidates`](DependencyProvider::get_candidates).
+    fn environment_package(&self, name: Self::NameId) -> Option<EnvironmentPackage>;
+
+    /// Returns the relation between two version sets that refer to the same
+    /// environment package.
+    ///
+    /// Only called for version sets whose
+    /// [`version_set_name`](Interner::version_set_name) is an environment
+    /// package.
+    ///
+    /// Soundness contract: answers other than
+    /// [`Unknown`](VersionSetRelation::Unknown) must be correct; when in doubt
+    /// return `Unknown`. A wrong `Disjoint` or `Subset` answer produces broken
+    /// lockfiles; `Unknown` merely risks describing environment regions no real
+    /// machine has.
+    fn environment_version_set_relation(
+        &self,
+        a: VersionSetId,
+        b: VersionSetId,
+    ) -> VersionSetRelation;
 }
 
 /// A list of candidate solvables for a specific package. This is returned from

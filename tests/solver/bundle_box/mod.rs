@@ -68,8 +68,8 @@ use itertools::Itertools;
 pub use pack::Pack;
 use resolvo::{
     Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    EnvironmentPackage, HintDependenciesAvailable, Interner, KnownDependencies, NameId,
-    PackageCandidates, SolvableId, SolverCache, StringId, VersionSetId, VersionSetRelation,
+    EnvironmentPackage, HintDependenciesAvailable, Interner, KnownDependencies, NameId, SolvableId,
+    SolverCache, StringId, UniversalDependencyProvider, VersionSetId, VersionSetRelation,
     VersionSetUnionId, snapshot::DependencySnapshot, utils::Pool,
 };
 pub use spec::Spec;
@@ -409,7 +409,7 @@ impl DependencyProvider for BundleBoxProvider {
         });
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
         let concurrent_requests = self.concurrent_requests.fetch_add(1, Ordering::SeqCst);
         self.concurrent_requests_max.set(
             self.concurrent_requests_max
@@ -423,13 +423,6 @@ impl DependencyProvider for BundleBoxProvider {
         );
 
         let package_name = self.pool.resolve_package_name(name);
-
-        // Check environment packages before the regular packages map.
-        if let Some(env_pkg) = self.environment_packages.get(package_name) {
-            return self
-                .maybe_delay(Some(PackageCandidates::Environment(*env_pkg)))
-                .await;
-        }
 
         let Some(package) = self.packages.get(package_name) else {
             return self.maybe_delay(None).await;
@@ -463,8 +456,7 @@ impl DependencyProvider for BundleBoxProvider {
             }
         }
 
-        self.maybe_delay(Some(PackageCandidates::Candidates(candidates)))
-            .await
+        self.maybe_delay(Some(candidates)).await
     }
 
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
@@ -530,6 +522,13 @@ impl DependencyProvider for BundleBoxProvider {
         } else {
             None
         }
+    }
+}
+
+impl UniversalDependencyProvider for BundleBoxProvider {
+    fn environment_package(&self, name: NameId) -> Option<EnvironmentPackage> {
+        let package_name = self.pool.resolve_package_name(name);
+        self.environment_packages.get(package_name).copied()
     }
 
     fn environment_version_set_relation(

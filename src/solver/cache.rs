@@ -4,8 +4,8 @@ use event_listener::Event;
 use std::{any::Any, cell::RefCell, rc::Rc};
 
 use crate::{
-    Candidates, Dependencies, DependencyProvider, HintDependenciesAvailable, PackageCandidates,
-    Requirement, VersionSetId,
+    Dependencies, DependencyProvider, EnvironmentPackage, HintDependenciesAvailable, Interner,
+    PackageCandidates, Requirement, VersionSetId, VersionSetRelation,
     internal::{
         arena::Arena,
         id::{CandidatesId, DependenciesId},
@@ -13,6 +13,16 @@ use crate::{
     },
     solver_id::{IdSet, SolverId},
 };
+
+/// Universal-solve hook that classifies a package name as an environment
+/// package (see [`SolverCache::set_env_classify`]). A plain `fn` pointer so
+/// the cache stays generic over `D: DependencyProvider`.
+pub(crate) type EnvClassifyHook<D> = fn(&D, <D as Interner>::NameId) -> Option<EnvironmentPackage>;
+
+/// Universal-solve hook that answers the version-set relation oracle for
+/// environment packages (see [`SolverCache::set_env_relation`]). A plain `fn`
+/// pointer so the cache stays generic over `D: DependencyProvider`.
+pub(crate) type EnvRelationHook<D> = fn(&D, VersionSetId, VersionSetId) -> VersionSetRelation;
 
 /// Keeps a cache of previously computed and/or requested information about
 /// solvables and version sets.
@@ -46,6 +56,25 @@ pub struct SolverCache<D: DependencyProvider> {
     /// information is provided by the DependencyProvider when the
     /// candidates for a package are requested.
     hint_dependencies_available: RefCell<<D::SolvableId as SolverId>::Set>,
+
+    /// Universal-solve hook that classifies a package name as an environment
+    /// package. Installed by [`Solver::solve_universal`](crate::Solver) before
+    /// encoding; `None` for a plain solve, in which case every package is
+    /// concrete and `get_candidates` alone determines its candidates. When
+    /// installed it is consulted (and its result cached) before
+    /// [`DependencyProvider::get_candidates`], so a package it classifies as
+    /// an environment package is never passed to `get_candidates`. A plain
+    /// `fn` pointer so the cache stays generic over `D: DependencyProvider`.
+    env_classify: Option<EnvClassifyHook<D>>,
+
+    /// Universal-solve hook answering the version-set relation oracle for
+    /// environment packages. Installed by
+    /// [`Solver::solve_universal`](crate::Solver) alongside
+    /// [`Self::env_classify`]; `None` for a plain solve, which never interns
+    /// environment literals and so never queries it. Lives on the cache (which
+    /// outlives the per-solve state reset) so the encoder can thread it into
+    /// [`SolverState::intern_env_matches_with_oracle_clauses`](crate::solver::SolverState).
+    env_relation: Option<EnvRelationHook<D>>,
 }
 
 impl<D: DependencyProvider> SolverCache<D> {
@@ -62,6 +91,8 @@ impl<D: DependencyProvider> SolverCache<D> {
             solvable_dependencies: Default::default(),
             solvable_to_dependencies: Default::default(),
             hint_dependencies_available: Default::default(),
+            env_classify: None,
+            env_relation: None,
         }
     }
 
@@ -70,13 +101,40 @@ impl<D: DependencyProvider> SolverCache<D> {
         &self.provider
     }
 
+    /// Installs the environment-package classification hook used by universal
+    /// solving (see [`SolverCache::env_classify`]). Must be called before any
+    /// candidates are cached so the classification is consistent for the whole
+    /// solve.
+    pub(crate) fn set_env_classify(&mut self, classify: EnvClassifyHook<D>) {
+        self.env_classify = Some(classify);
+    }
+
+    /// Installs the environment version-set relation oracle hook used by
+    /// universal solving (see [`SolverCache::env_relation`]).
+    pub(crate) fn set_env_relation(&mut self, relation: EnvRelationHook<D>) {
+        self.env_relation = Some(relation);
+    }
+
+    /// Returns the installed environment relation oracle hook, if any (see
+    /// [`SolverCache::env_relation`]). `None` outside a universal solve.
+    pub(crate) fn env_relation(&self) -> Option<EnvRelationHook<D>> {
+        self.env_relation
+    }
+
     /// Returns the candidates for the package with the given name. This will
     /// either ask the [`DependencyProvider`] for the entries or a cached
     /// value.
     ///
     /// If the provider has requested the solving process to be cancelled, the
     /// cancellation value will be returned as an `Err(...)`.
-    pub async fn get_or_cache_candidates(
+    ///
+    /// When an environment-classification hook is installed (universal solves,
+    /// see [`SolverCache::set_env_classify`]) it is consulted before
+    /// [`DependencyProvider::get_candidates`]: a package it classifies as an
+    /// environment package is cached as
+    /// [`PackageCandidates::Environment`] and never fetched. Otherwise the
+    /// provider's concrete candidates are cached.
+    pub(crate) async fn get_or_cache_candidates(
         &self,
         package_name: D::NameId,
     ) -> Result<&PackageCandidates<D::SolvableId>, Box<dyn Any>> {
@@ -113,14 +171,24 @@ impl<D: DependencyProvider> SolverCache<D> {
                             .borrow_mut()
                             .insert(package_name, Rc::new(Event::new()));
 
-                        // Otherwise we have to get them from the DependencyProvider
-                        let package_candidates = self
-                            .provider
-                            .get_candidates(package_name)
-                            .await
-                            .unwrap_or_else(
-                                || PackageCandidates::Candidates(Candidates::default()),
-                            );
+                        // Consult the environment-classification hook (if a
+                        // universal solve installed one) before fetching: a
+                        // package classified as an environment package has no
+                        // concrete candidates and must not be passed to
+                        // `get_candidates`. Otherwise fetch the concrete
+                        // candidates from the DependencyProvider.
+                        let package_candidates = match self
+                            .env_classify
+                            .and_then(|classify| classify(&self.provider, package_name))
+                        {
+                            Some(env_pkg) => PackageCandidates::Environment(env_pkg),
+                            None => PackageCandidates::Candidates(
+                                self.provider
+                                    .get_candidates(package_name)
+                                    .await
+                                    .unwrap_or_default(),
+                            ),
+                        };
 
                         // Store information about which solvables dependency information is
                         // easy to retrieve.

@@ -2117,13 +2117,16 @@ fn test_self_constrains_unsolvable() {
 // M1: Environment literals in the encoder -- scenario tests
 // ===========================================================================
 //
-// These tests exercise the three env-package encoding paths through a plain
-// `solve()` call which gives the "baseline" solution: all environment literals
-// default to false / undecided. None of these tests need `solve_universal`.
+// The type-level split means a plain `solve()` cannot classify environment
+// packages: a `UniversalDependencyProvider` used through `Solver::solve` sees
+// its environment packages as ordinary unknown packages (no candidates). The
+// environment encoding paths are exercised only under `solve_universal`, which
+// installs the classification and relation hooks before encoding.
 
-/// Conditional dependency on an environment package stays inactive in the
-/// baseline solve (environment literal is undecided = false, so the condition
-/// disjunction is not satisfied and the requirement is inactive).
+/// A concrete `solve()` does not classify environment packages, so a
+/// conditional dependency guarded by one stays inactive: `cuda` resolves to an
+/// unknown package with no candidates, the condition is unsatisfiable, and `b`
+/// is not pulled in.
 #[test]
 fn test_env_conditional_dep_inactive_in_baseline() {
     let mut provider = BundleBoxProvider::new();
@@ -2143,10 +2146,9 @@ fn test_env_conditional_dep_inactive_in_baseline() {
     ");
 }
 
-/// A constraint on an env package that can be absent: in the baseline solve
-/// the absent literal is false/undecided so the EnvConstrains clause is
-/// satisfied by the absent literal (absent is undecided, counts as false, and
-/// propagation does nothing), and the solve completes without a conflict.
+/// A concrete `solve()` does not classify environment packages, so a
+/// constraint on one is vacuous: `cuda` resolves to an unknown package with no
+/// candidates to exclude and the solve completes with only `a` installed.
 #[test]
 fn test_env_constrains_absent_branch_baseline() {
     let mut provider = BundleBoxProvider::new();
@@ -2166,21 +2168,16 @@ fn test_env_constrains_absent_branch_baseline() {
     ");
 }
 
-/// A requirement on an environment package forces that env literal to be true
-/// and the solve still succeeds (no concrete solvable is produced, but the
-/// solve does not fail).
+/// A requirement on an environment package forces that env literal true during
+/// a universal solve; the enumerated cell has no concrete solvables (the env
+/// literal is not a solvable).
 #[test]
 fn test_env_requirement_forces_literal_true() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", false);
-    // Root requires `cuda 11..100`. This should force L_{cuda>=11} = true.
-    let requirements = provider.requirements(&["cuda 11..100"]);
-    let mut solver = Solver::new(provider);
-    let problem = Problem::new().requirements(requirements);
-    let solved = solver.solve(problem).unwrap();
-    // No concrete solvables -- the env literal variable is true but not a
-    // solvable. The solution set of concrete solvables is empty.
-    assert_eq!(solved, vec![]);
+    // Root requires `cuda 11..100`, forcing L_{cuda>=11} = true.
+    let result = universal_solve_snapshot(provider, &["cuda 11..100"], &[&["cuda 11..100"]]);
+    assert_snapshot!(result, @"cell: cuda in >=11, <100");
 }
 
 /// A conditional dependency on an environment package becomes ACTIVE when
@@ -2194,14 +2191,11 @@ fn test_env_conditional_dep_active_when_literal_forced() {
     provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
     provider.add_package("b", Pack::new(1), &[], &[]);
 
-    let requirements = provider.requirements(&["a", "cuda 11..100"]);
-    let mut solver = Solver::new(provider);
-    let problem = Problem::new().requirements(requirements);
-    let solved = solver.solve(problem).unwrap();
-    let result = transaction_to_string(solver.provider(), &solved);
+    let result = universal_solve_snapshot(provider, &["a", "cuda 11..100"], &[&["cuda 11..100"]]);
     assert_snapshot!(result, @r"
-    a=1
-    b=1
+    cell: cuda in >=11, <100
+      a=1
+      b=1
     ");
 }
 
@@ -2218,37 +2212,36 @@ fn test_env_oracle_subset_satisfies_constraint() {
     provider.add_environment_package("cuda", false);
     provider.add_package("a", Pack::new(1), &[], &["cuda 11..100"]);
 
-    let requirements = provider.requirements(&["a", "cuda 12..100"]);
-    let mut solver = Solver::new(provider);
-    let problem = Problem::new().requirements(requirements);
-    let solved = solver.solve(problem).unwrap();
-    let result = transaction_to_string(solver.provider(), &solved);
+    let result = universal_solve_snapshot(provider, &["a", "cuda 12..100"], &[&["cuda 12..100"]]);
     assert_snapshot!(result, @r"
-    a=1
+    cell: cuda in >=12, <100 AND cuda in >=11, <100
+      a=1
     ");
 }
 
 /// Oracle Disjoint exclusion: two root requirements on disjoint version sets
 /// of the same environment package force both literals true, which violates
-/// the oracle clause `(not L_{0..5} or not L_{11..100})`. The solve must
-/// fail. Without the disjoint oracle clause both literals could be true
+/// the oracle clause `(not L_{0..5} or not L_{11..100})`. The universal solve
+/// must fail. Without the disjoint oracle clause both literals could be true
 /// simultaneously and the solve would (incorrectly) succeed.
 #[test]
 fn test_env_oracle_disjoint_conflict() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", false);
 
-    let requirements = provider.requirements(&["cuda 0..5", "cuda 11..100"]);
-    let mut solver = Solver::new(provider);
-    let problem = Problem::new().requirements(requirements);
-    let result = solver.solve(problem);
-    // Conflict rendering for env literals is deferred to M5; only assert
-    // that the solve fails as unsolvable.
-    assert!(matches!(result, Err(UnsolvableOrCancelled::Unsolvable(_))));
+    let result = universal_solve_snapshot(
+        provider,
+        &["cuda 0..5", "cuda 11..100"],
+        &[&["cuda 0..5", "cuda 11..100"]],
+    );
+    assert_snapshot!(
+        result,
+        @"unsolvable in cell: not (cuda in >=0, <5) AND cuda in >=11, <100"
+    );
 }
 
 /// `Requirement::Union` mixing an environment and a concrete version set is
-/// rejected in v1 with a clear panic.
+/// rejected during encoding with a clear panic.
 #[test]
 #[should_panic(expected = "mixing environment and concrete version sets")]
 fn test_env_union_mixing_concrete_panics() {
@@ -2258,14 +2251,14 @@ fn test_env_union_mixing_concrete_panics() {
 
     let requirements = provider.requirements(&["b 1..2 | cuda 11..100"]);
     let mut solver = Solver::new(provider);
-    let problem = Problem::new().requirements(requirements);
-    let _ = solver.solve(problem);
+    let problem = UniversalProblem::new().requirements(requirements);
+    let _ = solver.solve_universal(problem);
 }
 
 /// Environment-package encoding must also work under a real async runtime
-/// (tokio with `sleep_before_return = true`): classification of environment
-/// packages happens inside the queued futures where awaiting is legal, not
-/// via synchronous cache peeks that only hold under `NowOrNeverRuntime`.
+/// (tokio with `sleep_before_return = true`): the concrete-dependency futures
+/// actually yield while the (synchronous) environment classification hook is
+/// consulted for `cuda`.
 ///
 /// `a` requires the env package itself (forcing the literal true) and has a
 /// conditional dependency on `b` that becomes active because of it. `a` also
@@ -2282,11 +2275,11 @@ fn test_env_encoding_under_async_runtime() {
     );
     provider.add_package("b", Pack::new(1), &[], &[]);
 
-    // `solve_snapshot` uses the tokio runtime and sets `sleep_before_return`.
-    let result = solve_snapshot(provider, &["a"]);
+    let result = universal_solve_snapshot_async(provider, &["a"], &[&["cuda 11..100"]]);
     assert_snapshot!(result, @r"
-    a=1
-    b=1
+    cell: cuda in >=11, <100 AND cuda in >=5, <100
+      a=1
+      b=1
     ");
 }
 
@@ -2345,6 +2338,59 @@ fn universal_solve_snapshot(
         .collect();
 
     let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model);
+    match solver.solve_universal(problem) {
+        Ok(solution) => {
+            let mut buf = String::new();
+            for (condition, solvables) in &solution.cells {
+                writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
+                for solvable in solvables
+                    .iter()
+                    .map(|&s| solver.provider().display_solvable(s).to_string())
+                    .sorted()
+                {
+                    writeln!(buf, "  {solvable}").unwrap();
+                }
+            }
+            buf
+        }
+        Err(UniversalFailure::Unsolvable { cell, .. }) => {
+            format!("unsolvable in cell: {}", cell.display(solver.provider()))
+        }
+        Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+    }
+}
+
+/// Like [`universal_solve_snapshot`] but drives the solve on a real tokio
+/// runtime with `sleep_before_return`, so the concrete-dependency futures
+/// actually yield while the environment encoding paths run.
+fn universal_solve_snapshot_async(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> String {
+    use std::fmt::Write;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    provider.sleep_before_return = true;
+
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+
+    let mut solver = Solver::new(provider).with_runtime(runtime);
     let problem = UniversalProblem::new()
         .requirements(requirements)
         .environment_model(environment_model);
@@ -3579,33 +3625,25 @@ fn test_m5_conflict_display_requires_env_package() {
     ");
 }
 
-/// (M5-b) Plain solve with two disjoint requirements on the same env package:
-/// the requirements are rendered as environment requirements (never as
-/// missing packages) and the oracle consistency clause between them is
+/// (M5-b) Universal solve with two disjoint requirements on the same env
+/// package: the requirements are rendered as environment requirements (never
+/// as missing packages) and the oracle consistency clause between them is
 /// rendered as a mutual-exclusivity conflict.
 #[test]
 fn test_m5_conflict_display_oracle_disjoint() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", false);
 
-    let requirements = provider.requirements(&["cuda 0..5", "cuda 11..100"]);
-    let mut solver = Solver::new(provider);
-    let problem = Problem::new().requirements(requirements);
-    match solver.solve(problem) {
-        Err(UnsolvableOrCancelled::Unsolvable(conflict)) => {
-            let display = conflict.display_user_friendly(&solver).to_string();
-            // Must not panic, must mention both environment requirements and
-            // their mutual exclusivity, and must not claim candidates are
-            // missing.
-            assert_snapshot!(display, @r"
-            The following packages are incompatible
-            ├─ the environment must provide cuda >=0, <5
-            └─ the environment must provide cuda >=11, <100
-               └─ cuda >=11, <100 and cuda >=0, <5 are mutually exclusive environment requirements
-            ");
-        }
-        other => panic!("expected Unsolvable, got {other:?}"),
-    }
+    let result = universal_failure_snapshot(
+        provider,
+        &["cuda 0..5", "cuda 11..100"],
+        &[&["cuda 0..5", "cuda 11..100"]],
+    );
+    assert_snapshot!(result, @r"
+    cell: not (cuda in >=0, <5) AND cuda in >=11, <100
+    The following packages are incompatible
+    └─ the environment must provide cuda >=0, <5
+    ");
 }
 
 /// (M5-c) Scoped conflict for the constrains-split unsolvable-gap scenario:
@@ -3800,7 +3838,7 @@ fn test_snapshot_universal_mode_enumerates_cells() {
     let name_glibc = NameId::from_index(1);
     let glibc_ge2 = VersionSetId::from_index(0);
 
-    let mut provider = snapshot.provider().with_universal_mode(true);
+    let mut provider = snapshot.provider();
     let req = provider.add_package_requirement(NameId::from_index(0), "*");
     let mut solver = Solver::new(provider);
     let model = vec![vec![(

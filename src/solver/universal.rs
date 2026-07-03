@@ -22,29 +22,35 @@
 //! ```ignore
 //! use resolvo::{
 //!     Candidates, DependencyProvider, EnvLiteral, EnvLiteralKind, EnvironmentPackage,
-//!     PackageCandidates, Solver, UniversalProblem, VersionSetRelation,
+//!     Solver, UniversalDependencyProvider, UniversalProblem, VersionSetRelation,
 //! };
 //!
-//! // 1. Declare an environment package: a package whose value is unknown at
-//! //    solve time (e.g. `cuda`). Instead of concrete candidate solvables,
-//! //    `get_candidates` returns `PackageCandidates::Environment`.
+//! // 1. `get_candidates` describes concrete packages only; it never sees an
+//! //    environment package (enforced at the type level).
 //! impl DependencyProvider for MyProvider {
-//!     async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
-//!         if self.is_environment_package(name) {
-//!             return Some(PackageCandidates::Environment(EnvironmentPackage {
-//!                 // Machines without CUDA exist, so the absent literal is
-//!                 // part of the environment space.
-//!                 can_be_absent: true,
-//!             }));
-//!         }
-//!         Some(Candidates { candidates: self.candidates_for(name), ..Default::default() }.into())
+//!     async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
+//!         Some(Candidates { candidates: self.candidates_for(name), ..Default::default() })
 //!     }
 //!
-//!     // 2. Implement the relation oracle for version sets of environment
-//!     //    packages. Soundness contract: answers other than `Unknown` must
-//!     //    be correct; when in doubt return `Unknown`. A wrong `Disjoint`
-//!     //    or `Subset` answer produces broken solutions, `Unknown` merely
-//!     //    risks describing environment regions no real machine has.
+//!     // ... the remaining DependencyProvider methods as usual ...
+//! }
+//!
+//! // 2. Implement `UniversalDependencyProvider` to classify environment
+//! //    packages and answer the relation oracle. These methods are consulted
+//! //    only by `solve_universal`, never by a plain `solve`.
+//! impl UniversalDependencyProvider for MyProvider {
+//!     fn environment_package(&self, name: NameId) -> Option<EnvironmentPackage> {
+//!         // e.g. `cuda`: a package whose value is unknown at solve time.
+//!         // Machines without CUDA exist, so the absent literal is part of
+//!         // the environment space.
+//!         self.is_environment_package(name)
+//!             .then_some(EnvironmentPackage { can_be_absent: true })
+//!     }
+//!
+//!     // Soundness contract: answers other than `Unknown` must be correct;
+//!     // when in doubt return `Unknown`. A wrong `Disjoint` or `Subset`
+//!     // answer produces broken solutions, `Unknown` merely risks describing
+//!     // environment regions no real machine has.
 //!     fn environment_version_set_relation(
 //!         &self,
 //!         a: VersionSetId,
@@ -61,8 +67,6 @@
 //!             VersionSetRelation::Unknown
 //!         }
 //!     }
-//!
-//!     // ... the remaining DependencyProvider methods as usual ...
 //! }
 //!
 //! // 3. Build the problem: requirements as usual, plus an environment model
@@ -132,8 +136,8 @@ use std::{any::Any, marker::PhantomData};
 use crate::{
     CellCondition, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
     EnvLiteral, EnvLiteralKind, EnvironmentPackage, Interner, KnownDependencies, NameId,
-    PackageCandidates, Presence, Requirement, SolvableId, VariableId, VersionSetId,
-    VersionSetRelation,
+    PackageCandidates, Presence, Requirement, SolvableId, UniversalDependencyProvider, VariableId,
+    VersionSetId, VersionSetRelation,
     conflict::Conflict,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     runtime::AsyncRuntime,
@@ -493,7 +497,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// are exact.
     pub fn verify<D>(&self, provider: &D) -> Result<(), Vec<Violation<N>>>
     where
-        D: DependencyProvider + Interner<SolvableId = Id, NameId = N>,
+        D: UniversalDependencyProvider + Interner<SolvableId = Id, NameId = N>,
     {
         let mut violations = Vec::new();
 
@@ -535,7 +539,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// when the cells cover the entire model.
     fn find_uncovered_region<D>(&self, provider: &D) -> Option<CellCondition<N>>
     where
-        D: DependencyProvider + Interner<NameId = N>,
+        D: UniversalDependencyProvider + Interner<NameId = N>,
     {
         // Collect the distinct environment literals of the model and the
         // cells, in deterministic first-occurrence order. Every collected
@@ -693,7 +697,7 @@ pub enum UniversalFailure<N = NameId> {
     Cancelled(Box<dyn Any>),
 }
 
-impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
+impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Solves the given [`UniversalProblem`], producing a partition of the
     /// environment model into cells, each with the solvables valid throughout
     /// that cell.
@@ -796,6 +800,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // shared across the whole enumeration loop: the formula only grows,
         // so learnt clauses and interned variables stay valid across cells.
         self.state = SolverState::default();
+
+        // Install the environment hooks the shared solver internals consult.
+        // They live on the cache (which outlives the per-solve state reset), so
+        // a plain `solve` leaves them `None` and cannot observe environment
+        // packages: the cache classifies every package as concrete and the
+        // relation oracle is never queried. Reinstalling on every enumeration
+        // pass is harmless and idempotent.
+        self.cache
+            .set_env_classify(<D as UniversalDependencyProvider>::environment_package);
+        self.cache
+            .set_env_relation(<D as UniversalDependencyProvider>::environment_version_set_relation);
 
         // Universal enumeration depends on the order in which requires clauses
         // are registered; resolve conditional requirements eagerly so the
@@ -1261,9 +1276,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Encodes the environment model CNF as [`Clause::EnvClause`] clauses.
     ///
     /// For every package referenced by a model literal the candidates are
-    /// resolved and required to be [`PackageCandidates::Environment`]; the
-    /// literal variables are interned together with their oracle consistency
-    /// clauses.
+    /// resolved and required to classify as an environment package (cache
+    /// `PackageCandidates::Environment`); the literal variables are interned
+    /// together with their oracle consistency clauses.
     fn encode_environment_model(
         &mut self,
         model: &EnvironmentModel<D::NameId>,
@@ -1291,6 +1306,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         self.declare_environment_package(package_name, "environment model")?;
                         self.state.intern_env_matches_with_oracle_clauses(
                             self.cache.provider(),
+                            self.cache.env_relation(),
                             version_set,
                             package_name,
                         )
@@ -1398,6 +1414,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     self.declare_environment_package(package_name, "seed partition")?;
                     self.state.intern_env_matches_with_oracle_clauses(
                         self.cache.provider(),
+                        self.cache.env_relation(),
                         version_set,
                         package_name,
                     )
@@ -1952,7 +1969,7 @@ fn prove_env_disjoint<N: Copy + Eq, D>(
     b: &CellCondition<N>,
 ) -> Disjointness
 where
-    D: DependencyProvider + Interner<NameId = N>,
+    D: UniversalDependencyProvider + Interner<NameId = N>,
 {
     let mut unknown_involved = false;
     for (lit_a, sign_a) in &a.0 {

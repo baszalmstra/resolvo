@@ -147,7 +147,7 @@ pub(crate) enum Clause<N> {
     /// These clauses are tautologies within the modeled environment space.
     /// They are emitted when a new env-matches literal is interned for a
     /// package that already has other interned literals, based on the answer
-    /// from `DependencyProvider::environment_version_set_relation`.
+    /// from `UniversalDependencyProvider::environment_version_set_relation`.
     ///
     /// They participate in propagation and watching like any binary clause,
     /// but never appear in conflict chains (they are tautologies).

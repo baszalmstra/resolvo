@@ -513,7 +513,6 @@ fn main() {
         // Construct a fresh provider from the snapshot
         let mut provider = snapshot
             .provider()
-            .with_universal_mode(opts.mode == Mode::Universal)
             .with_timeout(SystemTime::now().add(Duration::from_secs(opts.timeout)));
 
         // Construct a problem with a random number of requirements.

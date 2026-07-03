@@ -17,8 +17,8 @@ use futures::FutureExt;
 use crate::{
     Candidates, Condition, ConditionId, DenseIndex, Dependencies, DependencyProvider,
     EnvironmentPackage, HintDependenciesAvailable, Interner, Mapping, NameId, PackageCandidates,
-    Requirement, SolvableId, SolverCache, StringId, VersionSetId, VersionSetRelation,
-    VersionSetUnionId,
+    Requirement, SolvableId, SolverCache, StringId, UniversalDependencyProvider, VersionSetId,
+    VersionSetRelation, VersionSetUnionId,
 };
 
 /// A single solvable in a [`DependencySnapshot`].
@@ -76,8 +76,12 @@ pub struct Package {
 
     /// When set, this package is an environment package for universal
     /// solving. The `solvables` then describe the concrete candidates of a
-    /// simulated machine, which are only presented when the provider runs in
-    /// concrete mode (see [`SnapshotProvider::with_universal_mode`]).
+    /// simulated machine, which [`SnapshotProvider`] presents from
+    /// [`get_candidates`](DependencyProvider::get_candidates) during a concrete
+    /// [`solve`](crate::Solver::solve); a
+    /// [`solve_universal`](crate::Solver::solve_universal) instead classifies
+    /// the package as an environment package via
+    /// [`environment_package`](UniversalDependencyProvider::environment_package).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -403,11 +407,6 @@ pub struct SnapshotProvider<'s> {
     additional_version_sets: Vec<VersionSet>,
     stop_time: Option<SystemTime>,
 
-    /// Whether packages marked as environment packages present themselves as
-    /// [`PackageCandidates::Environment`] (universal mode) instead of their
-    /// concrete simulated-machine candidates (concrete mode, the default).
-    universal: bool,
-
     /// Lookup index over the snapshot's precomputed relation table.
     relations: HashMap<(VersionSetId, VersionSetId), VersionSetRelation>,
 
@@ -441,7 +440,6 @@ impl<'s> SnapshotProvider<'s> {
             snapshot,
             additional_version_sets: Vec::new(),
             stop_time: None,
-            universal: false,
             relations,
             additional_base,
         }
@@ -454,16 +452,6 @@ impl<'s> SnapshotProvider<'s> {
             stop_time: Some(stop_time),
             ..self
         }
-    }
-
-    /// Switches between universal and concrete mode. In universal mode
-    /// packages marked as environment packages in the snapshot are presented
-    /// as [`PackageCandidates::Environment`] and the relation oracle answers
-    /// from the snapshot's precomputed relation table. In concrete mode (the
-    /// default) the environment markers are ignored and those packages
-    /// present their concrete simulated-machine candidates.
-    pub fn with_universal_mode(self, universal: bool) -> Self {
-        Self { universal, ..self }
     }
 
     /// Adds another requirement that matches any version of a package.
@@ -586,14 +574,9 @@ impl DependencyProvider for SnapshotProvider<'_> {
             .collect()
     }
 
-    async fn get_candidates(&self, name: NameId) -> Option<PackageCandidates> {
+    async fn get_candidates(&self, name: NameId) -> Option<Candidates> {
         let package = self.package(name);
-        if self.universal {
-            if let Some(environment) = package.environment {
-                return Some(PackageCandidates::Environment(environment));
-            }
-        }
-        Some(PackageCandidates::Candidates(Candidates {
+        Some(Candidates {
             candidates: package.solvables.clone(),
             favored: None,
             locked: None,
@@ -606,7 +589,7 @@ impl DependencyProvider for SnapshotProvider<'_> {
                     .filter(|&s| self.solvable(s).hint_dependencies_available)
                     .collect(),
             ),
-        }))
+        })
     }
 
     async fn sort_candidates(&self, _solver: &SolverCache<Self>, solvables: &mut [SolvableId]) {
@@ -615,6 +598,21 @@ impl DependencyProvider for SnapshotProvider<'_> {
 
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
         self.solvable(solvable).dependencies.clone()
+    }
+
+    fn should_cancel_with_value(&self) -> Option<Box<dyn Any>> {
+        if let Some(stop_time) = &self.stop_time {
+            if SystemTime::now() > *stop_time {
+                return Some(Box::new(()));
+            }
+        }
+        None
+    }
+}
+
+impl UniversalDependencyProvider for SnapshotProvider<'_> {
+    fn environment_package(&self, name: NameId) -> Option<EnvironmentPackage> {
+        self.package(name).environment
     }
 
     fn environment_version_set_relation(
@@ -636,14 +634,5 @@ impl DependencyProvider for SnapshotProvider<'_> {
             };
         }
         VersionSetRelation::Unknown
-    }
-
-    fn should_cancel_with_value(&self) -> Option<Box<dyn Any>> {
-        if let Some(stop_time) = &self.stop_time {
-            if SystemTime::now() > *stop_time {
-                return Some(Box::new(()));
-            }
-        }
-        None
     }
 }

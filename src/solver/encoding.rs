@@ -13,7 +13,9 @@
 //! resolves against packages
 //! whose value is unknown at solve time, for example `cuda` or a `glibc`
 //! version. Such a package has no concrete candidate solvables; the provider
-//! describes it with [`PackageCandidates::Environment`] instead. We never
+//! classifies it through
+//! [`UniversalDependencyProvider::environment_package`](crate::UniversalDependencyProvider::environment_package)
+//! and the cache carries it internally as `PackageCandidates::Environment`. We never
 //! decide *which* value it takes. Instead we introduce free SAT variables,
 //! the *environment literals*, and let the solver assign them like any other
 //! variable. A solution then describes a region of the environment space (a
@@ -44,7 +46,7 @@
 //! The literals of one package are not independent: if `L_{>=12}` is true
 //! then `L_{>=11}` must be too. The solver cannot see this on its own, so we
 //! ask the provider through
-//! [`environment_version_set_relation`](crate::DependencyProvider::environment_version_set_relation).
+//! [`environment_version_set_relation`](crate::UniversalDependencyProvider::environment_version_set_relation).
 //! Whenever a
 //! new literal `L_a` for `p` is interned we emit clauses against every
 //! literal `L_b` of `p` interned so far:
@@ -597,6 +599,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     let package_name = self.cache.provider().version_set_name(version_set);
                     vec![self.state.intern_env_matches_with_oracle_clauses(
                         self.cache.provider(),
+                        self.cache.env_relation(),
                         version_set,
                         package_name,
                     )]
@@ -690,6 +693,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                             let package_name = self.cache.provider().version_set_name(version_set);
                             let variable = self.state.intern_env_matches_with_oracle_clauses(
                                 self.cache.provider(),
+                                self.cache.env_relation(),
                                 version_set,
                                 package_name,
                             );
@@ -1062,6 +1066,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         let package_name = self.cache.provider().version_set_name(constraint);
         let matches_var = self.state.intern_env_matches_with_oracle_clauses(
             self.cache.provider(),
+            self.cache.env_relation(),
             constraint,
             package_name,
         );
@@ -1747,9 +1752,25 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
 #[cfg(test)]
 mod test {
     use crate::{
-        Condition, ConditionalRequirement, Problem, Solver,
+        Condition, ConditionalRequirement, Problem, Solver, UniversalDependencyProvider,
         solver::env_test_provider::{EnvTestProvider, dump_clauses},
     };
+
+    /// Installs the universal-solve environment hooks on a solver by hand.
+    ///
+    /// [`Solver::solve_universal`] installs these before encoding; concrete
+    /// [`Solver::solve`] never does, which is what stops a concrete solve from
+    /// classifying environment packages. These encoder unit tests drive a
+    /// plain `solve()` purely to inspect the generated clauses, so they opt in
+    /// to environment classification the same way `solve_universal` would.
+    fn install_env_hooks(solver: &mut Solver<EnvTestProvider>) {
+        solver.cache.set_env_classify(
+            <EnvTestProvider as UniversalDependencyProvider>::environment_package,
+        );
+        solver.cache.set_env_relation(
+            <EnvTestProvider as UniversalDependencyProvider>::environment_version_set_relation,
+        );
+    }
 
     /// Requirement-on-env-package encoding (5.4 item 1): the candidate list
     /// of the requires clause is the single literal `L_S`, giving the binary
@@ -1766,6 +1787,7 @@ mod test {
         let cuda_11 = provider.version_set("cuda", 11, 100);
 
         let mut solver = Solver::new(provider);
+        install_env_hooks(&mut solver);
         let problem = Problem::new().requirements(vec![cuda_12.into(), cuda_11.into()]);
         solver.solve(problem).expect("solve must succeed");
 
@@ -1802,6 +1824,7 @@ mod test {
         );
 
         let mut solver = Solver::new(provider);
+        install_env_hooks(&mut solver);
         let problem = Problem::new().requirements(vec![a_range.into()]);
         solver.solve(problem).expect("solve must succeed");
 
@@ -1826,6 +1849,7 @@ mod test {
         provider.set_dependencies(a, vec![], vec![cuda_11]);
 
         let mut solver = Solver::new(provider);
+        install_env_hooks(&mut solver);
         let problem = Problem::new().requirements(vec![a_range.into()]);
         solver.solve(problem).expect("solve must succeed");
 
@@ -1853,6 +1877,7 @@ mod test {
         let cuda_name = provider.pool.intern_package_name("cuda");
 
         let mut solver = Solver::new(provider);
+        install_env_hooks(&mut solver);
         let problem = Problem::new().requirements(vec![a_range.into()]);
         let solved = solver.solve(problem).expect("solve must succeed");
         assert_eq!(solved, vec![a]);

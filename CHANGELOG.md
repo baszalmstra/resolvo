@@ -22,18 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `UniversalFailure::Unsolvable` carrying the unsolvable region and a
   conflict scoped to that region via a targeted re-solve.
 - Environment packages: packages whose value is unknown at solve time (e.g.
-  `__glibc`, `__cuda`), declared by returning the new
-  `PackageCandidates::Environment` variant from
-  `DependencyProvider::get_candidates`. Their version sets are related
-  through the new `DependencyProvider::environment_version_set_relation`
-  oracle method. Soundness contract: answers other than `Unknown` must be
-  correct; when in doubt return `Unknown` (a wrong `Disjoint`/`Subset`
-  answer produces broken solutions, `Unknown` merely risks describing
-  environment regions no real machine has).
-- [**breaking**] `DependencyProvider::get_candidates` now returns
-  `Option<PackageCandidates>` instead of `Option<Candidates>`. Wrap existing
-  return values in `PackageCandidates::Candidates` (a `From<Candidates>`
-  impl is provided).
+  `__glibc`, `__cuda`), classified through the new
+  `UniversalDependencyProvider` trait (a supertrait of `DependencyProvider`).
+  A provider implements `environment_package(name) -> Option<EnvironmentPackage>`
+  to declare which names are environment packages and
+  `environment_version_set_relation(a, b) -> VersionSetRelation` as the
+  relation oracle over their version sets. Both are consulted **only** by
+  `Solver::solve_universal`; `DependencyProvider::get_candidates` describes
+  concrete packages only, so a plain `Solver::solve` can never observe an
+  environment package (enforced at the type level). Soundness contract for
+  the oracle: answers other than `Unknown` must be correct; when in doubt
+  return `Unknown` (a wrong `Disjoint`/`Subset` answer produces broken
+  solutions, `Unknown` merely risks describing environment regions no real
+  machine has).
 - `ConflictGraph` and `ConflictNode` carry a second generic parameter `N`
   (the name-id type) and gain environment-literal node variants
   `EnvMatches(VersionSetId)` and `EnvAbsent(N)`; `ConflictCause` gains
