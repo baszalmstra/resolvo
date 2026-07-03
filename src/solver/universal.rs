@@ -85,11 +85,15 @@
 //! let mut solver = Solver::new(provider);
 //! let solution = solver.solve_universal(problem)?;
 //!
-//! // 4. Consume the solution. `cells` partitions the environment space:
+//! // 4. Consume the solution. `cells()` partitions the environment space:
 //! //    each cell pairs a region (a conjunction of signed environment
 //! //    literals) with the solvables valid throughout that region.
-//! for (condition, solvables) in &solution.cells {
-//!     println!("{}: {solvables:?}", condition.display(solver.provider()));
+//! for cell in solution.cells() {
+//!     println!(
+//!         "{}: {:?}",
+//!         cell.condition().display(solver.provider()),
+//!         cell.solvables(),
+//!     );
 //! }
 //! // Per-solvable presence conditions, simplified within the model bounds.
 //! let merged = solution.merged();
@@ -106,7 +110,7 @@
 //! let next = UniversalProblem::new()
 //!     .requirements(new_requirements)
 //!     .environment_model(model)
-//!     .seed_partition(solution.cells.iter().map(|(c, _)| c.clone()).collect());
+//!     .seed_partition(solution.cells().iter().map(|c| c.condition().clone()).collect());
 //! ```
 //!
 //! # Conflict reporting
@@ -326,28 +330,112 @@ impl<Id, N> UniversalProblem<Id, N> {
     }
 }
 
+/// One cell of a [`UniversalSolution`]: a region of the environment space
+/// together with everything the solve determined for it.
+///
+/// Bundling the three parts — the [`condition`](Cell::condition) describing
+/// the region, the [`solvables`](Cell::solvables) valid throughout it, and the
+/// dependency [`edges`](Cell::edges) active in it — keeps them consistent by
+/// construction. The previous representation stored the edges in a vector
+/// parallel to the cells, an invariant that had to be maintained by hand;
+/// making a cell own its edges removes that class of bug.
+#[derive(Clone, Debug)]
+pub struct Cell<Id = SolvableId, N = NameId> {
+    condition: CellCondition<N>,
+    solvables: Vec<Id>,
+    edges: Vec<CellEdge<Id>>,
+}
+
+impl<Id, N> Cell<Id, N> {
+    /// Assembles a cell from its parts. Intended for reconstructing a
+    /// [`UniversalSolution`] from serialized data (see
+    /// [`UniversalSolution::from_cells`]); the enumerator builds cells
+    /// internally.
+    pub fn new(condition: CellCondition<N>, solvables: Vec<Id>, edges: Vec<CellEdge<Id>>) -> Self {
+        Self {
+            condition,
+            solvables,
+            edges,
+        }
+    }
+
+    /// The conjunction of environment literals describing the region of the
+    /// environment space this cell covers.
+    pub fn condition(&self) -> &CellCondition<N> {
+        &self.condition
+    }
+
+    /// The solvables chosen for this cell, valid throughout its region, in
+    /// canonical (solver-variable-id) order.
+    pub fn solvables(&self) -> &[Id] {
+        &self.solvables
+    }
+
+    /// The dependency edges active in this cell.
+    pub fn edges(&self) -> &[CellEdge<Id>] {
+        &self.edges
+    }
+}
+
 /// The result of a successful [`Solver::solve_universal`] call.
 #[derive(Debug)]
 pub struct UniversalSolution<Id = SolvableId, N = NameId> {
-    /// The enumerated cells: each pairs the conjunction of environment
-    /// literals describing a region of the environment space with the
-    /// solvables chosen for that region.
-    ///
-    /// The cells are pairwise disjoint, listed in deterministic enumeration
-    /// order (the baseline cell first), and together cover the environment
-    /// model.
-    pub cells: Vec<(CellCondition<N>, Vec<Id>)>,
+    /// The enumerated cells (see [`UniversalSolution::cells`]).
+    cells: Vec<Cell<Id, N>>,
 
     /// The environment model the solve was bounded by. Stored so that
     /// [`UniversalSolution::verify`] can re-check model coverage without any
     /// solver state (e.g. on a solution reconstructed from a lockfile).
-    pub environment_model: EnvironmentModel<N>,
+    environment_model: EnvironmentModel<N>,
+}
 
-    /// The dependency edges active in each cell, parallel to
-    /// [`UniversalSolution::cells`] (entry `i` holds the edges of cell `i`).
-    /// Captured at solve time because the solver state is reset by the next
-    /// solve. Use [`UniversalSolution::edges`] for the aggregated view.
-    pub cell_edges: Vec<Vec<CellEdge<Id>>>,
+impl<Id, N> UniversalSolution<Id, N> {
+    /// The enumerated cells: each pairs the conjunction of environment
+    /// literals describing a region of the environment space with the
+    /// solvables chosen for that region and the dependency edges active there.
+    ///
+    /// The cells are pairwise disjoint, listed in deterministic enumeration
+    /// order (the baseline cell first), and together cover the environment
+    /// model. The returned slice is read-only, so these invariants cannot be
+    /// broken after construction.
+    pub fn cells(&self) -> &[Cell<Id, N>] {
+        &self.cells
+    }
+
+    /// The environment model the solve was bounded by.
+    pub fn environment_model(&self) -> &EnvironmentModel<N> {
+        &self.environment_model
+    }
+
+    /// Reconstructs a solution from previously serialized cells and the
+    /// environment model it was solved against — the lockfile-reconstruction
+    /// path.
+    ///
+    /// The parallel-vector hazard of the old representation is gone: each
+    /// [`Cell`] carries its own condition, solvables and edges, so the only
+    /// structural check left is the model, which must contain no empty
+    /// disjunction (an empty disjunction is unsatisfiable and would make the
+    /// whole model, and every coverage check against it, vacuous).
+    ///
+    /// Provider-dependent invariants — pairwise cell disjointness, model
+    /// coverage, and that every literal names an environment package — are
+    /// *not* checked here; call [`UniversalSolution::verify`] with the
+    /// provider for those.
+    pub fn from_cells(
+        cells: Vec<Cell<Id, N>>,
+        environment_model: EnvironmentModel<N>,
+    ) -> Result<Self, InvalidUniversalInput<N>> {
+        if environment_model
+            .iter()
+            .any(|disjunction| disjunction.is_empty())
+        {
+            return Err(InvalidUniversalInput::EmptyModelDisjunction);
+        }
+        Ok(Self {
+            cells,
+            environment_model,
+        })
+    }
 }
 
 /// A single dependency edge of one cell of a [`UniversalSolution`]: within
@@ -422,8 +510,8 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// disjunct order are deterministic.
     pub fn merged(&self) -> Vec<(Id, Presence<N>)> {
         let mut order: Vec<Id> = Vec::new();
-        for (_, solvables) in &self.cells {
-            for &solvable in solvables {
+        for cell in &self.cells {
+            for &solvable in &cell.solvables {
                 if !order.contains(&solvable) {
                     order.push(solvable);
                 }
@@ -432,8 +520,8 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         order
             .into_iter()
             .map(|solvable| {
-                let presence =
-                    self.presence_for_cells(|index| self.cells[index].1.contains(&solvable));
+                let presence = self
+                    .presence_for_cells(|index| self.cells[index].solvables.contains(&solvable));
                 (solvable, presence)
             })
             .collect()
@@ -448,14 +536,9 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// are deterministic. This is the view a lockfile serializer needs to
     /// store a conditional dependency graph.
     pub fn edges(&self) -> Vec<(CellEdge<Id>, Presence<N>)> {
-        debug_assert_eq!(
-            self.cell_edges.len(),
-            self.cells.len(),
-            "cell_edges must be parallel to cells"
-        );
         let mut order: Vec<CellEdge<Id>> = Vec::new();
-        for edges in &self.cell_edges {
-            for &edge in edges {
+        for cell in &self.cells {
+            for &edge in &cell.edges {
                 if !order.contains(&edge) {
                     order.push(edge);
                 }
@@ -465,7 +548,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
             .into_iter()
             .map(|edge| {
                 let presence =
-                    self.presence_for_cells(|index| self.cell_edges[index].contains(&edge));
+                    self.presence_for_cells(|index| self.cells[index].edges.contains(&edge));
                 (edge, presence)
             })
             .collect()
@@ -506,10 +589,14 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         // Pairwise disjointness for cells whose solvable sets differ.
         for first in 0..self.cells.len() {
             for second in first + 1..self.cells.len() {
-                if same_solvable_set(&self.cells[first].1, &self.cells[second].1) {
+                if same_solvable_set(&self.cells[first].solvables, &self.cells[second].solvables) {
                     continue;
                 }
-                match prove_env_disjoint(provider, &self.cells[first].0, &self.cells[second].0) {
+                match prove_env_disjoint(
+                    provider,
+                    &self.cells[first].condition,
+                    &self.cells[second].condition,
+                ) {
                     Disjointness::Disjoint => {}
                     Disjointness::Overlapping => {
                         violations.push(Violation::OverlappingCells { first, second });
@@ -547,10 +634,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         // cells, in deterministic first-occurrence order. Every collected
         // literal occurs in at least one clause below.
         let mut literals: Vec<EnvLiteral<N>> = Vec::new();
-        let cell_literals = self
-            .cells
-            .iter()
-            .flat_map(|(condition, _)| condition.0.iter());
+        let cell_literals = self.cells.iter().flat_map(|cell| cell.condition.literals());
         for (literal, _) in self.environment_model.iter().flatten().chain(cell_literals) {
             if !literals.contains(literal) {
                 literals.push(literal.clone());
@@ -617,18 +701,17 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         // The negation of every cell condition: at least one of the cell's
         // literals must evaluate opposite. A cell with the empty condition
         // yields the empty (unsatisfiable) clause: it covers everything.
-        for (condition, _) in &self.cells {
+        for cell in &self.cells {
             clauses.push(
-                condition
-                    .0
-                    .iter()
+                cell.condition
+                    .literals()
                     .map(|(literal, sign)| (index_of(literal), *sign))
                     .collect(),
             );
         }
 
         let assignment = find_witness_indexed(literals.len(), &clauses)?;
-        Some(CellCondition(
+        Some(CellCondition::from_literals_unchecked(
             literals.into_iter().zip(assignment).collect(),
         ))
     }
@@ -646,10 +729,10 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// `debug_assert`, and release builds return the first match.
     pub fn project(&self, eval: impl Fn(&EnvLiteral<N>) -> bool) -> Option<&[Id]> {
         let mut found: Option<&[Id]> = None;
-        for (condition, solvables) in &self.cells {
-            let matches = condition
-                .0
-                .iter()
+        for cell in &self.cells {
+            let matches = cell
+                .condition
+                .literals()
                 .all(|(literal, sign)| eval(literal) == *sign);
             if !matches {
                 continue;
@@ -659,7 +742,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
                 "broken invariant: multiple cells match the same environment"
             );
             if found.is_none() {
-                found = Some(solvables);
+                found = Some(&cell.solvables);
             }
         }
         found
@@ -671,13 +754,15 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     /// the member cells' conditions.
     fn presence_for_cells(&self, member: impl Fn(usize) -> bool) -> Presence<N> {
         if (0..self.cells.len()).all(&member) {
-            return Presence(vec![CellCondition(Vec::new())]);
+            return Presence::from_disjuncts_unchecked(vec![
+                CellCondition::from_literals_unchecked(Vec::new()),
+            ]);
         }
         let disjuncts = (0..self.cells.len())
             .filter(|&index| member(index))
-            .map(|index| self.cells[index].0.clone())
+            .map(|index| self.cells[index].condition.clone())
             .collect();
-        Presence(simplify_disjuncts(disjuncts))
+        Presence::from_disjuncts_unchecked(simplify_disjuncts(disjuncts))
     }
 }
 
@@ -960,7 +1045,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
         for seed in seed_partition {
-            for (literal, _sign) in &seed.0 {
+            for (literal, _sign) in seed.literals() {
                 self.validate_env_literal(literal, EnvInputSource::SeedPartition)?;
             }
         }
@@ -1065,10 +1150,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // emitted on first interning.
         self.encode_environment_model(&environment_model)?;
 
-        let mut cells = Vec::new();
-        // The dependency edges of each recorded cell, captured while the
-        // cell's assignment is still on the decision stack.
-        let mut cell_edges = Vec::new();
+        let mut cells: Vec<Cell<D::SolvableId, D::NameId>> = Vec::new();
         // The same cells in solver variable space, used for disjointness
         // checks against new cells.
         let mut cell_assignments: Vec<Vec<(VariableId, bool)>> = Vec::new();
@@ -1127,9 +1209,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
                     let condition = self.cell_to_condition(&cell);
                     let solvables = self.chosen_solvables_canonical();
+                    // Capture the edges while the cell's assignment is still on
+                    // the decision stack, then bundle everything into one cell.
+                    let edges = self.capture_cell_edges();
                     let cell_is_empty = cell.is_empty();
-                    cells.push((condition, solvables));
-                    cell_edges.push(self.capture_cell_edges());
+                    cells.push(Cell::new(condition, solvables, edges));
                     cell_assignments.push(cell.clone());
 
                     #[cfg(feature = "diagnostics")]
@@ -1297,7 +1381,6 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         Ok(EnumerationOutcome::Done(UniversalSolution {
             cells,
             environment_model,
-            cell_edges,
         }))
     }
 
@@ -1625,8 +1708,8 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // Intern (and validate) every literal before pushing any decision:
         // interning emits oracle consistency clauses, whose watch
         // initialization assumes the involved variables are undecided.
-        let mut assumptions = Vec::with_capacity(seed.0.len());
-        for (env_literal, sign) in &seed.0 {
+        let mut assumptions = Vec::with_capacity(seed.len());
+        for (env_literal, sign) in seed.literals() {
             let variable = match env_literal.kind {
                 EnvLiteralKind::Matches(version_set) => {
                     let package_name = self.cache.provider().version_set_name(version_set);
@@ -2109,7 +2192,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         });
 
-        CellCondition(literals)
+        CellCondition::from_literals_unchecked(literals)
     }
 
     /// Searches for an assignment of the environment literal variables that
@@ -2195,8 +2278,8 @@ where
     D: UniversalDependencyProvider + Interner<NameId = N>,
 {
     let mut unknown_involved = false;
-    for (lit_a, sign_a) in &a.0 {
-        for (lit_b, sign_b) in &b.0 {
+    for (lit_a, sign_a) in a.literals() {
+        for (lit_b, sign_b) in b.literals() {
             if lit_a == lit_b {
                 if sign_a != sign_b {
                     return Disjointness::Disjoint;
@@ -2250,10 +2333,10 @@ fn simplify_disjuncts<N: Copy + Eq>(mut disjuncts: Vec<CellCondition<N>>) -> Vec
                 else {
                     continue;
                 };
-                if merged.0.is_empty() {
+                if merged.is_empty() {
                     // The merged disjunct holds in every environment, which
                     // makes every other disjunct redundant.
-                    return vec![CellCondition(Vec::new())];
+                    return vec![CellCondition::from_literals_unchecked(Vec::new())];
                 }
                 disjuncts[first] = merged;
                 disjuncts.remove(second);
@@ -2277,12 +2360,12 @@ fn merge_disjunct_pair<N: Copy + Eq>(
     a: &CellCondition<N>,
     b: &CellCondition<N>,
 ) -> Option<CellCondition<N>> {
-    if a.0.len() != b.0.len() {
+    if a.len() != b.len() {
         return None;
     }
     let mut differing = None;
-    for (index, (literal, sign)) in a.0.iter().enumerate() {
-        let (_, b_sign) = b.0.iter().find(|(b_literal, _)| b_literal == literal)?;
+    for (index, (literal, sign)) in a.literals().enumerate() {
+        let (_, b_sign) = b.literals().find(|(b_literal, _)| b_literal == literal)?;
         if sign != b_sign {
             if differing.is_some() {
                 return None;
@@ -2293,16 +2376,15 @@ fn merge_disjunct_pair<N: Copy + Eq>(
     // Equal lengths and every literal of `a` found in `b`: with no duplicate
     // literals this is a bijection, so the literal sets are identical.
     let merged = match differing {
-        None => a.0.clone(),
-        Some(drop_index) => {
-            a.0.iter()
-                .enumerate()
-                .filter(|&(index, _)| index != drop_index)
-                .map(|(_, literal)| literal.clone())
-                .collect()
-        }
+        None => a.literals().cloned().collect(),
+        Some(drop_index) => a
+            .literals()
+            .enumerate()
+            .filter(|&(index, _)| index != drop_index)
+            .map(|(_, literal)| literal.clone())
+            .collect(),
     };
-    Some(CellCondition(merged))
+    Some(CellCondition::from_literals_unchecked(merged))
 }
 
 /// A signed literal over a dense witness-search variable index: `(index,
@@ -2520,8 +2602,9 @@ mod test {
     fn cells_to_string(solver: &Solver<EnvTestProvider>, solution: &UniversalSolution) -> String {
         use std::fmt::Write;
         let mut out = String::new();
-        for (condition, solvables) in &solution.cells {
-            let solvables = solvables
+        for cell in solution.cells() {
+            let solvables = cell
+                .solvables()
                 .iter()
                 .map(|&s| solver.provider().display_solvable(s).to_string())
                 .collect::<Vec<_>>()
@@ -2529,7 +2612,7 @@ mod test {
             writeln!(
                 out,
                 "{} -> [{}]",
-                condition.display(solver.provider()),
+                cell.condition().display(solver.provider()),
                 solvables
             )
             .unwrap();
@@ -2666,21 +2749,27 @@ mod test {
             kind: EnvLiteralKind::Absent,
         };
 
-        let solution: UniversalSolution = UniversalSolution {
-            cells: vec![(CellCondition(vec![(absent_lit.clone(), true)]), vec![a])],
-            environment_model: vec![vec![
+        let solution: UniversalSolution = UniversalSolution::from_cells(
+            vec![Cell::new(
+                CellCondition::new(vec![(absent_lit.clone(), true)]).unwrap(),
+                vec![a],
+                vec![],
+            )],
+            vec![vec![
                 (matches_lit.clone(), true),
                 (absent_lit.clone(), true),
             ]],
-            cell_edges: vec![vec![]],
-        };
+        )
+        .unwrap();
 
         assert_eq!(
             solution.verify(&provider),
-            Err(vec![Violation::UncoveredRegion(CellCondition(vec![
-                (matches_lit, true),
-                (absent_lit, false),
-            ]))])
+            Err(vec![Violation::UncoveredRegion(
+                CellCondition::from_literals_unchecked(vec![
+                    (matches_lit, true),
+                    (absent_lit, false),
+                ])
+            )])
         );
     }
 
@@ -2697,23 +2786,25 @@ mod test {
         let a1 = provider.add_package("a", 1);
         let a2 = provider.add_package("a", 2);
 
-        let solution: UniversalSolution = UniversalSolution {
-            cells: vec![
-                (CellCondition(vec![]), vec![a1]),
-                (
-                    CellCondition(vec![(
+        let solution: UniversalSolution = UniversalSolution::from_cells(
+            vec![
+                Cell::new(CellCondition::default(), vec![a1], vec![]),
+                Cell::new(
+                    CellCondition::new(vec![(
                         EnvLiteral {
                             package: cuda_name,
                             kind: EnvLiteralKind::Matches(cuda_11),
                         },
                         true,
-                    )]),
+                    )])
+                    .unwrap(),
                     vec![a2],
+                    vec![],
                 ),
             ],
-            environment_model: vec![],
-            cell_edges: vec![vec![], vec![]],
-        };
+            vec![],
+        )
+        .unwrap();
 
         assert_eq!(
             solution.verify(&provider),
@@ -2746,14 +2837,22 @@ mod test {
             kind: EnvLiteralKind::Matches(cuda_3_8),
         };
 
-        let solution: UniversalSolution = UniversalSolution {
-            cells: vec![
-                (CellCondition(vec![(lit_0_5.clone(), true)]), vec![a1]),
-                (CellCondition(vec![(lit_3_8.clone(), true)]), vec![a2]),
+        let solution: UniversalSolution = UniversalSolution::from_cells(
+            vec![
+                Cell::new(
+                    CellCondition::new(vec![(lit_0_5.clone(), true)]).unwrap(),
+                    vec![a1],
+                    vec![],
+                ),
+                Cell::new(
+                    CellCondition::new(vec![(lit_3_8.clone(), true)]).unwrap(),
+                    vec![a2],
+                    vec![],
+                ),
             ],
-            environment_model: vec![vec![(lit_0_5, true), (lit_3_8, true)]],
-            cell_edges: vec![vec![], vec![]],
-        };
+            vec![vec![(lit_0_5, true), (lit_3_8, true)]],
+        )
+        .unwrap();
 
         assert_eq!(
             solution.verify(&provider),
@@ -2774,23 +2873,25 @@ mod test {
         let cuda_name = provider.pool.intern_package_name("cuda");
         let a = provider.add_package("a", 1);
 
-        let solution: UniversalSolution = UniversalSolution {
-            cells: vec![
-                (CellCondition(vec![]), vec![a]),
-                (
-                    CellCondition(vec![(
+        let solution: UniversalSolution = UniversalSolution::from_cells(
+            vec![
+                Cell::new(CellCondition::default(), vec![a], vec![]),
+                Cell::new(
+                    CellCondition::new(vec![(
                         EnvLiteral {
                             package: cuda_name,
                             kind: EnvLiteralKind::Matches(cuda_11),
                         },
                         true,
-                    )]),
+                    )])
+                    .unwrap(),
                     vec![a],
+                    vec![],
                 ),
             ],
-            environment_model: vec![],
-            cell_edges: vec![vec![], vec![]],
-        };
+            vec![],
+        )
+        .unwrap();
 
         assert_eq!(solution.verify(&provider), Ok(()));
     }
@@ -2817,14 +2918,22 @@ mod test {
             kind: EnvLiteralKind::Matches(cuda_5_9),
         };
 
-        let solution: UniversalSolution = UniversalSolution {
-            cells: vec![
-                (CellCondition(vec![(lit_0_2.clone(), true)]), vec![a1]),
-                (CellCondition(vec![(lit_5_9.clone(), true)]), vec![a2]),
+        let solution: UniversalSolution = UniversalSolution::from_cells(
+            vec![
+                Cell::new(
+                    CellCondition::new(vec![(lit_0_2.clone(), true)]).unwrap(),
+                    vec![a1],
+                    vec![],
+                ),
+                Cell::new(
+                    CellCondition::new(vec![(lit_5_9.clone(), true)]).unwrap(),
+                    vec![a2],
+                    vec![],
+                ),
             ],
-            environment_model: vec![vec![(lit_0_2, true), (lit_5_9, true)]],
-            cell_edges: vec![vec![], vec![]],
-        };
+            vec![vec![(lit_0_2, true), (lit_5_9, true)]],
+        )
+        .unwrap();
 
         assert_eq!(solution.verify(&provider), Ok(()));
     }
@@ -2885,14 +2994,14 @@ mod test {
         let a1 = provider.add_package("a", 1);
         let a2 = provider.add_package("a", 2);
 
-        let solution: UniversalSolution = UniversalSolution {
-            cells: vec![
-                (CellCondition(vec![]), vec![a1]),
-                (CellCondition(vec![]), vec![a2]),
+        let solution: UniversalSolution = UniversalSolution::from_cells(
+            vec![
+                Cell::new(CellCondition::default(), vec![a1], vec![]),
+                Cell::new(CellCondition::default(), vec![a2], vec![]),
             ],
-            environment_model: vec![],
-            cell_edges: vec![vec![], vec![]],
-        };
+            vec![],
+        )
+        .unwrap();
 
         let _ = solution.project(|_| false);
     }
@@ -2909,7 +3018,7 @@ mod test {
     /// Helper for the simplification unit tests: a conjunction of signed
     /// literals given as `(version set index, sign)` pairs.
     fn conj(literals: &[(usize, bool)]) -> CellCondition<NameId> {
-        CellCondition(
+        CellCondition::from_literals_unchecked(
             literals
                 .iter()
                 .map(|&(vs, sign)| (env_lit(vs), sign))

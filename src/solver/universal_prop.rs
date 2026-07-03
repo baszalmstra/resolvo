@@ -609,8 +609,7 @@ fn cell_condition_holds(
     env: &EnvSample,
 ) -> bool {
     condition
-        .0
-        .iter()
+        .literals()
         .all(|(literal, sign)| eval_env_literal(provider, env_name_ids, literal, env) == *sign)
 }
 
@@ -712,7 +711,7 @@ fn run_seed(seed: u64, stats: &mut Stats) {
     match solver.solve_universal(problem) {
         Ok(solution) => {
             stats.solved += 1;
-            stats.cells_total += solution.cells.len();
+            stats.cells_total += solution.cells().len();
             let provider = solver.provider();
 
             // (a) The independent verifier accepts the solution. The test
@@ -741,11 +740,11 @@ fn run_seed(seed: u64, stats: &mut Stats) {
 
                 // Exactly one cell must match, counted manually.
                 let matching = solution
-                    .cells
+                    .cells()
                     .iter()
                     .enumerate()
-                    .filter(|(_, (condition, _))| {
-                        cell_condition_holds(provider, &env_name_ids, condition, &env)
+                    .filter(|(_, cell)| {
+                        cell_condition_holds(provider, &env_name_ids, cell.condition(), &env)
                     })
                     .map(|(index, _)| index)
                     .collect::<Vec<_>>();
@@ -764,7 +763,7 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                     });
                 assert_eq!(
                     projected,
-                    &solution.cells[matching[0]].1[..],
+                    solution.cells()[matching[0]].solvables(),
                     "seed {seed}: project() returned a different cell than the manual match"
                 );
 
@@ -795,7 +794,7 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                 // projected cell. (Presence simplification is an exact
                 // equivalence within the model.)
                 for (solvable, presence) in &merged {
-                    let holds = presence.0.iter().any(|disjunct| {
+                    let holds = presence.disjuncts().any(|disjunct| {
                         cell_condition_holds(provider, &env_name_ids, disjunct, &env)
                     });
                     assert_eq!(
@@ -810,7 +809,7 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                 // Cross-check edges(): an active edge's parent and target
                 // must be installed in the projected cell.
                 for (edge, presence) in &edges {
-                    let holds = presence.0.iter().any(|disjunct| {
+                    let holds = presence.disjuncts().any(|disjunct| {
                         cell_condition_holds(provider, &env_name_ids, disjunct, &env)
                     });
                     if !holds {
@@ -857,9 +856,9 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             //     reseeded partition was just produced under exactly its own
             //     condition as assumptions, so replaying it changes nothing.
             let seeds: Vec<CellCondition<NameId>> = solution
-                .cells
+                .cells()
                 .iter()
-                .map(|(condition, _)| condition.clone())
+                .map(|cell| cell.condition().clone())
                 .collect();
             let reseeded = match solver.solve_universal(
                 UniversalProblem::new()
@@ -911,18 +910,18 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                      for environment {env:?}"
                 );
             }
-            if format!("{:?}", (&solution.cells, &solution.cell_edges))
-                == format!("{:?}", (&reseeded.cells, &reseeded.cell_edges))
-            {
+            // A cell bundles its condition, solvables and edges, so comparing
+            // the cell slices covers both the conditions and the edges.
+            if format!("{:?}", solution.cells()) == format!("{:?}", reseeded.cells()) {
                 stats.reseeded_identical += 1;
             }
 
             // The fixed-point round: reseeding the RESEEDED partition must
             // reproduce it byte-identically, cells and edges.
             let reseeded_seeds: Vec<CellCondition<NameId>> = reseeded
-                .cells
+                .cells()
                 .iter()
-                .map(|(condition, _)| condition.clone())
+                .map(|cell| cell.condition().clone())
                 .collect();
             let fixed_point = match solver.solve_universal(
                 UniversalProblem::new()
@@ -936,15 +935,12 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                      succeeded: {failure:?}"
                 ),
             };
+            // Cells bundle conditions and edges, so one comparison of the cell
+            // slices covers both.
             assert_eq!(
-                format!("{:?}", reseeded.cells),
-                format!("{:?}", fixed_point.cells),
+                format!("{:?}", reseeded.cells()),
+                format!("{:?}", fixed_point.cells()),
                 "seed {seed}: reseeding the reseeded partition produced different cells"
-            );
-            assert_eq!(
-                format!("{:?}", reseeded.cell_edges),
-                format!("{:?}", fixed_point.cell_edges),
-                "seed {seed}: reseeding the reseeded partition produced different edges"
             );
             stats.fixed_point_identical += 1;
 

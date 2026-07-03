@@ -14,11 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   optionally a seed partition from a previous solve) into a
   `UniversalSolution` that partitions the environment space into pairwise
   disjoint cells, each with the solvables valid throughout that cell. The
-  solution exposes `cells` (the raw partition), `merged` (per-solvable
-  presence conditions), `edges` (the conditional dependency graph for
-  lockfile serialization), `project` (selecting the cell of one concrete
-  environment) and `verify` (re-checking disjointness and model coverage,
-  e.g. for solutions reconstructed from a lockfile). Failures are reported
+  solution exposes `cells()` (the partition as a read-only slice of `Cell`,
+  each bundling its `condition()`, `solvables()` and `edges()`), `merged`
+  (per-solvable presence conditions), `edges` (the conditional dependency
+  graph for lockfile serialization), `project` (selecting the cell of one
+  concrete environment) and `verify` (re-checking disjointness and model
+  coverage, e.g. for solutions reconstructed from a lockfile). A solution can
+  be rebuilt from serialized parts with `UniversalSolution::from_cells` and
+  `Cell::new`. `CellCondition` and `Presence` encapsulate their literals
+  behind iterator accessors (`literals()`, `disjuncts()`); construct them from
+  raw literals with the normalizing `CellCondition::new` (which deduplicates
+  and rejects a literal given with both signs, returning `ContradictoryLiteral`)
+  and `Presence::new`. Failures are reported
   as `UniversalFailure::Unsolvable` carrying the unsolvable region and a
   conflict scoped to that region via a targeted re-solve. Structurally
   invalid caller inputs are rejected up front, before any solving, as

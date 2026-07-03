@@ -55,8 +55,8 @@ pub use requirement::Requirement;
 #[cfg(feature = "diagnostics")]
 pub use solver::CellPinCounts;
 pub use solver::{
-    CellEdge, EmptySolvables, EnvInputSource, EnvironmentModel, InvalidUniversalInput, Problem,
-    Solver, SolverCache, UniversalFailure, UniversalProblem, UniversalSolution,
+    Cell, CellEdge, EmptySolvables, EnvInputSource, EnvironmentModel, InvalidUniversalInput,
+    Problem, Solver, SolverCache, UniversalFailure, UniversalProblem, UniversalSolution,
     UnsolvableOrCancelled, Violation,
 };
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
@@ -134,9 +134,19 @@ pub enum EnvLiteralKind {
 
 /// A conjunction of signed environment literals.
 ///
-/// An empty conjunction means "all environments".
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CellCondition<N>(pub Vec<(EnvLiteral<N>, bool)>);
+/// An empty conjunction means "all environments". Every environment literal
+/// appears at most once: the [normalizing constructor](CellCondition::new)
+/// deduplicates repeated literals and rejects a literal supplied with both
+/// signs, so a `CellCondition` can never encode a self-contradiction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellCondition<N>(Vec<(EnvLiteral<N>, bool)>);
+
+impl<N> Default for CellCondition<N> {
+    /// The empty conjunction, which holds in every environment.
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
 
 impl<N> CellCondition<N> {
     /// Returns an object that formats the cell condition in a human readable
@@ -150,6 +160,56 @@ impl<N> CellCondition<N> {
             condition: self,
             interner,
         }
+    }
+
+    /// Returns an iterator over the signed environment literals of the
+    /// conjunction, in order. Each `(literal, positive)` pair must hold with
+    /// the given sign for the condition to be satisfied.
+    pub fn literals(&self) -> impl ExactSizeIterator<Item = &(EnvLiteral<N>, bool)> + '_ {
+        self.0.iter()
+    }
+
+    /// The number of literals in the conjunction.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the conjunction is empty, i.e. holds in every environment.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Wraps literals already known to be normalized (each environment literal
+    /// at most once, no sign contradiction). The enumerator produces such
+    /// literals directly; external callers must use [`CellCondition::new`],
+    /// which enforces the invariant.
+    pub(crate) fn from_literals_unchecked(literals: Vec<(EnvLiteral<N>, bool)>) -> Self {
+        Self(literals)
+    }
+}
+
+impl<N: PartialEq> CellCondition<N> {
+    /// Creates a condition from a list of signed environment literals,
+    /// normalizing it: exact duplicate `(literal, sign)` pairs are dropped and
+    /// a literal that occurs with both signs is rejected as
+    /// [`ContradictoryLiteral`], because no environment can satisfy it.
+    ///
+    /// This is the entry point for reconstructing conditions from serialized
+    /// data (e.g. a lockfile). The returned condition upholds the invariant
+    /// that every environment literal appears at most once.
+    pub fn new(literals: Vec<(EnvLiteral<N>, bool)>) -> Result<Self, ContradictoryLiteral<N>> {
+        let mut normalized: Vec<(EnvLiteral<N>, bool)> = Vec::with_capacity(literals.len());
+        for (literal, sign) in literals {
+            if let Some((_, existing)) = normalized.iter().find(|(known, _)| *known == literal) {
+                if *existing != sign {
+                    return Err(ContradictoryLiteral { literal });
+                }
+                // Exact duplicate: keep the single existing entry.
+            } else {
+                normalized.push((literal, sign));
+            }
+        }
+        Ok(Self(normalized))
     }
 }
 
@@ -191,6 +251,29 @@ impl<I: Interner> Display for CellConditionDisplay<'_, I> {
     }
 }
 
+/// The error returned by [`CellCondition::new`] when the same environment
+/// literal is supplied with both signs. Such a conjunction is unsatisfiable —
+/// no environment can make a literal simultaneously true and false — so it is
+/// rejected rather than silently normalized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContradictoryLiteral<N> {
+    /// The literal that appeared with two different signs.
+    pub literal: EnvLiteral<N>,
+}
+
+impl<N: Debug> Display for ContradictoryLiteral<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the environment literal {:?} appears with both signs, which no \
+             environment can satisfy",
+            self.literal,
+        )
+    }
+}
+
+impl<N: Debug> std::error::Error for ContradictoryLiteral<N> {}
+
 /// A presence condition: a disjunction (logical OR) of [`CellCondition`]
 /// conjunctions, i.e. a formula in disjunctive normal form over signed
 /// environment literals.
@@ -204,7 +287,7 @@ impl<I: Interner> Display for CellConditionDisplay<'_, I> {
 /// which OR together the conditions of the cells a solvable (or edge) appears
 /// in, simplified within the bounds of the environment model.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Presence<N>(pub Vec<CellCondition<N>>);
+pub struct Presence<N>(Vec<CellCondition<N>>);
 
 impl<N> Presence<N> {
     /// Returns an object that formats the presence condition in a human
@@ -220,6 +303,42 @@ impl<N> Presence<N> {
             presence: self,
             interner,
         }
+    }
+
+    /// Returns an iterator over the disjuncts (the OR-ed [`CellCondition`]s).
+    /// The presence holds in an environment when at least one disjunct does.
+    pub fn disjuncts(&self) -> impl ExactSizeIterator<Item = &CellCondition<N>> + '_ {
+        self.0.iter()
+    }
+
+    /// The number of disjuncts.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the presence has no disjuncts, i.e. holds in no environment.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Wraps disjuncts already known to be normalized. Used by the solver,
+    /// which produces simplified disjuncts directly.
+    pub(crate) fn from_disjuncts_unchecked(disjuncts: Vec<CellCondition<N>>) -> Self {
+        Self(disjuncts)
+    }
+}
+
+impl<N: PartialEq> Presence<N> {
+    /// Creates a presence from a list of disjuncts, dropping exact duplicate
+    /// disjuncts. Intended for reconstructing a presence from serialized data.
+    pub fn new(disjuncts: Vec<CellCondition<N>>) -> Self {
+        let mut normalized: Vec<CellCondition<N>> = Vec::with_capacity(disjuncts.len());
+        for disjunct in disjuncts {
+            if !normalized.contains(&disjunct) {
+                normalized.push(disjunct);
+            }
+        }
+        Self(normalized)
     }
 }
 

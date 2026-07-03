@@ -54,7 +54,7 @@ pub(crate) mod variable_map;
 mod watch_map;
 
 pub use universal::{
-    CellEdge, EnvInputSource, EnvironmentModel, InvalidUniversalInput, UniversalFailure,
+    Cell, CellEdge, EnvInputSource, EnvironmentModel, InvalidUniversalInput, UniversalFailure,
     UniversalProblem, UniversalSolution, Violation,
 };
 

@@ -223,12 +223,12 @@ fn merge_disjunct_pair(
     a: &CellCondition<NameId>,
     b: &CellCondition<NameId>,
 ) -> Option<CellCondition<NameId>> {
-    if a.0.len() != b.0.len() {
+    if a.len() != b.len() {
         return None;
     }
     let mut differing = None;
-    for (index, (literal, sign)) in a.0.iter().enumerate() {
-        let (_, b_sign) = b.0.iter().find(|(b_literal, _)| b_literal == literal)?;
+    for (index, (literal, sign)) in a.literals().enumerate() {
+        let (_, b_sign) = b.literals().find(|(b_literal, _)| b_literal == literal)?;
         if sign != b_sign {
             if differing.is_some() {
                 return None;
@@ -236,17 +236,18 @@ fn merge_disjunct_pair(
             differing = Some(index);
         }
     }
-    let merged = match differing {
-        None => a.0.clone(),
-        Some(drop_index) => {
-            a.0.iter()
-                .enumerate()
-                .filter(|&(index, _)| index != drop_index)
-                .map(|(_, literal)| literal.clone())
-                .collect()
-        }
+    let merged: Vec<_> = match differing {
+        None => a.literals().cloned().collect(),
+        Some(drop_index) => a
+            .literals()
+            .enumerate()
+            .filter(|&(index, _)| index != drop_index)
+            .map(|(_, literal)| literal.clone())
+            .collect(),
     };
-    Some(CellCondition(merged))
+    // The merged conjunction is a subset of `a`'s literals, which are already
+    // non-contradictory, so normalization cannot fail here.
+    Some(CellCondition::new(merged).expect("merged disjunct is contradiction-free"))
 }
 
 /// Simplifies a disjunction of conjunctions to a fixpoint (mirror
@@ -259,8 +260,8 @@ fn simplify_disjuncts(mut disjuncts: Vec<CellCondition<NameId>>) -> Vec<CellCond
                 else {
                     continue;
                 };
-                if merged.0.is_empty() {
-                    return vec![CellCondition(Vec::new())];
+                if merged.is_empty() {
+                    return vec![CellCondition::default()];
                 }
                 disjuncts[first] = merged;
                 disjuncts.remove(second);
@@ -291,10 +292,13 @@ fn dump_cell_stats(
     // Group cells by solvable set. The solvable lists are canonical (sorted
     // by solver variable id), so identical sets compare equal as vectors.
     let mut groups: Vec<(Vec<SolvableId>, Vec<usize>)> = Vec::new();
-    for (idx, (_, solvables)) in solution.cells.iter().enumerate() {
-        match groups.iter_mut().find(|(set, _)| set == solvables) {
+    for (idx, cell) in solution.cells().iter().enumerate() {
+        match groups
+            .iter_mut()
+            .find(|(set, _)| set.as_slice() == cell.solvables())
+        {
             Some((_, cells)) => cells.push(idx),
-            None => groups.push((solvables.clone(), vec![idx])),
+            None => groups.push((cell.solvables().to_vec(), vec![idx])),
         }
     }
 
@@ -305,7 +309,7 @@ fn dump_cell_stats(
     for (_, cells) in &groups {
         let disjuncts: Vec<CellCondition<NameId>> = cells
             .iter()
-            .map(|&idx| solution.cells[idx].0.clone())
+            .map(|&idx| solution.cells()[idx].condition().clone())
             .collect();
         let simplified = simplify_disjuncts(disjuncts).len();
         group_simplified.push(simplified);
@@ -316,7 +320,7 @@ fn dump_cell_stats(
     writeln!(
         out,
         "cells: {}  distinct solvable sets: {}  simplified partition size: {}",
-        solution.cells.len(),
+        solution.cells().len(),
         groups.len(),
         total_simplified
     )
@@ -326,8 +330,8 @@ fn dump_cell_stats(
     // in cell conditions and how many cells mention them.
     writeln!(out, "\n=== axis fragmentation ===").unwrap();
     let mut axis: Vec<(NameId, Vec<(String, usize, usize)>)> = Vec::new();
-    for (condition, _) in &solution.cells {
-        for (literal, sign) in &condition.0 {
+    for cell in solution.cells() {
+        for (literal, sign) in cell.condition().literals() {
             let display = match &literal.kind {
                 EnvLiteralKind::Absent => "absent".to_string(),
                 EnvLiteralKind::Matches(vs) => {
@@ -412,12 +416,12 @@ fn dump_cell_stats(
             .position(|(_, cells)| cells.contains(&idx))
             .unwrap()
     };
-    for (idx, (condition, _)) in solution.cells.iter().enumerate() {
+    for (idx, cell) in solution.cells().iter().enumerate() {
         writeln!(
             out,
             "cell {idx} (group {}): {}",
             group_of(idx),
-            condition.display(provider)
+            cell.condition().display(provider)
         )
         .unwrap();
     }
@@ -425,7 +429,7 @@ fn dump_cell_stats(
     eprintln!(
         "cells dump: {} cells, {} distinct solvable sets, simplified partition \
          size {} -> {}",
-        solution.cells.len(),
+        solution.cells().len(),
         groups.len(),
         total_simplified,
         path.display()
@@ -676,15 +680,15 @@ fn main() {
                 match result {
                     Ok(solution) => {
                         let distinct: HashSet<_> = solution
-                            .cells
+                            .cells()
                             .iter()
-                            .flat_map(|(_, solvables)| solvables.iter().copied())
+                            .flat_map(|cell| cell.solvables().iter().copied())
                             .collect();
                         let mut literals: Vec<&EnvLiteral<NameId>> = Vec::new();
                         for (literal, _) in solution
-                            .cells
+                            .cells()
                             .iter()
-                            .flat_map(|(condition, _)| condition.0.iter())
+                            .flat_map(|cell| cell.condition().literals())
                         {
                             if !literals.contains(&literal) {
                                 literals.push(literal);
@@ -695,13 +699,13 @@ fn main() {
                             style(format!(
                                 "==> OK in {:.2}ms, {} cells, {} distinct records",
                                 record.duration * 1000.0,
-                                solution.cells.len(),
+                                solution.cells().len(),
                                 distinct.len(),
                             ))
                             .green()
                         );
                         record.records = Some(distinct.len());
-                        record.cells = Some(solution.cells.len());
+                        record.cells = Some(solution.cells().len());
                         record.env_literals = Some(literals.len());
                         if let Some(path) = &opts.cells_dump {
                             dump_cell_stats(path, i, &solution, solver.provider(), &snapshot);

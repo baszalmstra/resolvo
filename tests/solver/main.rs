@@ -2344,9 +2344,10 @@ fn universal_solve_snapshot(
     match solver.solve_universal(problem) {
         Ok(solution) => {
             let mut buf = String::new();
-            for (condition, solvables) in &solution.cells {
-                writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
-                for solvable in solvables
+            for cell in solution.cells() {
+                writeln!(buf, "cell: {}", cell.condition().display(solver.provider())).unwrap();
+                for solvable in cell
+                    .solvables()
                     .iter()
                     .map(|&s| solver.provider().display_solvable(s).to_string())
                     .sorted()
@@ -2398,9 +2399,10 @@ fn universal_solve_snapshot_async(
     match solver.solve_universal(problem) {
         Ok(solution) => {
             let mut buf = String::new();
-            for (condition, solvables) in &solution.cells {
-                writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
-                for solvable in solvables
+            for cell in solution.cells() {
+                writeln!(buf, "cell: {}", cell.condition().display(solver.provider())).unwrap();
+                for solvable in cell
+                    .solvables()
                     .iter()
                     .map(|&s| solver.provider().display_solvable(s).to_string())
                     .sorted()
@@ -3076,9 +3078,10 @@ fn format_universal_result(
     match result {
         Ok(solution) => {
             let mut buf = String::new();
-            for (condition, solvables) in &solution.cells {
-                writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
-                for solvable in solvables
+            for cell in solution.cells() {
+                writeln!(buf, "cell: {}", cell.condition().display(solver.provider())).unwrap();
+                for solvable in cell
+                    .solvables()
                     .iter()
                     .map(|&s| solver.provider().display_solvable(s).to_string())
                     .sorted()
@@ -3131,9 +3134,9 @@ fn universal_resolve_with_own_cells(
         .expect("solvable");
 
     let seeds = first
-        .cells
+        .cells()
         .iter()
-        .map(|(condition, _)| condition.clone())
+        .map(|cell| cell.condition().clone())
         .collect();
     let second = solver
         .solve_universal(
@@ -3200,7 +3203,7 @@ fn test_universal_seed_rejects_concrete_package() {
     let mut provider = BundleBoxProvider::new();
     provider.add_package("b", Pack::new(1), &[], &[]);
 
-    let seed = CellCondition(vec![parse_env_literal(&mut provider, "b 1..2")]);
+    let seed = CellCondition::new(vec![parse_env_literal(&mut provider, "b 1..2")]).unwrap();
     let (_solver, result) = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
     assert!(matches!(
         result,
@@ -3221,7 +3224,7 @@ fn test_universal_seed_rejects_absent_literal_for_present_package() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", false);
 
-    let seed = CellCondition(vec![parse_env_literal(&mut provider, "cuda absent")]);
+    let seed = CellCondition::new(vec![parse_env_literal(&mut provider, "cuda absent")]).unwrap();
     let (_solver, result) = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
     assert!(matches!(
         result,
@@ -3249,7 +3252,7 @@ fn test_universal_seed_rejects_version_set_package_mismatch() {
         package: cuda,
         kind: EnvLiteralKind::Matches(rocm_version_set),
     };
-    let seed = CellCondition(vec![(mismatched, true)]);
+    let seed = CellCondition::new(vec![(mismatched, true)]).unwrap();
     let (_solver, result) = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
     assert!(matches!(
         result,
@@ -3284,10 +3287,11 @@ fn test_universal_seed_conflict_at_level_n_plus_one_drops_seed() {
         parse_env_literal(&mut provider, "cuda absent"),
         parse_env_literal(&mut provider, "cuda 11..100"),
     ]];
-    let seed = CellCondition(vec![
+    let seed = CellCondition::new(vec![
         parse_env_literal(&mut provider, "not cuda absent"),
         parse_env_literal(&mut provider, "not cuda 11..100"),
-    ]);
+    ])
+    .unwrap();
 
     let mut solver = Solver::new(provider);
     let unseeded = solver
@@ -3382,11 +3386,12 @@ fn test_universal_seed_order_changes_generalization() {
     let requirements = provider.requirements(&["pkg"]);
     let model = vec![vec![parse_env_literal(&mut provider, "glibc 217..1000")]];
     let seeds = vec![
-        CellCondition(vec![
+        CellCondition::new(vec![
             parse_env_literal(&mut provider, "glibc 217..1000"),
             parse_env_literal(&mut provider, "not glibc 228..1000"),
-        ]),
-        CellCondition(vec![parse_env_literal(&mut provider, "glibc 228..1000")]),
+        ])
+        .unwrap(),
+        CellCondition::new(vec![parse_env_literal(&mut provider, "glibc 228..1000")]).unwrap(),
     ];
 
     let mut solver = Solver::new(provider);
@@ -3431,11 +3436,12 @@ fn test_universal_invalidated_seed_dropped_region_reenumerated() {
         parse_env_literal(&mut provider, "cuda 12..100"),
     ]];
     let seeds = vec![
-        CellCondition(vec![parse_env_literal(&mut provider, "cuda absent")]),
-        CellCondition(vec![
+        CellCondition::new(vec![parse_env_literal(&mut provider, "cuda absent")]).unwrap(),
+        CellCondition::new(vec![
             parse_env_literal(&mut provider, "cuda 11..100"),
             parse_env_literal(&mut provider, "not cuda 12..100"),
-        ]),
+        ])
+        .unwrap(),
     ];
 
     let mut solver = Solver::new(provider);
@@ -3468,10 +3474,11 @@ fn test_universal_invalidated_seed_dropped_region_reenumerated() {
 fn test_universal_dropped_seed_then_free_enumeration_matches_unseeded() {
     let mut provider = cross_product_provider();
     let requirements = provider.requirements(&["a"]);
-    let bogus_seed = CellCondition(vec![
+    let bogus_seed = CellCondition::new(vec![
         parse_env_literal(&mut provider, "cuda 11..100"),
         parse_env_literal(&mut provider, "cuda absent"),
-    ]);
+    ])
+    .unwrap();
 
     let mut solver = Solver::new(provider);
     let unseeded = solver
@@ -3503,10 +3510,11 @@ fn test_universal_stale_seed_heals_to_general_cell() {
 
     let requirements = provider.requirements(&["a"]);
     let model = vec![vec![parse_env_literal(&mut provider, "cuda 12..100")]];
-    let seed = CellCondition(vec![
+    let seed = CellCondition::new(vec![
         parse_env_literal(&mut provider, "cuda 12..100"),
         parse_env_literal(&mut provider, "rocm 5..10"),
-    ]);
+    ])
+    .unwrap();
 
     let mut solver = Solver::new(provider);
     let solution = solver
@@ -3524,34 +3532,21 @@ fn test_universal_stale_seed_heals_to_general_cell() {
     ");
 }
 
-/// A seed that contradicts itself on the same literal (`cuda 11..100` both
-/// positive and negative) describes no environment at all: it is dropped at
-/// assumption setup (the second decision on the same variable fails) and the
-/// solve continues as if the seed was not given.
+/// A condition that contradicts itself on the same literal (`cuda 11..100`
+/// both positive and negative) describes no environment at all, so it is now
+/// unrepresentable: [`CellCondition::new`] rejects it with
+/// [`resolvo::ContradictoryLiteral`] before it can ever reach the solver as a
+/// seed. (Previously such a seed was constructed and then dropped at
+/// assumption setup.)
 #[test]
-fn test_universal_self_contradictory_seed_dropped() {
+fn test_universal_self_contradictory_condition_rejected() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", true);
-    provider.add_package("a", Pack::new(1), &["b 1..2; if cuda 11..100"], &[]);
-    provider.add_package("b", Pack::new(1), &[], &[]);
 
-    let seed = CellCondition(vec![
-        parse_env_literal(&mut provider, "cuda 11..100"),
-        parse_env_literal(&mut provider, "not cuda 11..100"),
-    ]);
-    let (solver, result) = universal_solve_with_seeds(
-        provider,
-        &["a"],
-        &[&["cuda absent", "cuda 11..100"]],
-        vec![seed],
-    );
-    assert_snapshot!(format_universal_result(&solver, &result), @r"
-    cell: not (cuda in >=11, <100)
-      a=1
-    cell: cuda in >=11, <100
-      a=1
-      b=1
-    ");
+    let positive = parse_env_literal(&mut provider, "cuda 11..100");
+    let negative = parse_env_literal(&mut provider, "not cuda 11..100");
+    let err = CellCondition::new(vec![positive.clone(), negative]).unwrap_err();
+    assert_eq!(err.literal, positive.0);
 }
 
 /// Multiple constraints from different parents on the same package.
@@ -3979,9 +3974,10 @@ fn test_snapshot_universal_mode_enumerates_cells() {
     let solution = solver.solve_universal(problem).unwrap();
 
     let mut buf = String::new();
-    for (condition, solvables) in &solution.cells {
-        writeln!(buf, "cell: {}", condition.display(solver.provider())).unwrap();
-        for solvable in solvables
+    for cell in solution.cells() {
+        writeln!(buf, "cell: {}", cell.condition().display(solver.provider())).unwrap();
+        for solvable in cell
+            .solvables()
             .iter()
             .map(|&s| solver.provider().display_solvable(s).to_string())
             .sorted()
@@ -4073,7 +4069,7 @@ fn test_universal_trail_reuse_second_cell_decides_less() {
     let cell_decisions = solver.universal_cell_decisions();
     assert_eq!(
         cell_decisions.len(),
-        solution.cells.len(),
+        solution.cells().len(),
         "one counter entry per recorded cell"
     );
     assert_eq!(
@@ -4092,16 +4088,16 @@ fn test_universal_trail_reuse_second_cell_decides_less() {
     let pins = solver.universal_cell_pins();
     assert_eq!(
         pins.len(),
-        solution.cells.len(),
+        solution.cells().len(),
         "one pin-count entry per recorded cell"
     );
-    for (pin, (condition, _)) in pins.iter().zip(&solution.cells) {
+    for (pin, cell) in pins.iter().zip(solution.cells()) {
         assert_eq!(
             pin.total() as usize,
-            condition.0.len(),
+            cell.condition().len(),
             "every literal of the cell condition is attributed to exactly one \
              pinning rule (got {pin:?} for a condition of {} literals)",
-            condition.0.len()
+            cell.condition().len()
         );
     }
 }
@@ -4164,7 +4160,7 @@ fn test_universal_env_literals_decided_last() {
         .expect("solvable");
     solution.verify(solver.provider()).unwrap();
     assert_eq!(
-        solution.cells.len(),
+        solution.cells().len(),
         4,
         "one cell per osver x arch region of the model"
     );
