@@ -728,17 +728,18 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             // implication per requirer. Root requirements stay direct so the
             // decision heuristic can still recognise them as explicit.
             //
-            // Skipped in universal mode: cell enumeration scans
-            // `requires_clauses` in registration order and reads each
-            // requirer's candidate disjunction directly, so routing requirers
-            // through a shared gate would break the reseed fixed-point (see
-            // [`SolverState::universal_mode`], and the same reasoning for the
-            // lazy-conditional path). Requirements over environment literals
-            // stay direct for the same reason.
+            // Requirements over environment literals stay direct: their
+            // clauses feed `env_support_clauses` and `env_sensitive_parents`
+            // (universal cell extraction and the env-literals-last ordering),
+            // which key on the requirer's own clause. Unlike the
+            // lazy-conditional path (see [`SolverState::universal_mode`]) the
+            // gate encoding is fully synchronous, so it keeps registration
+            // order deterministic and is safe in universal mode; the
+            // requirer -> requirement bookkeeping that cell-edge capture
+            // needs is recorded in [`Encoder::add_shared_requires`].
             if condition.is_none()
                 && !no_candidates
                 && !variable.is_root()
-                && !self.state.universal_mode
                 && !has_env
                 && candidate_count >= REQUIRES_AUX_ENCODING_THRESHOLD
             {
@@ -843,14 +844,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         requirement: Requirement,
         version_set_variables: &[Vec<VariableId>],
     ) {
-        let gate = match self.state.requires_aux_vars.get(&requirement) {
-            Some(&gate) => gate,
+        let (gate, shared_clause_id) = match self.state.requires_aux_vars.get(&requirement) {
+            Some(&entry) => entry,
             None => {
                 let gate = self
                     .state
                     .variable_map
                     .alloc_requires_gate_variable(requirement);
-                self.state.requires_aux_vars.insert(requirement, gate);
 
                 // The shared disjunction, encoded as a normal requires clause
                 // whose parent is the gate.
@@ -862,6 +862,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     &self.state.decision_tracker,
                 );
                 let clause_id = self.state.add_clause(watched_literals, kind);
+                self.state
+                    .requires_aux_vars
+                    .insert(requirement, (gate, clause_id));
 
                 let names = requirement
                     .version_sets(self.cache.provider())
@@ -879,9 +882,21 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         .expect("a freshly allocated gate variable cannot already be assigned");
                 }
 
-                gate
+                (gate, clause_id)
             }
         };
+
+        // Record the requirer -> requirement mapping for universal cell
+        // extraction: `capture_cell_edges` walks `requires_clauses` per
+        // installed parent to reconstruct active dependency edges, and must
+        // see gated requirements too. The recorded clause is the shared
+        // disjunction (the requirer's own clause is only the binary
+        // implication to the gate).
+        self.state
+            .requires_clauses
+            .entry(parent)
+            .or_default()
+            .push((requirement, None, shared_clause_id));
 
         // The implication `parent -> gate`, encoded as the binary clause
         // `(gate ∨ ¬parent)` (the `AnyOf` shape).

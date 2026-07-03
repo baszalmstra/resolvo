@@ -489,12 +489,14 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// in `on_candidates_available`.
     pub(crate) env_packages: <D::NameId as SolverId>::Map<Option<EnvironmentPackage>>,
 
-    /// The gate variable of the shared requires encoding per requirement. The
-    /// single candidate disjunction (`Clause::Requires` on the gate) is emitted
-    /// exactly once, when the variable is allocated; each requirer then only
-    /// adds a binary implication to the gate. See
+    /// The gate variable and shared disjunction clause of the shared requires
+    /// encoding per requirement. The single candidate disjunction
+    /// (`Clause::Requires` on the gate) is emitted exactly once, when the
+    /// variable is allocated; each requirer then only adds a binary
+    /// implication to the gate (and records the shared clause in
+    /// `requires_clauses` for universal cell-edge capture). See
     /// [`variable_map::VariableOrigin::RequiresGate`].
-    requires_aux_vars: HashMap<Requirement, VariableId>,
+    requires_aux_vars: HashMap<Requirement, (VariableId, ClauseId)>,
 
     /// For each shared-requires gate, the requirers that imply it
     /// (`(¬requirer ∨ gate)`) and the implication clause. The encoder forces the

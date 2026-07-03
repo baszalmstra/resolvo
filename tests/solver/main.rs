@@ -2774,6 +2774,43 @@ fn test_universal_merged_and_edges_cross_product() {
     ");
 }
 
+/// The shared-requires gate encoding is active in universal mode: `dep` has
+/// five candidates, so the unconditional requirements of `a` and `b` on it
+/// are encoded through a shared gate variable. The captured cell edges must
+/// still show one direct `parent -> dep` edge per requirer in every cell
+/// (the gate is invisible in the output), and the cuda-guarded dependency
+/// still splits the cells.
+#[test]
+fn test_universal_shared_requires_gate_edges() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    for version in 1..=5 {
+        provider.add_package("dep", Pack::new(version), &[], &[]);
+    }
+    provider.add_package(
+        "a",
+        Pack::new(1),
+        &["dep 1..6", "c 1..2; if cuda 11..100"],
+        &[],
+    );
+    provider.add_package("b", Pack::new(1), &["dep 1..6"], &[]);
+    provider.add_package("c", Pack::new(1), &[], &[]);
+    let result = universal_merged_and_edges_snapshot(provider, &["a", "b"], &[]);
+    assert_snapshot!(result, @r"
+    merged:
+      a=1 -> <all environments>
+      b=1 -> <all environments>
+      dep=5 -> <all environments>
+      c=1 -> cuda in >=11, <100
+    edges:
+      <root> -> a * -> a=1 [<all environments>]
+      <root> -> b * -> b=1 [<all environments>]
+      b=1 -> dep >=1, <6 -> dep=5 [<all environments>]
+      a=1 -> dep >=1, <6 -> dep=5 [<all environments>]
+      a=1 -> c >=1, <2 -> c=1 [cuda in >=11, <100]
+    ");
+}
+
 /// merged() with a presence that does not simplify to a single conjunction:
 /// in the OR-condition scenario `b` is installed in the `cuda` cell and in
 /// the `not cuda AND rocm` cell. The two disjuncts have different lengths,
