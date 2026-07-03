@@ -488,6 +488,23 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// for packages declared via `PackageCandidates::Environment`. Populated
     /// in `on_candidates_available`.
     pub(crate) env_packages: <D::NameId as SolverId>::Map<Option<EnvironmentPackage>>,
+
+    /// The gate variable of the shared requires encoding per requirement. The
+    /// single candidate disjunction (`Clause::Requires` on the gate) is emitted
+    /// exactly once, when the variable is allocated; each requirer then only
+    /// adds a binary implication to the gate. See
+    /// [`variable_map::VariableOrigin::RequiresGate`].
+    requires_aux_vars: HashMap<Requirement, VariableId>,
+
+    /// For each shared-requires gate, the requirers that imply it
+    /// (`(¬requirer ∨ gate)`) and the implication clause. The encoder forces the
+    /// gate true at its own (lazy, often higher) level, so a backtrack can
+    /// strand it (the implication is unit but watched literals never re-fire on
+    /// an unassignment); [`SolverState::force_stuck_gates`] uses this to
+    /// re-derive such gates. An [`IndexMap`] so the forcing order, and hence the
+    /// solution, stays deterministic.
+    requires_gate_requirers: IndexMap<VariableId, Vec<(VariableId, ClauseId)>, ahash::RandomState>,
+
     pub(crate) decision_tracker: DecisionTracker,
 
     /// The number of assumption decision levels currently active: decisions
@@ -626,6 +643,9 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             at_least_one_tracker: Default::default(),
             constrains_aux_vars: Default::default(),
             env_packages: Default::default(),
+
+            requires_aux_vars: Default::default(),
+            requires_gate_requirers: Default::default(),
             decision_tracker: Default::default(),
             assumption_levels: 0,
             propagated_total: 0,
@@ -1394,7 +1414,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // conclude the solution is complete.
             let fired_conditions = self.state.fired_deferred_conditions();
 
+            // Re-derive shared-requires gates stranded by a backtrack, else the
+            // gated requirement would be silently dropped (see
+            // [`SolverState::force_stuck_gates`]).
+            let forced_stuck_gates = self.state.force_stuck_gates(level);
+
             if new_solvables.is_empty() && fired_conditions.is_empty() {
+                if forced_stuck_gates {
+                    // Only gates were repaired: loop to propagate and re-decide.
+                    continue;
+                }
+
                 // If no new literals were selected and no deferred conditions
                 // fired, this solution is complete and we can return.
                 tracing::trace!(
@@ -2946,6 +2976,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut causes_at_current_level = 0u32;
         let mut learnt = Vec::new();
         let mut back_track_to = 0;
+        // Index in `learnt` of the highest-level non-asserting literal, moved
+        // to the front below so it becomes the second watch (watch2onhighest).
+        let mut highest_level_idx = 0;
 
         let mut s_value;
         let mut learnt_why = Vec::new();
@@ -2983,8 +3016,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                                 .assigned_value(literal.variable())
                                 .unwrap(),
                         );
+                        if decision_level > back_track_to {
+                            back_track_to = decision_level;
+                            highest_level_idx = learnt.len();
+                        }
                         learnt.push(learnt_literal);
-                        back_track_to = back_track_to.max(decision_level);
                     } else {
                         unreachable!();
                     }
@@ -3027,6 +3063,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             if causes_at_current_level == 0 {
                 break;
             }
+        }
+
+        // Watch the two highest-level literals: the asserting literal (pushed
+        // last) and the highest-level of the rest (moved to the front). They
+        // are unassigned last on backtracking, so the watches move least.
+        if !learnt.is_empty() {
+            learnt.swap(0, highest_level_idx);
         }
 
         let last_literal = Literal::new(conflicting_solvable, s_value);
@@ -3429,6 +3472,37 @@ impl<D: DependencyProvider> SolverState<D> {
             Some(variable) => self.decision_tracker.assigned_value(variable) == Some(true),
             None => false,
         }
+    }
+
+    /// Forces true every stranded shared-requires gate (unassigned, but with an
+    /// installed requirer that implies it), using the requirer's implication
+    /// clause as the reason so conflict analysis stays correct. Returns whether
+    /// any were forced. Assigned gates are left alone (a false gate with an
+    /// installed requirer is a real conflict propagation already reports).
+    /// Forcing a gate never changes a requirer, so one in-place pass suffices.
+    pub(crate) fn force_stuck_gates(&mut self, level: u32) -> bool {
+        let Self {
+            requires_gate_requirers,
+            decision_tracker,
+            ..
+        } = self;
+
+        let mut forced_any = false;
+        for (&gate, requirers) in requires_gate_requirers.iter() {
+            if decision_tracker.assigned_value(gate).is_some() {
+                continue;
+            }
+            if let Some(&(_, reason)) = requirers
+                .iter()
+                .find(|&&(requirer, _)| decision_tracker.assigned_value(requirer) == Some(true))
+            {
+                decision_tracker
+                    .try_add_decision(Decision::new(gate, true, reason), level)
+                    .expect("a stuck gate is unassigned, so the decision cannot conflict");
+                forced_any = true;
+            }
+        }
+        forced_any
     }
 
     /// Returns the `ConditionId`s of deferred requirements whose gating
