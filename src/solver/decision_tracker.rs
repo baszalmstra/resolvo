@@ -1,5 +1,5 @@
 use crate::solver::{decision::Decision, decision_map::DecisionMap};
-use crate::{VariableId, internal::id::ClauseId};
+use crate::{DenseIndex, VariableId, internal::id::ClauseId};
 
 /// Tracks the assignments to solvables, keeping a log that can be used to backtrack, and a map that
 /// can be used to query the current value assigned
@@ -49,6 +49,16 @@ pub(crate) struct DecisionTracker {
     /// `Default` of zero after `clear()` invalidates everything, as it
     /// must.
     encode_floor: usize,
+
+    /// The clause that derived each variable's current assignment, indexed
+    /// by variable index like [`DecisionMap`]. Written only when a fresh
+    /// assignment lands in [`Self::try_add_decision`], so an entry always
+    /// matches the assignment the map holds for its variable. Undoing an
+    /// assignment leaves the entry behind as a stale leftover, but stale
+    /// entries are unreachable by construction: every read
+    /// ([`Self::find_clause_for_assignment`]) is guarded by the decision
+    /// map, and a variable without a current assignment reports no reason.
+    reasons: Vec<ClauseId>,
 }
 
 impl DecisionTracker {
@@ -106,10 +116,13 @@ impl DecisionTracker {
     // Find the clause that caused the assignment of the specified solvable. If no assignment has
     // been made to the solvable than `None` is returned.
     pub(crate) fn find_clause_for_assignment(&self, variable_id: VariableId) -> Option<ClauseId> {
-        self.stack
-            .iter()
-            .find(|d| d.variable == variable_id)
-            .map(|d| d.derived_from)
+        // The decision map guards the lookup: only a currently assigned
+        // variable reads its `reasons` entry, and that entry was written
+        // when the current assignment landed (see [`Self::reasons`]). A
+        // variable occurs at most once on the trail, so this matches the
+        // historical first-occurrence stack scan exactly.
+        self.assigned_value(variable_id)?;
+        Some(self.reasons[variable_id.to_index()])
     }
 
     /// Attempts to add a decision
@@ -122,6 +135,11 @@ impl DecisionTracker {
         match self.map.value(decision.variable) {
             None => {
                 self.map.set(decision.variable, decision.value, level);
+                let index = decision.variable.to_index();
+                if index >= self.reasons.len() {
+                    self.reasons.resize(index + 1, ClauseId::install_root());
+                }
+                self.reasons[index] = decision.derived_from;
                 self.stack.push(decision);
                 Ok(true)
             }
