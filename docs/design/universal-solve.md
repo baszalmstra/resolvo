@@ -475,6 +475,35 @@ level n+1, etc.).
   reproduce exactly. Callers that want version-level stickiness on top
   should pass the previous solution as `Candidates::favored`, which keeps
   working unchanged in universal mode.
+- (Learned when the property-test generator grew fat packages, 4-5 versions
+  per package:) the fixed point is NOT achievable per cell by extraction
+  rules alone. Three mechanisms were found and addressed:
+  1. Extraction missed *steering* pins: an env assignment that excluded a
+     more-preferred candidate through the candidate's own clauses (so the
+     candidate is not installed and no support rule fires) was dropped by
+     generalization, and the replay preferred that candidate again.
+     `extract_cell` now walks the implication cone of every falsified
+     candidate that precedes the installed pick and pins the env
+     assignments the cone rests on (`CellPinCounts::steering`).
+  2. A requires/constrains clause encoded while its non-parent literals are
+     all already false (cheaply-available dependencies cascading under an
+     assumption prefix) was flagged as a conflict even with the parent
+     undecided, dropping perfectly solvable seeds as "unsolvable as
+     seeded". The encoder now asserts `¬parent` instead (mirroring the
+     born-all-false shared-requires gate).
+  3. Even then, extraction pins are a function of the trail: a free-phase
+     trail (kept prefix, blocking cascades) assigns env literals the replay
+     leaves undecided, and per-run learnt clauses steer propagation, so no
+     assignment-keyed rule can make a single pass replay-canonical.
+     `solve_universal` therefore iterates a SEEDED enumeration on its own
+     output until a pass over a saturated provider cache reproduces its
+     seed list (`RESEED_FIXED_POINT_MAX_ROUNDS`, cycle-detected), which
+     makes the returned partition a byte-identical reseed fixed point by
+     construction. Convergence normally takes one pass, occasionally two
+     or three; orbits without a fixed point exist only for seed lists no
+     enumeration produced (e.g. reordered ones) and return their last pass,
+     still a verified disjoint cover. The unseeded first solve is a single
+     pass, unchanged.
 
 ### 5.8 Output types, merge, verify, project
 

@@ -3311,15 +3311,20 @@ fn test_universal_seed_reproduces_candidate_split_partition() {
 /// learnt clause is a valid resolvent of real clauses (assumptions appear
 /// only as literals, never as resolution steps) and safely persists.
 ///
-/// The test also documents two effects of seed order: (1) with no earlier
-/// cell to stay disjoint from, the recorded cell generalizes to all of
-/// `glibc >=217` (pkg=1 is valid for the entire model), and (2) the second
-/// seed `glibc >=228` then contradicts the first cell's blocking clause
-/// during its first propagation and is dropped. The partition legitimately
-/// DIFFERS from the unseeded one (which prefers pkg=2 where possible) but
-/// is a valid cover; this is why the shuffled-seed property test asserts
-/// validity, not equality: generalization depends on which cells were
-/// recorded before, so seed order can change the partition's content.
+/// The test also documents an effect of the steering pins on seed order:
+/// even with no earlier cell to stay disjoint from, the recorded cell does
+/// NOT generalize to all of `glibc >=217` (pkg=1 would be valid for the
+/// entire model) — extraction pins `not (glibc >=228)` because that
+/// assignment is why the preferred pkg=2 was skipped, keeping the cell
+/// honest about the choice it records. The second seed `glibc >=228` then
+/// still replays (it is disjoint from the first cell) and keeps its
+/// canonical pkg=2 solution, so this reordered seed list reproduces
+/// exactly. Seed order can still change the partition's content in general
+/// (generalization and repair depend on which cells were recorded before),
+/// which is why the shuffled-seed property test asserts validity, not
+/// equality. Historically, before the steering pins existed, the first
+/// cell over-generalized to the whole model here and the second seed was
+/// dropped against its blocking clause.
 #[test]
 fn test_universal_seed_order_changes_generalization() {
     let mut provider = BundleBoxProvider::new();
@@ -3354,8 +3359,10 @@ fn test_universal_seed_order_changes_generalization() {
     // The partition is a valid, disjoint, covering one.
     assert_eq!(solution.verify(solver.provider()), Ok(()));
     assert_snapshot!(format_universal_result(&solver, &Ok(solution)), @r"
-    cell: glibc in >=217, <1000
+    cell: not (glibc in >=228, <1000) AND glibc in >=217, <1000
       pkg=1
+    cell: glibc in >=228, <1000
+      pkg=2
     ");
 }
 

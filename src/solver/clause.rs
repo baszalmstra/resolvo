@@ -521,14 +521,21 @@ impl<N: SolverId> Clause<N> {
             matches_var,
             ..
         } = *payload;
-        assert_ne!(decision_tracker.assigned_value(parent), Some(false));
+        // The parent may already have been assigned false by the time this
+        // clause is built (e.g. the encoder asserted `¬parent` for a sibling
+        // clause born with all its non-parent literals false). The clause is
+        // then currently satisfied by `¬parent`, but that assignment can be
+        // backtracked later, so the clause must still be added; it never
+        // conflicts in that state.
+        let parent_is_false = decision_tracker.assigned_value(parent) == Some(false);
 
         let kind = Clause::EnvConstrains(env_constrains_id);
 
         match absent_var {
             None => {
                 // Binary clause: (not parent or matches)
-                let conflict = decision_tracker.assigned_value(matches_var) == Some(false);
+                let conflict =
+                    !parent_is_false && decision_tracker.assigned_value(matches_var) == Some(false);
                 (
                     kind,
                     Some([parent.negative(), matches_var.positive()]),
@@ -548,11 +555,17 @@ impl<N: SolverId> Clause<N> {
                 } else if matches_val != Some(false) {
                     matches_var.positive()
                 } else {
-                    // Both false -- conflict.
-                    return (kind, Some([parent.negative(), ab.positive()]), true);
+                    // Both false -- conflict, unless the parent already is
+                    // false, which satisfies the clause.
+                    return (
+                        kind,
+                        Some([parent.negative(), ab.positive()]),
+                        !parent_is_false,
+                    );
                 };
 
-                let conflict = ab_val == Some(false) && matches_val == Some(false);
+                let conflict =
+                    !parent_is_false && ab_val == Some(false) && matches_val == Some(false);
                 (kind, Some([parent.negative(), watched_candidate]), conflict)
             }
         }

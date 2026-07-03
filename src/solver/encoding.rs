@@ -818,7 +818,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             );
 
             if conflict {
-                self.conflicting_clauses.push(clause_id);
+                self.conflict_or_assert_parent(variable, clause_id);
             } else if no_candidates && condition.is_none() {
                 // Add assertions for unit clauses (i.e. those with no matching candidates)
                 self.state.negative_assertions.push((variable, clause_id));
@@ -981,7 +981,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                         }
 
                         if conflict {
-                            self.conflicting_clauses.push(clause_id);
+                            self.conflict_or_assert_parent(variable, clause_id);
                         }
                     }
                     return;
@@ -1044,7 +1044,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 );
                 let clause_id = self.state.add_clause(watched_literals, kind);
                 if conflict {
-                    self.conflicting_clauses.push(clause_id);
+                    self.conflict_or_assert_parent(variable, clause_id);
                 }
             }
             ConstraintCandidates::Environment(env_pkg) => {
@@ -1124,7 +1124,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         );
 
         if conflict {
-            self.conflicting_clauses.push(clause_id);
+            self.conflict_or_assert_parent(parent_var, clause_id);
         }
     }
 
@@ -1172,6 +1172,31 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         }
 
         variable
+    }
+
+    /// Handles a clause of the shape `(¬parent ∨ rest)` that was born with
+    /// every `rest` literal already assigned false.
+    ///
+    /// With the parent installed this is a genuine conflict and the clause
+    /// is queued for the caller's conflict handling. With the parent
+    /// undecided the clause is merely unit (`¬parent`), and because the
+    /// falsifying assignments predate the clause no watch will ever fire to
+    /// propagate it: assert `¬parent` directly, mirroring the born-all-false
+    /// gate in [`Self::add_shared_requires`]. The undecided case arises when
+    /// dependencies are cheaply available (hints, or a previous solve on the
+    /// same solver) and encoding cascades under existing assignments — most
+    /// prominently under the assumption prefix of a seeded universal cell,
+    /// where the conflict verdict would otherwise drop a perfectly solvable
+    /// seed as "unsolvable as seeded".
+    fn conflict_or_assert_parent(&mut self, parent: VariableId, clause_id: ClauseId) {
+        if self.state.decision_tracker.assigned_value(parent).is_none() {
+            self.state
+                .decision_tracker
+                .try_add_decision(Decision::new(parent, false, clause_id), self.level)
+                .expect("bug: the parent was just checked to be undecided");
+        } else {
+            self.conflicting_clauses.push(clause_id);
+        }
     }
 
     /// Enqueues retrieving the dependencies for a solvable.

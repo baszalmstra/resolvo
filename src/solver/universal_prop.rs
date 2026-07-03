@@ -206,7 +206,15 @@ fn gen_universe(rng: &mut Rng) -> Universe {
     let pkg_count = rng.range(2, 6) as usize;
     let mut packages = Vec::new();
     for p in 0..pkg_count {
-        let version_count = rng.range(1, 4) as usize;
+        // A quarter of the packages are "fat" (4-5 versions) so that wide
+        // requirements on them cross `REQUIRES_AUX_ENCODING_THRESHOLD` and
+        // the property gate exercises the shared-requires gate encoding in
+        // universal mode.
+        let version_count = if rng.chance(1, 4) {
+            rng.range(4, 6) as usize
+        } else {
+            rng.range(1, 4) as usize
+        };
         let mut versions = Vec::new();
         for _ in 0..version_count {
             let mut requirements = Vec::new();
@@ -223,7 +231,11 @@ fn gen_universe(rng: &mut Rng) -> Universe {
                 }
                 let lo = if rng.chance(1, 2) { 1 } else { rng.range(1, 4) };
                 let hi = if rng.chance(1, 2) {
-                    4
+                    // Wide enough to cover fat packages, so those
+                    // requirements have >= 4 candidates and use the shared
+                    // gate. On regular (1-3 version) packages this is
+                    // equivalent to the previous wide bound of 4.
+                    6
                 } else {
                     rng.range(lo + 1, 5)
                 };
@@ -294,7 +306,7 @@ fn gen_universe(rng: &mut Rng) -> Universe {
             root_requirements.push(GenRequirement {
                 target: GenTarget::Concrete(p),
                 lo: 1,
-                hi: 4,
+                hi: 6,
                 condition: None,
             });
         }
@@ -843,9 +855,11 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             // here unconditionally:
             //   - the reseeded partition is a verified disjoint cover, and
             //     its projections are valid solutions (checked on samples);
-            //   - one more reseed round is a fixed point: each cell of the
-            //     reseeded partition was just produced under exactly its own
-            //     condition as assumptions, so replaying it changes nothing.
+            //   - one more reseed round is a fixed point: a seeded
+            //     `solve_universal` internally iterates the enumeration on
+            //     its own output until a pass (over a saturated provider
+            //     cache) reproduces its seed list, so the returned partition
+            //     replays byte-identically.
             let seeds: Vec<CellCondition<NameId>> = solution
                 .cells()
                 .iter()

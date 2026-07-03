@@ -177,13 +177,22 @@ enum EnumerationOutcome<Id, N> {
 /// tail.
 const TRAIL_RESHAPE_ORDINARY_LEVELS: u32 = 8;
 
+/// The maximum number of enumeration passes a SEEDED `solve_universal` may
+/// take to reach the reseed fixed point (see `solve_universal_impl`). Each
+/// pass re-enumerates from a fresh solver state with the previous pass's
+/// cells as seeds; convergence normally takes one pass (the seeds replay
+/// exactly) or two (one healing pass plus its confirmation). On exhaustion
+/// the last pass's solution is returned: still a verified disjoint cover,
+/// at worst not yet reproducing byte-identically under one more reseed.
+const RESEED_FIXED_POINT_MAX_ROUNDS: u32 = 8;
+
 /// The number of cell literals each pinning rule contributed to one recorded
 /// cell of a universal enumeration (a diagnostics observation point, see
 /// `Solver::universal_cell_pins`).
 ///
 /// Every literal of a recorded cell is attributed to exactly one rule: the
 /// rule that first pushed it during cell extraction or disjointness repair.
-/// The split separates honest load-bearing extraction (the first five
+/// The split separates honest load-bearing extraction (the first six
 /// fields) from the disjointness-repair appends, which is the load-bearing
 /// distinction when investigating condition fragmentation: repair literals
 /// do not create cells, they only specialize the conditions of solutions
@@ -205,6 +214,11 @@ pub struct CellPinCounts {
     pub support_neg: u32,
     /// `EnvConstrains` absent/matches pins.
     pub constrains: u32,
+    /// Environment assignments in the implication cone of a falsified
+    /// more-preferred candidate that `decide()` skipped (pinned with their
+    /// trail sign, so a re-solve of the cell excludes the same candidates
+    /// and reproduces the same picks).
+    pub steering: u32,
     /// Agreement pins added by the disjointness repair scan.
     pub repair_agreement: u32,
     /// Distinguishing literals appended by the disjointness repair.
@@ -221,6 +235,7 @@ impl CellPinCounts {
             + self.support_skip
             + self.support_neg
             + self.constrains
+            + self.steering
             + self.repair_agreement
             + self.repair_distinguishing
     }
@@ -1044,19 +1059,98 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.validate_universal_input(&environment_model, &seed_partition)
             .map_err(UniversalFailure::InvalidInput)?;
 
-        // First attempt: enumerate with trail-prefix preservation. When a
-        // prefix-started run exceeds its work budget the attempt is
-        // abandoned wholesale (the solver state shaped by reused transitions
-        // performs badly under real search and is not repairable in place)
-        // and the enumeration re-runs from a fresh state with reuse
-        // disabled, exactly as if trail reuse did not exist. The wasted
-        // attempt is bounded by the work budgets; the fallback never aborts,
-        // so at most one rebuild happens.
+        // A seeded solve must return a reseed fixed point: enumerating with
+        // the returned cells as seeds reproduces them byte-identically (the
+        // M4 seeding contract, design doc 5.7). One enumeration pass does
+        // not guarantee this by itself: a recorded cell is shaped by
+        // transient per-run search state (learnt clauses and activity from
+        // earlier cells of the same run, kept trail prefixes of the free
+        // phase), so replaying its condition from the cleaner state of the
+        // next run can legitimately extract a different, healthier cell.
+        // Iterate the enumeration on its own output until a pass reproduces
+        // its seed list; each pass starts from a fresh solver state, so the
+        // pass that confirms stability runs under exactly the conditions the
+        // caller's next reseed would. An unseeded solve returns its first
+        // enumeration unchanged (its healing round is the caller's first
+        // reseed, which the design documents).
+        let mut seeds = seed_partition;
+        let confirming = !seeds.is_empty();
+        let mut rounds = 0;
+        let mut inputs_tried: Vec<Vec<CellCondition<D::NameId>>> = Vec::new();
+        loop {
+            let fetches_before = self.cache.fetch_count();
+            let solution = self.enumerate_universal_with_fallback(
+                &requirements,
+                &constraints,
+                &environment_model,
+                &seeds,
+            )?;
+            if !confirming {
+                return Ok(solution);
+            }
+            let output: Vec<CellCondition<D::NameId>> = solution
+                .cells()
+                .iter()
+                .map(|cell| cell.condition().clone())
+                .collect();
+            rounds += 1;
+            // Convergence requires a pass that reproduced its seed list
+            // WITHOUT learning anything new from the provider: cached
+            // dependencies gate the encoder's eager cascade (and thereby the
+            // clause registration order), so only a pass over a saturated
+            // cache is reproducible by the identical later call the fixed
+            // point promises.
+            let cache_grew = self.cache.fetch_count() != fetches_before;
+            if !cache_grew {
+                if output == seeds {
+                    return Ok(solution);
+                }
+                // An output equal to an earlier input closes an orbit with
+                // no fixed point on it (possible for seed lists that no
+                // enumeration produced, e.g. reordered ones; an in-order
+                // reseed heals towards stability instead). Iterating further
+                // would only walk the cycle; return the last pass, which is
+                // still a verified disjoint cover.
+                if inputs_tried.contains(&output) {
+                    tracing::debug!(
+                        "reseed iteration closed a cycle after {rounds} passes without \
+                         finding a fixed point; returning the last enumeration"
+                    );
+                    return Ok(solution);
+                }
+            }
+            if rounds >= RESEED_FIXED_POINT_MAX_ROUNDS {
+                tracing::debug!(
+                    "reseed iteration did not converge within {rounds} passes; returning \
+                     the last enumeration"
+                );
+                return Ok(solution);
+            }
+            inputs_tried.push(std::mem::replace(&mut seeds, output));
+        }
+    }
+
+    /// One full enumeration: first with trail-prefix preservation; when a
+    /// prefix-started run exceeds its work budget the attempt is abandoned
+    /// wholesale (the solver state shaped by reused transitions performs
+    /// badly under real search and is not repairable in place) and the
+    /// enumeration re-runs from a fresh state with reuse disabled, exactly
+    /// as if trail reuse did not exist. The wasted attempt is bounded by the
+    /// work budgets; the fallback never aborts, so at most one rebuild
+    /// happens.
+    #[allow(clippy::type_complexity)]
+    fn enumerate_universal_with_fallback(
+        &mut self,
+        requirements: &[ConditionalRequirement],
+        constraints: &[VersionSetId],
+        environment_model: &EnvironmentModel<D::NameId>,
+        seed_partition: &[CellCondition<D::NameId>],
+    ) -> Result<UniversalSolution<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
         match self.enumerate_universal(
-            requirements.clone(),
-            constraints.clone(),
+            requirements.to_vec(),
+            constraints.to_vec(),
             environment_model.clone(),
-            seed_partition.clone(),
+            seed_partition.to_vec(),
             true,
         )? {
             EnumerationOutcome::Done(solution) => Ok(solution),
@@ -1066,10 +1160,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                      without it"
                 );
                 match self.enumerate_universal(
-                    requirements,
-                    constraints,
-                    environment_model,
-                    seed_partition,
+                    requirements.to_vec(),
+                    constraints.to_vec(),
+                    environment_model.clone(),
+                    seed_partition.to_vec(),
                     false,
                 )? {
                     EnumerationOutcome::Done(solution) => Ok(solution),
@@ -1818,12 +1912,16 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// literal variables to exactly the load-bearing assignments, sorted by
     /// variable id for determinism (design doc 5.6).
     ///
-    /// Scans only the indexed support clauses
-    /// (`SolverState::env_support_clauses`). Oracle consistency, model and
-    /// blocking clauses never contribute support: the former two are
-    /// tautologies over the modeled environment space and the latter are
-    /// handled by the disjointness repair. Learnt clauses are implied by the
-    /// other clauses and never contribute either.
+    /// Scans the indexed support clauses
+    /// (`SolverState::env_support_clauses`) for validity support, then all
+    /// requires clauses of installed parents for steering pins (environment
+    /// assignments that excluded a more-preferred candidate; see the
+    /// steering block below). Oracle consistency, model and blocking clauses
+    /// never contribute support: the former two are tautologies over the
+    /// modeled environment space and the latter are handled by the
+    /// disjointness repair. Learnt clauses are implied by the other clauses
+    /// and never contribute support either (they can appear as reasons
+    /// inside a steering cone).
     ///
     /// Also returns, per pinning rule, how many literals the rule
     /// contributed (a [`CellPinCounts`]; the disjointness repair adds its
@@ -2024,6 +2122,133 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 _ => unreachable!(
                     "only Requires and EnvConstrains clauses are indexed for cell support"
                 ),
+            }
+        }
+
+        // Steering pins: the support rules above cover only clauses whose
+        // parent is installed, so they miss environment assignments that
+        // steered a CANDIDATE CHOICE by falsifying a more-preferred
+        // candidate. Example: under the assumption `E = true`, a preferred
+        // candidate `x` is propagated false through x's own conditional
+        // requires clause (`not x OR not E OR y`, with `y` false), so the
+        // solver installs the next candidate instead. `x` is not installed,
+        // so no support rule fires, `E` is dropped by generalization, and a
+        // re-solve of the cell under its own (generalized) condition prefers
+        // `x` again and extracts a DIFFERENT cell — breaking the reseed
+        // fixed point. The same mechanism applies to free-phase cells whose
+        // kept trail prefix falsified a preferred candidate for reasons that
+        // involve environment literals.
+        //
+        // For every requires clause with an installed parent whose condition
+        // holds, walk the implication cone of each falsified candidate that
+        // precedes the installed pick in sorted-candidate order (exactly the
+        // candidates `decide()` skipped), and pin every environment literal
+        // assignment the cone rests on. The walk stops at installed
+        // solvables and the root (they are part of the recorded solution and
+        // re-derive in a re-solve) and at decide() picks (free choices, not
+        // implications). Pinning trail-consistent literals only shrinks the
+        // cell, so this is always sound.
+        {
+            // Level-starting assignments are decide() picks or assumption
+            // decisions; their recorded clause is not an implying reason.
+            let mut level_starts: ahash::HashSet<VariableId> = ahash::HashSet::default();
+            let mut previous_level = 0;
+            for decision in state.decision_tracker.stack() {
+                let level = state.decision_tracker.level(decision.variable);
+                if level > previous_level {
+                    level_starts.insert(decision.variable);
+                }
+                previous_level = previous_level.max(level);
+            }
+
+            let mut visited: ahash::HashSet<VariableId> = ahash::HashSet::default();
+            let mut cone: Vec<VariableId> = Vec::new();
+            for (&parent, requirements) in state.requires_clauses.iter() {
+                if state.decision_tracker.assigned_value(parent) != Some(true) {
+                    continue;
+                }
+                for (requirement, disjunction, _clause_id) in requirements {
+                    // Only clauses whose condition holds drove a pick; a
+                    // clause satisfied by its condition complement never
+                    // reached decide().
+                    if let Some(disjunction) = *disjunction {
+                        let condition_holds = state.disjunctions[disjunction]
+                            .literals
+                            .iter()
+                            .all(|literal| !literal.eval(decision_map).unwrap_or(literal.negate()));
+                        if !condition_holds {
+                            continue;
+                        }
+                    }
+                    // The falsified prefix of the sorted candidates is
+                    // exactly what decide() skipped before the installed
+                    // pick (an undecided candidate means the clause was
+                    // satisfied through another clause's install before
+                    // decide() ever drove it: no steering happened here).
+                    for &candidate in state.requirement_to_sorted_candidates[*requirement]
+                        .iter()
+                        .flatten()
+                    {
+                        match state.decision_tracker.assigned_value(candidate) {
+                            Some(false) => cone.push(candidate),
+                            _ => break,
+                        }
+                    }
+                }
+            }
+
+            while let Some(variable) = cone.pop() {
+                if !visited.insert(variable) {
+                    continue;
+                }
+                let Some(assigned) = state.decision_tracker.assigned_value(variable) else {
+                    // Cone entries and reason antecedents are assigned by
+                    // construction; tolerate gaps defensively in release.
+                    debug_assert!(false, "bug: an implication-cone variable is unassigned");
+                    continue;
+                };
+                if is_env_variable(state, variable) {
+                    if record(&mut cell, variable, assigned) {
+                        pins.steering += 1;
+                    }
+                    continue;
+                }
+                // Installed solvables and the root are part of the recorded
+                // solution; a re-solve re-installs them, and their own
+                // steering is pinned through their own clauses.
+                if assigned && variable.as_solvable_or_root(&state.variable_map).is_some() {
+                    continue;
+                }
+                // decide() picks are free choices; assumption decisions are
+                // environment literals and were pinned above.
+                if level_starts.contains(&variable) {
+                    continue;
+                }
+                let Some(reason) = state.decision_tracker.find_clause_for_assignment(variable)
+                else {
+                    debug_assert!(false, "bug: a propagated assignment has no reason clause");
+                    continue;
+                };
+                debug_assert_ne!(
+                    reason,
+                    ClauseId::assumption(),
+                    "bug: assumption decisions start a level and are environment literals"
+                );
+                // Every literal of the reason clause other than the
+                // propagated one was false when the propagation fired; the
+                // cone rests on those assignments.
+                state.clauses.kinds[reason.to_index()].visit_literals(
+                    &state.learnt_clauses,
+                    &state.requirement_to_sorted_candidates,
+                    &state.disjunctions,
+                    &state.env_constrains,
+                    &state.env_clauses,
+                    |literal| {
+                        if literal.variable() != variable {
+                            cone.push(literal.variable());
+                        }
+                    },
+                );
             }
         }
 

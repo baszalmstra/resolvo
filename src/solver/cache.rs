@@ -96,6 +96,16 @@ impl<D: DependencyProvider> SolverCache<D> {
         }
     }
 
+    /// Returns a counter that increases whenever the cache learns something
+    /// new from the provider (a package's candidates or a solvable's
+    /// dependencies). Used by `solve_universal`'s reseed fixed-point
+    /// iteration: cached dependencies gate the encoder's eager cascade, so an
+    /// enumeration is only reproducible by an identical later call once a
+    /// pass completes without growing the cache.
+    pub(crate) fn fetch_count(&self) -> usize {
+        self.candidates.len() + self.solvable_dependencies.len()
+    }
+
     /// Returns the [`DependencyProvider`] used by this cache.
     pub fn provider(&self) -> &D {
         &self.provider
