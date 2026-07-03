@@ -19,9 +19,9 @@ use rand::{
     rngs::StdRng,
 };
 use resolvo::{
-    CellCondition, ConditionalRequirement, EnvLiteral, EnvLiteralKind, EnvironmentModel, NameId,
-    Problem, SolvableId, Solver, UniversalFailure, UniversalProblem, UniversalSolution,
-    UnsolvableOrCancelled, VersionSetId,
+    CellCondition, ConditionalRequirement, EnvClause, EnvLiteral, EnvironmentModel, NameId,
+    Problem, SignedEnvLiteral, SolvableId, Solver, UniversalFailure, UniversalProblem,
+    UniversalSolution, UnsolvableOrCancelled, VersionSetId,
     snapshot::{DependencySnapshot, SnapshotProvider},
 };
 
@@ -184,8 +184,8 @@ fn resolve_env_model(model: &EnvModelFile, snapshot: &DependencySnapshot) -> Env
                         "model references '{}' which is not an environment package",
                         literal.package
                     );
-                    let kind = match (&literal.matches, literal.absent) {
-                        (Some(display), false) => EnvLiteralKind::Matches(find_version_set(
+                    let env_literal = match (&literal.matches, literal.absent) {
+                        (Some(display), false) => EnvLiteral::Matches(find_version_set(
                             name_id,
                             &literal.package,
                             display,
@@ -196,22 +196,16 @@ fn resolve_env_model(model: &EnvModelFile, snapshot: &DependencySnapshot) -> Env
                                 "model uses 'absent' for '{}' which cannot be absent",
                                 literal.package
                             );
-                            EnvLiteralKind::Absent
+                            EnvLiteral::Absent(name_id)
                         }
                         _ => panic!(
                             "model literal for '{}' must have exactly one of 'matches'/'absent'",
                             literal.package
                         ),
                     };
-                    (
-                        EnvLiteral {
-                            package: name_id,
-                            kind,
-                        },
-                        literal.positive,
-                    )
+                    SignedEnvLiteral::new(env_literal, literal.positive)
                 })
-                .collect()
+                .collect::<EnvClause<NameId>>()
         })
         .collect()
 }
@@ -227,9 +221,9 @@ fn merge_disjunct_pair(
         return None;
     }
     let mut differing = None;
-    for (index, (literal, sign)) in a.literals().enumerate() {
-        let (_, b_sign) = b.literals().find(|(b_literal, _)| b_literal == literal)?;
-        if sign != b_sign {
+    for (index, sa) in a.literals().enumerate() {
+        let sb = b.literals().find(|sb| sb.literal == sa.literal)?;
+        if sa.positive != sb.positive {
             if differing.is_some() {
                 return None;
             }
@@ -242,7 +236,7 @@ fn merge_disjunct_pair(
             .literals()
             .enumerate()
             .filter(|&(index, _)| index != drop_index)
-            .map(|(_, literal)| literal.clone())
+            .map(|(_, signed)| *signed)
             .collect(),
     };
     // The merged conjunction is a subset of `a`'s literals, which are already
@@ -331,23 +325,25 @@ fn dump_cell_stats(
     writeln!(out, "\n=== axis fragmentation ===").unwrap();
     let mut axis: Vec<(NameId, Vec<(String, usize, usize)>)> = Vec::new();
     for cell in solution.cells() {
-        for (literal, sign) in cell.condition().literals() {
-            let display = match &literal.kind {
-                EnvLiteralKind::Absent => "absent".to_string(),
-                EnvLiteralKind::Matches(vs) => {
-                    snapshot.version_sets.get(*vs).unwrap().display.clone()
+        for signed in cell.condition().literals() {
+            let (package, display) = match signed.literal {
+                EnvLiteral::Absent(name) => (name, "absent".to_string()),
+                EnvLiteral::Matches(vs) => {
+                    let version_set = snapshot.version_sets.get(vs).unwrap();
+                    (version_set.name, version_set.display.clone())
                 }
             };
-            let package_entry = match axis.iter_mut().find(|(p, _)| *p == literal.package) {
+            let sign = signed.positive;
+            let package_entry = match axis.iter_mut().find(|(p, _)| *p == package) {
                 Some(entry) => entry,
                 None => {
-                    axis.push((literal.package, Vec::new()));
+                    axis.push((package, Vec::new()));
                     axis.last_mut().unwrap()
                 }
             };
             match package_entry.1.iter_mut().find(|(d, _, _)| *d == display) {
                 Some((_, pos, neg)) => {
-                    if *sign {
+                    if sign {
                         *pos += 1;
                     } else {
                         *neg += 1;
@@ -355,8 +351,8 @@ fn dump_cell_stats(
                 }
                 None => package_entry.1.push((
                     display,
-                    if *sign { 1 } else { 0 },
-                    if *sign { 0 } else { 1 },
+                    if sign { 1 } else { 0 },
+                    if sign { 0 } else { 1 },
                 )),
             }
         }
@@ -685,13 +681,13 @@ fn main() {
                             .flat_map(|cell| cell.solvables().iter().copied())
                             .collect();
                         let mut literals: Vec<&EnvLiteral<NameId>> = Vec::new();
-                        for (literal, _) in solution
+                        for signed in solution
                             .cells()
                             .iter()
                             .flat_map(|cell| cell.condition().literals())
                         {
-                            if !literals.contains(&literal) {
-                                literals.push(literal);
+                            if !literals.contains(&&signed.literal) {
+                                literals.push(&signed.literal);
                             }
                         }
                         eprintln!(
@@ -711,17 +707,17 @@ fn main() {
                             dump_cell_stats(path, i, &solution, solver.provider(), &snapshot);
                         }
                         if opts.project {
-                            let projected = solution.project(|literal| {
-                                let package = snapshot.packages.get(literal.package).unwrap();
-                                match &literal.kind {
-                                    EnvLiteralKind::Absent => package.solvables.is_empty(),
-                                    EnvLiteralKind::Matches(version_set) => {
-                                        let version_set =
-                                            snapshot.version_sets.get(*version_set).unwrap();
-                                        package.solvables.iter().any(|solvable| {
-                                            version_set.matching_candidates.contains(solvable)
-                                        })
-                                    }
+                            let projected = solution.project(|literal| match *literal {
+                                EnvLiteral::Absent(name) => {
+                                    snapshot.packages.get(name).unwrap().solvables.is_empty()
+                                }
+                                EnvLiteral::Matches(version_set) => {
+                                    let version_set =
+                                        snapshot.version_sets.get(version_set).unwrap();
+                                    let package = snapshot.packages.get(version_set.name).unwrap();
+                                    package.solvables.iter().any(|solvable| {
+                                        version_set.matching_candidates.contains(solvable)
+                                    })
                                 }
                             });
                             record.projected = Some(match projected {

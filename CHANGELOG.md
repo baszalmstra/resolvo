@@ -21,22 +21,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concrete environment) and `verify` (re-checking disjointness and model
   coverage, e.g. for solutions reconstructed from a lockfile). A solution can
   be rebuilt from serialized parts with `UniversalSolution::from_cells` and
-  `Cell::new`. `CellCondition` and `Presence` encapsulate their literals
-  behind iterator accessors (`literals()`, `disjuncts()`); construct them from
-  raw literals with the normalizing `CellCondition::new` (which deduplicates
-  and rejects a literal given with both signs, returning `ContradictoryLiteral`)
-  and `Presence::new`. Failures are reported
-  as `UniversalFailure::Unsolvable` carrying the unsolvable region and a
-  conflict scoped to that region via a targeted re-solve. Structurally
-  invalid caller inputs are rejected up front, before any solving, as
-  `UniversalFailure::InvalidInput(InvalidUniversalInput)` (a `#[non_exhaustive]`
-  error enum with a `Display` impl): a literal in the environment model or a
-  seed partition that names a non-environment package, a `Matches` literal
-  whose version set belongs to a different package, an `Absent` literal for a
-  package declared `can_be_absent: false`, or an empty model disjunction. The
-  `EnvInputSource` on each variant names which input carried the error. A
-  merely stale seed (still valid environment packages, no longer matching a
-  solution) is not an error and still heals silently.
+  `Cell::new`. Environment literals use a closed representation that makes
+  invalid states unrepresentable: `EnvLiteral<N>` is an enum
+  (`Matches(VersionSetId)` — its package is derived from the version set via
+  the interner and read back with `EnvLiteral::package(interner)` — or
+  `Absent(N)`), so a literal can never name a version set of the wrong package.
+  A literal is signed with `SignedEnvLiteral { literal, positive }` (public
+  convention: `positive == true` means the literal holds), used consistently by
+  both `EnvClause` (a disjunction) and `CellCondition` (a conjunction), which
+  are distinct newtypes and no longer interchangeable. The environment model is
+  the newtype `EnvironmentModel<N>` (a conjunction of `EnvClause`s), built with
+  `EnvironmentModel::new`/`EnvClause::new` or via `FromIterator`. `CellCondition`
+  and `Presence` encapsulate their literals behind iterator accessors
+  (`literals()`, `disjuncts()`); construct them from raw signed literals with
+  the normalizing `CellCondition::new` (which deduplicates and rejects a literal
+  given with both signs, returning `ContradictoryLiteral`) and `Presence::new`.
+  Failures are reported as `UniversalFailure::Unsolvable` carrying the
+  unsolvable region and a conflict scoped to that region via a targeted
+  re-solve. Structurally invalid caller inputs are rejected up front, before any
+  solving, as `UniversalFailure::InvalidInput(InvalidUniversalInput)` (a
+  `#[non_exhaustive]` error enum with a `Display` impl): a literal in the
+  environment model or a seed partition that names a non-environment package, an
+  `Absent` literal for a package declared `can_be_absent: false`, or an empty
+  model disjunction. The `EnvInputSource` on each variant names which input
+  carried the error. A merely stale seed (still valid environment packages, no
+  longer matching a solution) is not an error and still heals silently.
 - Environment packages: packages whose value is unknown at solve time (e.g.
   `__glibc`, `__cuda`), classified through the new
   `UniversalDependencyProvider` trait (a supertrait of `DependencyProvider`).

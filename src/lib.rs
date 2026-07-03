@@ -112,24 +112,130 @@ pub(crate) enum PackageCandidates<S = SolvableId> {
     Environment(EnvironmentPackage),
 }
 
-/// A signed environment literal: a reference to a version set (or the absent
-/// sentinel) for a specific environment package.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnvLiteral<N> {
-    /// The environment package this literal refers to.
-    pub package: N,
-    /// Whether this literal is a version-set match or the absent sentinel.
-    pub kind: EnvLiteralKind,
+/// A reference to a specific value of an environment package: either the
+/// environment's value for the package matches a version set, or the package
+/// is absent from the environment.
+///
+/// Invalid combinations that a flat `{ package, version_set }` pair could
+/// express — most importantly a package paired with a version set that belongs
+/// to a *different* package — are unrepresentable here: a
+/// [`Matches`](EnvLiteral::Matches) literal derives its package from the
+/// version set via [`Interner::version_set_name`], and only an
+/// [`Absent`](EnvLiteral::Absent) literal carries a package name of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvLiteral<N> {
+    /// The environment's value for the package exists and matches this version
+    /// set. The package the literal refers to is the version set's package,
+    /// [`Interner::version_set_name`].
+    Matches(VersionSetId),
+    /// The named package is absent from the environment.
+    Absent(N),
 }
 
-/// The kind of an [`EnvLiteral`].
+impl<N> EnvLiteral<N> {
+    /// The environment package this literal refers to. A
+    /// [`Matches`](EnvLiteral::Matches) literal derives its package from the
+    /// version set via the interner; an [`Absent`](EnvLiteral::Absent) literal
+    /// returns the name it stores directly.
+    pub fn package<I: Interner<NameId = N>>(&self, interner: &I) -> N
+    where
+        N: Copy,
+    {
+        match self {
+            EnvLiteral::Matches(version_set) => interner.version_set_name(*version_set),
+            EnvLiteral::Absent(name) => *name,
+        }
+    }
+}
+
+/// A signed environment literal: an [`EnvLiteral`] paired with the truth value
+/// it must take.
+///
+/// `positive` follows the public convention **`true` = the literal holds**: a
+/// positive [`Matches`](EnvLiteral::Matches) requires the environment to match
+/// the version set, a negative one requires it not to. The solver's internal
+/// negation convention is confined to its own literal types and never surfaces
+/// on this public boundary.
+///
+/// The same signed-literal type is shared by [`EnvClause`] (a disjunction) and
+/// by [`CellCondition`] (a conjunction), so the two differ only in how their
+/// literals combine, never in the literal representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignedEnvLiteral<N> {
+    /// The environment literal.
+    pub literal: EnvLiteral<N>,
+    /// Whether the literal must hold (`true`) or must not hold (`false`).
+    pub positive: bool,
+}
+
+impl<N> SignedEnvLiteral<N> {
+    /// Pairs a literal with the truth value it must take (`true` = the literal
+    /// holds).
+    pub fn new(literal: EnvLiteral<N>, positive: bool) -> Self {
+        Self { literal, positive }
+    }
+}
+
+impl<N> From<(EnvLiteral<N>, bool)> for SignedEnvLiteral<N> {
+    /// Converts a `(literal, positive)` pair, preserving the `true` = holds
+    /// convention so existing tuple call sites stay ergonomic.
+    fn from((literal, positive): (EnvLiteral<N>, bool)) -> Self {
+        Self { literal, positive }
+    }
+}
+
+/// A disjunction (logical OR) of [`SignedEnvLiteral`]s: one clause of an
+/// [`EnvironmentModel`] CNF.
+///
+/// A clause is satisfied by an environment when at least one of its signed
+/// literals holds; an empty clause is unsatisfiable. This is deliberately a
+/// *different* type from [`CellCondition`], which is a *conjunction* of the
+/// same literals: a disjunction and a conjunction are not interchangeable even
+/// though both range over signed environment literals.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EnvLiteralKind {
-    /// The environment's value for this package exists and matches the given
-    /// version set.
-    Matches(VersionSetId),
-    /// The package is absent from the environment.
-    Absent,
+pub struct EnvClause<N>(Vec<SignedEnvLiteral<N>>);
+
+impl<N> Default for EnvClause<N> {
+    /// The empty disjunction, which no environment satisfies.
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<N> EnvClause<N> {
+    /// Creates a clause (a disjunction) from its signed literals.
+    pub fn new(literals: Vec<SignedEnvLiteral<N>>) -> Self {
+        Self(literals)
+    }
+
+    /// Returns an iterator over the signed literals of the disjunction, in
+    /// order. The clause holds when at least one of them holds.
+    pub fn literals(&self) -> impl ExactSizeIterator<Item = &SignedEnvLiteral<N>> + '_ {
+        self.0.iter()
+    }
+
+    /// The number of literals in the disjunction.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the disjunction has no literals. An empty disjunction is
+    /// unsatisfiable.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<N> FromIterator<SignedEnvLiteral<N>> for EnvClause<N> {
+    fn from_iter<T: IntoIterator<Item = SignedEnvLiteral<N>>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl<N> FromIterator<(EnvLiteral<N>, bool)> for EnvClause<N> {
+    fn from_iter<T: IntoIterator<Item = (EnvLiteral<N>, bool)>>(iter: T) -> Self {
+        Self(iter.into_iter().map(SignedEnvLiteral::from).collect())
+    }
 }
 
 /// A conjunction of signed environment literals.
@@ -138,8 +244,12 @@ pub enum EnvLiteralKind {
 /// appears at most once: the [normalizing constructor](CellCondition::new)
 /// deduplicates repeated literals and rejects a literal supplied with both
 /// signs, so a `CellCondition` can never encode a self-contradiction.
+///
+/// This is a *conjunction*; the disjunction counterpart is [`EnvClause`]. The
+/// two are intentionally distinct types and cannot be substituted for one
+/// another.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CellCondition<N>(Vec<(EnvLiteral<N>, bool)>);
+pub struct CellCondition<N>(Vec<SignedEnvLiteral<N>>);
 
 impl<N> Default for CellCondition<N> {
     /// The empty conjunction, which holds in every environment.
@@ -163,9 +273,10 @@ impl<N> CellCondition<N> {
     }
 
     /// Returns an iterator over the signed environment literals of the
-    /// conjunction, in order. Each `(literal, positive)` pair must hold with
-    /// the given sign for the condition to be satisfied.
-    pub fn literals(&self) -> impl ExactSizeIterator<Item = &(EnvLiteral<N>, bool)> + '_ {
+    /// conjunction, in order. Each literal must hold with its stored sign
+    /// ([`SignedEnvLiteral::positive`], `true` = holds) for the condition to be
+    /// satisfied.
+    pub fn literals(&self) -> impl ExactSizeIterator<Item = &SignedEnvLiteral<N>> + '_ {
         self.0.iter()
     }
 
@@ -183,30 +294,38 @@ impl<N> CellCondition<N> {
     /// at most once, no sign contradiction). The enumerator produces such
     /// literals directly; external callers must use [`CellCondition::new`],
     /// which enforces the invariant.
-    pub(crate) fn from_literals_unchecked(literals: Vec<(EnvLiteral<N>, bool)>) -> Self {
+    pub(crate) fn from_literals_unchecked(literals: Vec<SignedEnvLiteral<N>>) -> Self {
         Self(literals)
     }
 }
 
 impl<N: PartialEq> CellCondition<N> {
     /// Creates a condition from a list of signed environment literals,
-    /// normalizing it: exact duplicate `(literal, sign)` pairs are dropped and
-    /// a literal that occurs with both signs is rejected as
+    /// normalizing it: exact duplicate signed literals are dropped and a
+    /// literal that occurs with both signs is rejected as
     /// [`ContradictoryLiteral`], because no environment can satisfy it.
     ///
     /// This is the entry point for reconstructing conditions from serialized
-    /// data (e.g. a lockfile). The returned condition upholds the invariant
-    /// that every environment literal appears at most once.
-    pub fn new(literals: Vec<(EnvLiteral<N>, bool)>) -> Result<Self, ContradictoryLiteral<N>> {
-        let mut normalized: Vec<(EnvLiteral<N>, bool)> = Vec::with_capacity(literals.len());
-        for (literal, sign) in literals {
-            if let Some((_, existing)) = normalized.iter().find(|(known, _)| *known == literal) {
-                if *existing != sign {
-                    return Err(ContradictoryLiteral { literal });
+    /// data (e.g. a lockfile): deserialize the raw [`SignedEnvLiteral`]s, then
+    /// re-normalize through this constructor rather than deriving
+    /// `Deserialize` on `CellCondition` itself (which would bypass the
+    /// invariant). The returned condition upholds the invariant that every
+    /// environment literal appears at most once.
+    pub fn new(literals: Vec<SignedEnvLiteral<N>>) -> Result<Self, ContradictoryLiteral<N>> {
+        let mut normalized: Vec<SignedEnvLiteral<N>> = Vec::with_capacity(literals.len());
+        for signed in literals {
+            if let Some(existing) = normalized
+                .iter()
+                .find(|known| known.literal == signed.literal)
+            {
+                if existing.positive != signed.positive {
+                    return Err(ContradictoryLiteral {
+                        literal: signed.literal,
+                    });
                 }
                 // Exact duplicate: keep the single existing entry.
             } else {
-                normalized.push((literal, sign));
+                normalized.push(signed);
             }
         }
         Ok(Self(normalized))
@@ -225,25 +344,26 @@ impl<I: Interner> Display for CellConditionDisplay<'_, I> {
         if self.condition.0.is_empty() {
             return write!(f, "<all environments>");
         }
-        for (idx, (literal, positive)) in self.condition.0.iter().enumerate() {
+        for (idx, signed) in self.condition.0.iter().enumerate() {
             if idx > 0 {
                 write!(f, " AND ")?;
             }
-            if !positive {
+            if !signed.positive {
                 write!(f, "not (")?;
             }
-            match literal.kind {
-                EnvLiteralKind::Matches(version_set) => write!(
+            match signed.literal {
+                EnvLiteral::Matches(version_set) => write!(
                     f,
                     "{} in {}",
-                    self.interner.display_name(literal.package),
+                    self.interner
+                        .display_name(self.interner.version_set_name(version_set)),
                     self.interner.display_version_set(version_set)
                 )?,
-                EnvLiteralKind::Absent => {
-                    write!(f, "{} absent", self.interner.display_name(literal.package))?
+                EnvLiteral::Absent(package) => {
+                    write!(f, "{} absent", self.interner.display_name(package))?
                 }
             }
-            if !positive {
+            if !signed.positive {
                 write!(f, ")")?;
             }
         }

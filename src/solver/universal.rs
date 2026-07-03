@@ -21,8 +21,9 @@
 //!
 //! ```ignore
 //! use resolvo::{
-//!     Candidates, DependencyProvider, EnvLiteral, EnvLiteralKind, EnvironmentPackage,
-//!     Solver, UniversalDependencyProvider, UniversalProblem, VersionSetRelation,
+//!     Candidates, DependencyProvider, EnvClause, EnvLiteral, EnvironmentModel,
+//!     EnvironmentPackage, SignedEnvLiteral, Solver, UniversalDependencyProvider,
+//!     UniversalProblem, VersionSetRelation,
 //! };
 //!
 //! // 1. `get_candidates` describes concrete packages only; it never sees an
@@ -74,10 +75,10 @@
 //! //    a CNF over signed environment literals; this one says "cuda is
 //! //    absent, or cuda matches >=11". An empty model means "all
 //! //    environments".
-//! let model = vec![vec![
-//!     (EnvLiteral { package: cuda_name, kind: EnvLiteralKind::Absent }, true),
-//!     (EnvLiteral { package: cuda_name, kind: EnvLiteralKind::Matches(cuda_ge_11) }, true),
-//! ]];
+//! let model = EnvironmentModel::new(vec![EnvClause::new(vec![
+//!     SignedEnvLiteral::new(EnvLiteral::Absent(cuda_name), true),
+//!     SignedEnvLiteral::new(EnvLiteral::Matches(cuda_ge_11), true),
+//! ])]);
 //! let problem = UniversalProblem::new()
 //!     .requirements(requirements)
 //!     .environment_model(model.clone());
@@ -138,9 +139,9 @@
 use std::{any::Any, fmt, marker::PhantomData};
 
 use crate::{
-    CellCondition, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
-    EnvLiteral, EnvLiteralKind, EnvironmentPackage, Interner, KnownDependencies, NameId,
-    PackageCandidates, Presence, Requirement, SolvableId, UniversalDependencyProvider, VariableId,
+    CellCondition, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider, EnvClause,
+    EnvLiteral, EnvironmentPackage, Interner, KnownDependencies, NameId, PackageCandidates,
+    Presence, Requirement, SignedEnvLiteral, SolvableId, UniversalDependencyProvider, VariableId,
     VersionSetId, VersionSetRelation,
     conflict::Conflict,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
@@ -234,11 +235,52 @@ fn is_env_variable<D: DependencyProvider>(state: &SolverState<D>, variable: Vari
     )
 }
 
-/// An environment model: a CNF over signed environment literals. Each inner
-/// `Vec` is a disjunction of `(literal, positive)` pairs; the conjunction of
-/// all disjunctions bounds the environment space a universal solve must
-/// cover. An empty CNF means "all environments".
-pub type EnvironmentModel<N = NameId> = Vec<Vec<(EnvLiteral<N>, bool)>>;
+/// An environment model: a CNF over signed environment literals. It is a
+/// conjunction of [`EnvClause`]s (each a disjunction of [`SignedEnvLiteral`]s)
+/// that together bound the environment space a universal solve must cover. An
+/// empty CNF means "all environments".
+///
+/// This is a newtype rather than a bare `Vec<Vec<_>>` so a CNF model cannot be
+/// confused with the DNF [`Presence`] type or with a single [`CellCondition`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentModel<N = NameId>(Vec<EnvClause<N>>);
+
+impl<N> Default for EnvironmentModel<N> {
+    /// The empty model, which bounds nothing ("all environments").
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<N> EnvironmentModel<N> {
+    /// Creates a model from its clauses (a conjunction of disjunctions).
+    pub fn new(clauses: Vec<EnvClause<N>>) -> Self {
+        Self(clauses)
+    }
+
+    /// Returns an iterator over the model's clauses, in order. The model holds
+    /// in an environment when every clause holds.
+    pub fn clauses(&self) -> impl ExactSizeIterator<Item = &EnvClause<N>> + '_ {
+        self.0.iter()
+    }
+
+    /// The number of clauses in the model.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the model has no clauses, i.e. bounds nothing ("all
+    /// environments").
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<N> FromIterator<EnvClause<N>> for EnvironmentModel<N> {
+    fn from_iter<T: IntoIterator<Item = EnvClause<N>>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
 
 /// Describes a universal resolution problem: requirements and constraints
 /// like a [`crate::Problem`], plus an explicit environment model bounding the
@@ -267,7 +309,7 @@ impl<Id, N> UniversalProblem<Id, N> {
         Self {
             requirements: Vec::new(),
             constraints: Vec::new(),
-            environment_model: Vec::new(),
+            environment_model: EnvironmentModel::new(Vec::new()),
             seed_partition: Vec::new(),
             _marker: PhantomData,
         }
@@ -425,10 +467,7 @@ impl<Id, N> UniversalSolution<Id, N> {
         cells: Vec<Cell<Id, N>>,
         environment_model: EnvironmentModel<N>,
     ) -> Result<Self, InvalidUniversalInput<N>> {
-        if environment_model
-            .iter()
-            .any(|disjunction| disjunction.is_empty())
-        {
+        if environment_model.clauses().any(|clause| clause.is_empty()) {
             return Err(InvalidUniversalInput::EmptyModelDisjunction);
         }
         Ok(Self {
@@ -635,9 +674,13 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         // literal occurs in at least one clause below.
         let mut literals: Vec<EnvLiteral<N>> = Vec::new();
         let cell_literals = self.cells.iter().flat_map(|cell| cell.condition.literals());
-        for (literal, _) in self.environment_model.iter().flatten().chain(cell_literals) {
-            if !literals.contains(literal) {
-                literals.push(literal.clone());
+        let model_literals = self
+            .environment_model
+            .clauses()
+            .flat_map(|clause| clause.literals());
+        for signed in model_literals.chain(cell_literals) {
+            if !literals.contains(&signed.literal) {
+                literals.push(signed.literal);
             }
         }
         let index_of = |literal: &EnvLiteral<N>| {
@@ -655,12 +698,12 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         // an absent literal excludes every matches literal of its package.
         for i in 0..literals.len() {
             for j in i + 1..literals.len() {
-                if literals[i].package != literals[j].package {
+                if literals[i].package(provider) != literals[j].package(provider) {
                     continue;
                 }
-                match (&literals[i].kind, &literals[j].kind) {
-                    (EnvLiteralKind::Matches(vs_i), EnvLiteralKind::Matches(vs_j)) => {
-                        match provider.environment_version_set_relation(*vs_i, *vs_j) {
+                match (literals[i], literals[j]) {
+                    (EnvLiteral::Matches(vs_i), EnvLiteral::Matches(vs_j)) => {
+                        match provider.environment_version_set_relation(vs_i, vs_j) {
                             VersionSetRelation::Disjoint => {
                                 clauses.push(vec![(i, true), (j, true)]);
                             }
@@ -677,11 +720,11 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
                             VersionSetRelation::Unknown => {}
                         }
                     }
-                    (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent)
-                    | (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => {
+                    (EnvLiteral::Matches(_), EnvLiteral::Absent(_))
+                    | (EnvLiteral::Absent(_), EnvLiteral::Matches(_)) => {
                         clauses.push(vec![(i, true), (j, true)]);
                     }
-                    (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => {
+                    (EnvLiteral::Absent(_), EnvLiteral::Absent(_)) => {
                         unreachable!("two absent literals of the same package are equal")
                     }
                 }
@@ -689,11 +732,11 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
         }
 
         // The model clauses.
-        for disjunction in &self.environment_model {
+        for clause in self.environment_model.clauses() {
             clauses.push(
-                disjunction
-                    .iter()
-                    .map(|(literal, positive)| (index_of(literal), !positive))
+                clause
+                    .literals()
+                    .map(|signed| (index_of(&signed.literal), !signed.positive))
                     .collect(),
             );
         }
@@ -705,14 +748,18 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
             clauses.push(
                 cell.condition
                     .literals()
-                    .map(|(literal, sign)| (index_of(literal), *sign))
+                    .map(|signed| (index_of(&signed.literal), signed.positive))
                     .collect(),
             );
         }
 
         let assignment = find_witness_indexed(literals.len(), &clauses)?;
         Some(CellCondition::from_literals_unchecked(
-            literals.into_iter().zip(assignment).collect(),
+            literals
+                .into_iter()
+                .zip(assignment)
+                .map(|(literal, positive)| SignedEnvLiteral::new(literal, positive))
+                .collect(),
         ))
     }
 
@@ -733,7 +780,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
             let matches = cell
                 .condition
                 .literals()
-                .all(|(literal, sign)| eval(literal) == *sign);
+                .all(|signed| eval(&signed.literal) == signed.positive);
             if !matches {
                 continue;
             }
@@ -811,21 +858,7 @@ pub enum InvalidUniversalInput<N = NameId> {
         /// The offending package.
         package: N,
     },
-    /// A [`Matches`](EnvLiteralKind::Matches) literal pairs a package with a
-    /// version set that belongs to a different package: the literal's
-    /// `package` disagrees with
-    /// [`version_set_name`](Interner::version_set_name) of its version set.
-    VersionSetPackageMismatch {
-        /// The input that referenced the literal.
-        source: EnvInputSource,
-        /// The package named by the literal.
-        package: N,
-        /// The version set the literal matches.
-        version_set: VersionSetId,
-        /// The package the version set actually belongs to.
-        version_set_package: N,
-    },
-    /// An [`Absent`](EnvLiteralKind::Absent) literal references an environment
+    /// An [`Absent`](EnvLiteral::Absent) literal references an environment
     /// package declared with `can_be_absent: false`, which therefore has no
     /// absent literal.
     AbsentLiteralForPresentPackage {
@@ -847,16 +880,6 @@ impl<N: fmt::Debug> fmt::Display for InvalidUniversalInput<N> {
                 "the {source} references package {package:?} which is not an environment package; \
                  only packages classified by `UniversalDependencyProvider::environment_package` \
                  may appear there",
-            ),
-            InvalidUniversalInput::VersionSetPackageMismatch {
-                source,
-                package,
-                version_set,
-                version_set_package,
-            } => write!(
-                f,
-                "the {source} pairs package {package:?} with version set {version_set:?}, which \
-                 belongs to package {version_set_package:?}",
             ),
             InvalidUniversalInput::AbsentLiteralForPresentPackage { source, package } => write!(
                 f,
@@ -911,17 +934,17 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// every [`seed_partition`](UniversalProblem::seed_partition) condition
     /// must reference an environment package (one classified by
     /// [`UniversalDependencyProvider::environment_package`](crate::UniversalDependencyProvider::environment_package)),
-    /// a [`Matches`](EnvLiteralKind::Matches) literal's version set must belong
-    /// to the literal's own package, an [`Absent`](EnvLiteralKind::Absent)
-    /// literal requires `can_be_absent: true`, and no model disjunction may be
-    /// empty. See [`InvalidUniversalInput`] for the individual checks.
+    /// an [`Absent`](EnvLiteral::Absent) literal requires `can_be_absent: true`,
+    /// and no model disjunction may be empty. (A [`Matches`](EnvLiteral::Matches)
+    /// literal cannot name a version set of the wrong package: its package is
+    /// derived from the version set, so that mismatch is unrepresentable.) See
+    /// [`InvalidUniversalInput`] for the individual checks.
     ///
     /// ```ignore
     /// // `some_pkg` is a concrete package, not an environment package.
-    /// let model = vec![vec![(
-    ///     EnvLiteral { package: some_pkg, kind: EnvLiteralKind::Absent },
-    ///     true,
-    /// )]];
+    /// let model = EnvironmentModel::new(vec![EnvClause::new(vec![
+    ///     SignedEnvLiteral::new(EnvLiteral::Absent(some_pkg), true),
+    /// ])]);
     /// let problem = UniversalProblem::new().environment_model(model);
     /// let err = solver.solve_universal(problem).unwrap_err();
     /// assert!(matches!(
@@ -1036,51 +1059,44 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         environment_model: &EnvironmentModel<D::NameId>,
         seed_partition: &[CellCondition<D::NameId>],
     ) -> Result<(), InvalidUniversalInput<D::NameId>> {
-        for disjunction in environment_model {
-            if disjunction.is_empty() {
+        for clause in environment_model.clauses() {
+            if clause.is_empty() {
                 return Err(InvalidUniversalInput::EmptyModelDisjunction);
             }
-            for (literal, _positive) in disjunction {
-                self.validate_env_literal(literal, EnvInputSource::EnvironmentModel)?;
+            for signed in clause.literals() {
+                self.validate_env_literal(&signed.literal, EnvInputSource::EnvironmentModel)?;
             }
         }
         for seed in seed_partition {
-            for (literal, _sign) in seed.literals() {
-                self.validate_env_literal(literal, EnvInputSource::SeedPartition)?;
+            for signed in seed.literals() {
+                self.validate_env_literal(&signed.literal, EnvInputSource::SeedPartition)?;
             }
         }
         Ok(())
     }
 
     /// Validates a single environment literal: its package must classify as an
-    /// environment package, a [`Matches`](EnvLiteralKind::Matches) literal's
-    /// version set must belong to that same package, and an
-    /// [`Absent`](EnvLiteralKind::Absent) literal requires the package to be
-    /// declared `can_be_absent: true`. `source` names the input for the error.
+    /// environment package and an [`Absent`](EnvLiteral::Absent) literal
+    /// requires the package to be declared `can_be_absent: true`. A
+    /// [`Matches`](EnvLiteral::Matches) literal derives its package from the
+    /// version set, so it can never reference the wrong package. `source` names
+    /// the input for the error.
     fn validate_env_literal(
         &self,
         literal: &EnvLiteral<D::NameId>,
         source: EnvInputSource,
     ) -> Result<(), InvalidUniversalInput<D::NameId>> {
-        let package = literal.package;
-        match literal.kind {
-            EnvLiteralKind::Matches(version_set) => {
-                // A matches literal must pair its package with a version set of
-                // that same package before we can meaningfully classify it.
-                let version_set_package = self.provider().version_set_name(version_set);
-                if version_set_package != package {
-                    return Err(InvalidUniversalInput::VersionSetPackageMismatch {
-                        source,
-                        package,
-                        version_set,
-                        version_set_package,
-                    });
-                }
+        match *literal {
+            EnvLiteral::Matches(version_set) => {
+                // A matches literal derives its package from the version set, so
+                // it can only ever reference that package; the previously
+                // possible package/version-set mismatch is now unrepresentable.
+                let package = self.provider().version_set_name(version_set);
                 if self.provider().environment_package(package).is_none() {
                     return Err(InvalidUniversalInput::NotAnEnvironmentPackage { source, package });
                 }
             }
-            EnvLiteralKind::Absent => match self.provider().environment_package(package) {
+            EnvLiteral::Absent(package) => match self.provider().environment_package(package) {
                 None => {
                     return Err(InvalidUniversalInput::NotAnEnvironmentPackage { source, package });
                 }
@@ -1598,22 +1614,17 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         &mut self,
         model: &EnvironmentModel<D::NameId>,
     ) -> Result<(), UniversalFailure<D::NameId>> {
-        for disjunction in model {
+        for clause in model.clauses() {
             debug_assert!(
-                !disjunction.is_empty(),
+                !clause.is_empty(),
                 "invariant: empty model disjunctions are rejected by validate_universal_input"
             );
 
-            let mut literals = Vec::with_capacity(disjunction.len());
-            for (env_literal, positive) in disjunction {
-                let variable = match env_literal.kind {
-                    EnvLiteralKind::Matches(version_set) => {
+            let mut literals = Vec::with_capacity(clause.len());
+            for signed in clause.literals() {
+                let variable = match signed.literal {
+                    EnvLiteral::Matches(version_set) => {
                         let package_name = self.cache.provider().version_set_name(version_set);
-                        debug_assert!(
-                            package_name == env_literal.package,
-                            "invariant: version-set/package mismatches are rejected by \
-                             validate_universal_input"
-                        );
                         self.declare_environment_package(package_name, "environment model")?;
                         self.state.intern_env_matches_with_oracle_clauses(
                             self.cache.provider(),
@@ -1622,8 +1633,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             package_name,
                         )
                     }
-                    EnvLiteralKind::Absent => {
-                        let package_name = env_literal.package;
+                    EnvLiteral::Absent(package_name) => {
                         let env_pkg =
                             self.declare_environment_package(package_name, "environment model")?;
                         debug_assert!(
@@ -1635,9 +1645,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             .intern_env_absent_with_oracle_clauses(package_name)
                     }
                 };
-                // A positive model literal asserts the variable, a negative
-                // one its negation.
-                literals.push(Literal::new(variable, !positive));
+                // A positive model literal (`positive`, the public "holds"
+                // convention) asserts the variable; a negative one asserts its
+                // negation. This `!` is the sole boundary flip between the
+                // public sign and the solver's internal `Literal` negate flag.
+                literals.push(Literal::new(variable, !signed.positive));
             }
             self.state.add_env_clause(literals, EnvClauseKind::Model);
         }
@@ -1709,15 +1721,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // interning emits oracle consistency clauses, whose watch
         // initialization assumes the involved variables are undecided.
         let mut assumptions = Vec::with_capacity(seed.len());
-        for (env_literal, sign) in seed.literals() {
-            let variable = match env_literal.kind {
-                EnvLiteralKind::Matches(version_set) => {
+        for signed in seed.literals() {
+            let variable = match signed.literal {
+                EnvLiteral::Matches(version_set) => {
                     let package_name = self.cache.provider().version_set_name(version_set);
-                    debug_assert!(
-                        package_name == env_literal.package,
-                        "invariant: version-set/package mismatches are rejected by \
-                         validate_universal_input"
-                    );
                     self.declare_environment_package(package_name, "seed partition")?;
                     self.state.intern_env_matches_with_oracle_clauses(
                         self.cache.provider(),
@@ -1726,8 +1733,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         package_name,
                     )
                 }
-                EnvLiteralKind::Absent => {
-                    let package_name = env_literal.package;
+                EnvLiteral::Absent(package_name) => {
                     let env_pkg =
                         self.declare_environment_package(package_name, "seed partition")?;
                     debug_assert!(
@@ -1739,7 +1745,9 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         .intern_env_absent_with_oracle_clauses(package_name)
                 }
             };
-            assumptions.push((variable, *sign));
+            // The public `positive` sign is the assumption's decision value
+            // directly (`true` = the literal holds); no negation flip here.
+            assumptions.push((variable, signed.positive));
         }
 
         // Push each assumption as a decision at its own level, derived from
@@ -2151,21 +2159,15 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Converts a cell in solver variable space to the public
     /// [`CellCondition`] representation via the variable origins.
     fn cell_to_condition(&self, cell: &[(VariableId, bool)]) -> CellCondition<D::NameId> {
-        let mut literals: Vec<(EnvLiteral<D::NameId>, bool)> = cell
+        let mut literals: Vec<SignedEnvLiteral<D::NameId>> = cell
             .iter()
             .map(|&(variable, value)| {
                 let literal = match self.state.variable_map.origin(variable) {
-                    VariableOrigin::EnvMatches(version_set) => EnvLiteral {
-                        package: self.provider().version_set_name(version_set),
-                        kind: EnvLiteralKind::Matches(version_set),
-                    },
-                    VariableOrigin::EnvAbsent(package) => EnvLiteral {
-                        package,
-                        kind: EnvLiteralKind::Absent,
-                    },
+                    VariableOrigin::EnvMatches(version_set) => EnvLiteral::Matches(version_set),
+                    VariableOrigin::EnvAbsent(package) => EnvLiteral::Absent(package),
                     _ => unreachable!("cell literals are always environment literal variables"),
                 };
-                (literal, value)
+                SignedEnvLiteral::new(literal, value)
             })
             .collect();
 
@@ -2176,19 +2178,19 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // through different seed partitions would render differently. The
         // ids used here come from the dependency provider and are stable
         // across solves.
-        literals.sort_by(|(a, _), (b, _)| {
+        literals.sort_by(|a, b| {
             use std::cmp::Ordering;
-            match (&a.kind, &b.kind) {
-                (EnvLiteralKind::Matches(vs_a), EnvLiteralKind::Matches(vs_b)) => {
+            match (a.literal, b.literal) {
+                (EnvLiteral::Matches(vs_a), EnvLiteral::Matches(vs_b)) => {
                     vs_a.to_index().cmp(&vs_b.to_index())
                 }
-                (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent) => Ordering::Less,
-                (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => Ordering::Greater,
-                (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => self
+                (EnvLiteral::Matches(_), EnvLiteral::Absent(_)) => Ordering::Less,
+                (EnvLiteral::Absent(_), EnvLiteral::Matches(_)) => Ordering::Greater,
+                (EnvLiteral::Absent(name_a), EnvLiteral::Absent(name_b)) => self
                     .provider()
-                    .display_name(a.package)
+                    .display_name(name_a)
                     .to_string()
-                    .cmp(&self.provider().display_name(b.package).to_string()),
+                    .cmp(&self.provider().display_name(name_b).to_string()),
             }
         });
 
@@ -2278,20 +2280,22 @@ where
     D: UniversalDependencyProvider + Interner<NameId = N>,
 {
     let mut unknown_involved = false;
-    for (lit_a, sign_a) in a.literals() {
-        for (lit_b, sign_b) in b.literals() {
-            if lit_a == lit_b {
-                if sign_a != sign_b {
+    for sa in a.literals() {
+        for sb in b.literals() {
+            if sa.literal == sb.literal {
+                if sa.positive != sb.positive {
                     return Disjointness::Disjoint;
                 }
                 continue;
             }
-            if !(*sign_a && *sign_b) || lit_a.package != lit_b.package {
+            if !(sa.positive && sb.positive)
+                || sa.literal.package(provider) != sb.literal.package(provider)
+            {
                 continue;
             }
-            match (&lit_a.kind, &lit_b.kind) {
-                (EnvLiteralKind::Matches(vs_a), EnvLiteralKind::Matches(vs_b)) => {
-                    match provider.environment_version_set_relation(*vs_a, *vs_b) {
+            match (sa.literal, sb.literal) {
+                (EnvLiteral::Matches(vs_a), EnvLiteral::Matches(vs_b)) => {
+                    match provider.environment_version_set_relation(vs_a, vs_b) {
                         VersionSetRelation::Disjoint => return Disjointness::Disjoint,
                         VersionSetRelation::Unknown => unknown_involved = true,
                         VersionSetRelation::Subset
@@ -2299,11 +2303,11 @@ where
                         | VersionSetRelation::Equal => {}
                     }
                 }
-                (EnvLiteralKind::Matches(_), EnvLiteralKind::Absent)
-                | (EnvLiteralKind::Absent, EnvLiteralKind::Matches(_)) => {
+                (EnvLiteral::Matches(_), EnvLiteral::Absent(_))
+                | (EnvLiteral::Absent(_), EnvLiteral::Matches(_)) => {
                     return Disjointness::Disjoint;
                 }
-                (EnvLiteralKind::Absent, EnvLiteralKind::Absent) => {
+                (EnvLiteral::Absent(_), EnvLiteral::Absent(_)) => {
                     unreachable!("two absent literals of the same package are equal")
                 }
             }
@@ -2364,9 +2368,9 @@ fn merge_disjunct_pair<N: Copy + Eq>(
         return None;
     }
     let mut differing = None;
-    for (index, (literal, sign)) in a.literals().enumerate() {
-        let (_, b_sign) = b.literals().find(|(b_literal, _)| b_literal == literal)?;
-        if sign != b_sign {
+    for (index, sa) in a.literals().enumerate() {
+        let sb = b.literals().find(|sb| sb.literal == sa.literal)?;
+        if sa.positive != sb.positive {
             if differing.is_some() {
                 return None;
             }
@@ -2381,7 +2385,7 @@ fn merge_disjunct_pair<N: Copy + Eq>(
             .literals()
             .enumerate()
             .filter(|&(index, _)| index != drop_index)
-            .map(|(_, literal)| literal.clone())
+            .map(|(_, signed)| *signed)
             .collect(),
     };
     Some(CellCondition::from_literals_unchecked(merged))
@@ -2631,7 +2635,6 @@ mod test {
         provider.add_env_package("glibc", false);
         let glibc_217 = provider.version_set("glibc", 217, 1000);
         let glibc_228 = provider.version_set("glibc", 228, 1000);
-        let glibc_name = provider.pool.intern_package_name("glibc");
         let pkg_2 = provider.add_package("pkg", 2);
         let pkg_1 = provider.add_package("pkg", 1);
         provider.set_dependencies(pkg_2, vec![glibc_228.into()], vec![]);
@@ -2641,13 +2644,9 @@ mod test {
         let mut solver = Solver::new(provider);
         let problem = UniversalProblem::new()
             .requirements(vec![pkg_any.into()])
-            .environment_model(vec![vec![(
-                EnvLiteral {
-                    package: glibc_name,
-                    kind: EnvLiteralKind::Matches(glibc_217),
-                },
-                true,
-            )]]);
+            .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(EnvLiteral::Matches(glibc_217), true),
+            ])]));
         let solution = solver.solve_universal(problem).expect("solvable");
 
         insta::assert_snapshot!(cells_to_string(&solver, &solution), @r"
@@ -2672,22 +2671,10 @@ mod test {
         let mut solver = Solver::new(provider);
         let problem = UniversalProblem::new()
             .requirements(vec![a_any.into()])
-            .environment_model(vec![vec![
-                (
-                    EnvLiteral {
-                        package: cuda_name,
-                        kind: EnvLiteralKind::Absent,
-                    },
-                    true,
-                ),
-                (
-                    EnvLiteral {
-                        package: cuda_name,
-                        kind: EnvLiteralKind::Matches(cuda_11),
-                    },
-                    true,
-                ),
-            ]]);
+            .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(EnvLiteral::Absent(cuda_name), true),
+                SignedEnvLiteral::new(EnvLiteral::Matches(cuda_11), true),
+            ])]));
         let solution = solver.solve_universal(problem).expect("solvable");
 
         insta::assert_snapshot!(cells_to_string(&solver, &solution), @r"
@@ -2705,7 +2692,6 @@ mod test {
         provider.add_env_package("glibc", false);
         let glibc_217 = provider.version_set("glibc", 217, 1000);
         let glibc_228 = provider.version_set("glibc", 228, 1000);
-        let glibc_name = provider.pool.intern_package_name("glibc");
         let pkg_2 = provider.add_package("pkg", 2);
         let pkg_1 = provider.add_package("pkg", 1);
         provider.set_dependencies(pkg_2, vec![glibc_228.into()], vec![]);
@@ -2715,13 +2701,9 @@ mod test {
         let mut solver = Solver::new(provider);
         let problem = UniversalProblem::new()
             .requirements(vec![pkg_any.into()])
-            .environment_model(vec![vec![(
-                EnvLiteral {
-                    package: glibc_name,
-                    kind: EnvLiteralKind::Matches(glibc_217),
-                },
-                true,
-            )]]);
+            .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(EnvLiteral::Matches(glibc_217), true),
+            ])]));
         let solution = solver.solve_universal(problem).expect("solvable");
 
         assert_eq!(solution.verify(solver.provider()), Ok(()));
@@ -2740,25 +2722,19 @@ mod test {
         let cuda_11 = provider.version_set("cuda", 11, 100);
         let cuda_name = provider.pool.intern_package_name("cuda");
         let a = provider.add_package("a", 1);
-        let matches_lit = EnvLiteral {
-            package: cuda_name,
-            kind: EnvLiteralKind::Matches(cuda_11),
-        };
-        let absent_lit = EnvLiteral {
-            package: cuda_name,
-            kind: EnvLiteralKind::Absent,
-        };
+        let matches_lit = EnvLiteral::Matches(cuda_11);
+        let absent_lit = EnvLiteral::Absent(cuda_name);
 
         let solution: UniversalSolution = UniversalSolution::from_cells(
             vec![Cell::new(
-                CellCondition::new(vec![(absent_lit.clone(), true)]).unwrap(),
+                CellCondition::new(vec![SignedEnvLiteral::new(absent_lit, true)]).unwrap(),
                 vec![a],
                 vec![],
             )],
-            vec![vec![
-                (matches_lit.clone(), true),
-                (absent_lit.clone(), true),
-            ]],
+            EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(matches_lit, true),
+                SignedEnvLiteral::new(absent_lit, true),
+            ])]),
         )
         .unwrap();
 
@@ -2766,8 +2742,8 @@ mod test {
             solution.verify(&provider),
             Err(vec![Violation::UncoveredRegion(
                 CellCondition::from_literals_unchecked(vec![
-                    (matches_lit, true),
-                    (absent_lit, false),
+                    SignedEnvLiteral::new(matches_lit, true),
+                    SignedEnvLiteral::new(absent_lit, false),
                 ])
             )])
         );
@@ -2782,7 +2758,6 @@ mod test {
         let mut provider = EnvTestProvider::default();
         provider.add_env_package("cuda", true);
         let cuda_11 = provider.version_set("cuda", 11, 100);
-        let cuda_name = provider.pool.intern_package_name("cuda");
         let a1 = provider.add_package("a", 1);
         let a2 = provider.add_package("a", 2);
 
@@ -2790,11 +2765,8 @@ mod test {
             vec![
                 Cell::new(CellCondition::default(), vec![a1], vec![]),
                 Cell::new(
-                    CellCondition::new(vec![(
-                        EnvLiteral {
-                            package: cuda_name,
-                            kind: EnvLiteralKind::Matches(cuda_11),
-                        },
+                    CellCondition::new(vec![SignedEnvLiteral::new(
+                        EnvLiteral::Matches(cuda_11),
                         true,
                     )])
                     .unwrap(),
@@ -2802,7 +2774,7 @@ mod test {
                     vec![],
                 ),
             ],
-            vec![],
+            EnvironmentModel::default(),
         )
         .unwrap();
 
@@ -2825,32 +2797,28 @@ mod test {
         provider.add_env_package("cuda", true);
         let cuda_0_5 = provider.version_set("cuda", 0, 5);
         let cuda_3_8 = provider.version_set("cuda", 3, 8);
-        let cuda_name = provider.pool.intern_package_name("cuda");
         let a1 = provider.add_package("a", 1);
         let a2 = provider.add_package("a", 2);
-        let lit_0_5 = EnvLiteral {
-            package: cuda_name,
-            kind: EnvLiteralKind::Matches(cuda_0_5),
-        };
-        let lit_3_8 = EnvLiteral {
-            package: cuda_name,
-            kind: EnvLiteralKind::Matches(cuda_3_8),
-        };
+        let lit_0_5 = EnvLiteral::Matches(cuda_0_5);
+        let lit_3_8 = EnvLiteral::Matches(cuda_3_8);
 
         let solution: UniversalSolution = UniversalSolution::from_cells(
             vec![
                 Cell::new(
-                    CellCondition::new(vec![(lit_0_5.clone(), true)]).unwrap(),
+                    CellCondition::new(vec![SignedEnvLiteral::new(lit_0_5, true)]).unwrap(),
                     vec![a1],
                     vec![],
                 ),
                 Cell::new(
-                    CellCondition::new(vec![(lit_3_8.clone(), true)]).unwrap(),
+                    CellCondition::new(vec![SignedEnvLiteral::new(lit_3_8, true)]).unwrap(),
                     vec![a2],
                     vec![],
                 ),
             ],
-            vec![vec![(lit_0_5, true), (lit_3_8, true)]],
+            EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(lit_0_5, true),
+                SignedEnvLiteral::new(lit_3_8, true),
+            ])]),
         )
         .unwrap();
 
@@ -2870,18 +2838,14 @@ mod test {
         let mut provider = EnvTestProvider::default();
         provider.add_env_package("cuda", true);
         let cuda_11 = provider.version_set("cuda", 11, 100);
-        let cuda_name = provider.pool.intern_package_name("cuda");
         let a = provider.add_package("a", 1);
 
         let solution: UniversalSolution = UniversalSolution::from_cells(
             vec![
                 Cell::new(CellCondition::default(), vec![a], vec![]),
                 Cell::new(
-                    CellCondition::new(vec![(
-                        EnvLiteral {
-                            package: cuda_name,
-                            kind: EnvLiteralKind::Matches(cuda_11),
-                        },
+                    CellCondition::new(vec![SignedEnvLiteral::new(
+                        EnvLiteral::Matches(cuda_11),
                         true,
                     )])
                     .unwrap(),
@@ -2889,7 +2853,7 @@ mod test {
                     vec![],
                 ),
             ],
-            vec![],
+            EnvironmentModel::default(),
         )
         .unwrap();
 
@@ -2906,32 +2870,28 @@ mod test {
         provider.add_env_package("cuda", true);
         let cuda_0_2 = provider.version_set("cuda", 0, 2);
         let cuda_5_9 = provider.version_set("cuda", 5, 9);
-        let cuda_name = provider.pool.intern_package_name("cuda");
         let a1 = provider.add_package("a", 1);
         let a2 = provider.add_package("a", 2);
-        let lit_0_2 = EnvLiteral {
-            package: cuda_name,
-            kind: EnvLiteralKind::Matches(cuda_0_2),
-        };
-        let lit_5_9 = EnvLiteral {
-            package: cuda_name,
-            kind: EnvLiteralKind::Matches(cuda_5_9),
-        };
+        let lit_0_2 = EnvLiteral::Matches(cuda_0_2);
+        let lit_5_9 = EnvLiteral::Matches(cuda_5_9);
 
         let solution: UniversalSolution = UniversalSolution::from_cells(
             vec![
                 Cell::new(
-                    CellCondition::new(vec![(lit_0_2.clone(), true)]).unwrap(),
+                    CellCondition::new(vec![SignedEnvLiteral::new(lit_0_2, true)]).unwrap(),
                     vec![a1],
                     vec![],
                 ),
                 Cell::new(
-                    CellCondition::new(vec![(lit_5_9.clone(), true)]).unwrap(),
+                    CellCondition::new(vec![SignedEnvLiteral::new(lit_5_9, true)]).unwrap(),
                     vec![a2],
                     vec![],
                 ),
             ],
-            vec![vec![(lit_0_2, true), (lit_5_9, true)]],
+            EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(lit_0_2, true),
+                SignedEnvLiteral::new(lit_5_9, true),
+            ])]),
         )
         .unwrap();
 
@@ -2948,7 +2908,6 @@ mod test {
         provider.add_env_package("glibc", false);
         let glibc_217 = provider.version_set("glibc", 217, 1000);
         let glibc_228 = provider.version_set("glibc", 228, 1000);
-        let glibc_name = provider.pool.intern_package_name("glibc");
         let pkg_2 = provider.add_package("pkg", 2);
         let pkg_1 = provider.add_package("pkg", 1);
         provider.set_dependencies(pkg_2, vec![glibc_228.into()], vec![]);
@@ -2958,23 +2917,19 @@ mod test {
         let mut solver = Solver::new(provider);
         let problem = UniversalProblem::new()
             .requirements(vec![pkg_any.into()])
-            .environment_model(vec![vec![(
-                EnvLiteral {
-                    package: glibc_name,
-                    kind: EnvLiteralKind::Matches(glibc_217),
-                },
-                true,
-            )]]);
+            .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(EnvLiteral::Matches(glibc_217), true),
+            ])]));
         let solution = solver.solve_universal(problem).expect("solvable");
 
         let provider = solver.provider();
         let eval_for = |glibc_version: u32| {
-            move |literal: &EnvLiteral<NameId>| match literal.kind {
-                EnvLiteralKind::Matches(version_set) => provider
+            move |literal: &EnvLiteral<NameId>| match *literal {
+                EnvLiteral::Matches(version_set) => provider
                     .pool
                     .resolve_version_set(version_set)
                     .contains(glibc_version),
-                EnvLiteralKind::Absent => false,
+                EnvLiteral::Absent(_) => false,
             }
         };
 
@@ -2999,7 +2954,7 @@ mod test {
                 Cell::new(CellCondition::default(), vec![a1], vec![]),
                 Cell::new(CellCondition::default(), vec![a2], vec![]),
             ],
-            vec![],
+            EnvironmentModel::default(),
         )
         .unwrap();
 
@@ -3009,10 +2964,7 @@ mod test {
     /// Helper for the simplification unit tests: a matches literal for
     /// version set index `vs` of a single shared package.
     fn env_lit(vs: usize) -> EnvLiteral<NameId> {
-        EnvLiteral {
-            package: NameId::from_index(0),
-            kind: EnvLiteralKind::Matches(VersionSetId::from_index(vs)),
-        }
+        EnvLiteral::Matches(VersionSetId::from_index(vs))
     }
 
     /// Helper for the simplification unit tests: a conjunction of signed
@@ -3021,7 +2973,7 @@ mod test {
         CellCondition::from_literals_unchecked(
             literals
                 .iter()
-                .map(|&(vs, sign)| (env_lit(vs), sign))
+                .map(|&(vs, sign)| SignedEnvLiteral::new(env_lit(vs), sign))
                 .collect(),
         )
     }

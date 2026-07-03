@@ -6,9 +6,10 @@ use bundle_box::{BundleBoxProvider, Pack};
 use insta::assert_snapshot;
 use itertools::Itertools;
 use resolvo::{
-    CellCondition, ConditionalRequirement, DependencyProvider, EnvInputSource, EnvLiteral,
-    EnvLiteralKind, Interner, InvalidUniversalInput, NameId, Problem, SolvableId, Solver,
-    UniversalFailure, UniversalProblem, UniversalSolution, UnsolvableOrCancelled, VersionSetId,
+    CellCondition, ConditionalRequirement, DependencyProvider, EnvClause, EnvInputSource,
+    EnvLiteral, EnvironmentModel, Interner, InvalidUniversalInput, NameId, Problem,
+    SignedEnvLiteral, SolvableId, Solver, UniversalFailure, UniversalProblem, UniversalSolution,
+    UnsolvableOrCancelled, VersionSetId,
 };
 use tracing_test::traced_test;
 
@@ -2291,28 +2292,19 @@ fn test_env_encoding_under_async_runtime() {
 /// [`universal_solve_snapshot`]. `"cuda absent"` is the absent literal,
 /// anything else is parsed as a [`Spec`] (e.g. `"cuda 11..100"`). A
 /// `"not "` prefix negates the literal.
-fn parse_env_literal(
-    provider: &mut BundleBoxProvider,
-    literal: &str,
-) -> (EnvLiteral<NameId>, bool) {
+fn parse_env_literal(provider: &mut BundleBoxProvider, literal: &str) -> SignedEnvLiteral<NameId> {
     let (literal, positive) = match literal.strip_prefix("not ") {
         Some(rest) => (rest, false),
         None => (literal, true),
     };
     let env_literal = match literal.strip_suffix(" absent") {
-        Some(name) => EnvLiteral {
-            package: provider.pool.intern_package_name(name),
-            kind: EnvLiteralKind::Absent,
-        },
+        Some(name) => EnvLiteral::Absent(provider.pool.intern_package_name(name)),
         None => {
             let version_set = provider.version_sets(&[literal])[0];
-            EnvLiteral {
-                package: provider.version_set_name(version_set),
-                kind: EnvLiteralKind::Matches(version_set),
-            }
+            EnvLiteral::Matches(version_set)
         }
     };
-    (env_literal, positive)
+    SignedEnvLiteral::new(env_literal, positive)
 }
 
 /// Runs a universal solve and formats the resulting cell partition (or the
@@ -2993,38 +2985,10 @@ fn test_universal_model_rejects_empty_disjunction() {
     ));
 }
 
-/// A [`EnvLiteralKind::Matches`] literal whose version set belongs to a
-/// different package than the literal names surfaces as
-/// [`InvalidUniversalInput::VersionSetPackageMismatch`], before any solving.
-#[test]
-fn test_universal_model_rejects_version_set_package_mismatch() {
-    let mut provider = BundleBoxProvider::new();
-    provider.add_environment_package("cuda", true);
-    provider.add_environment_package("rocm", true);
-
-    // Build a literal that claims to be about `cuda` but carries a version set
-    // interned for `rocm`.
-    let rocm_version_set = provider.version_sets(&["rocm 1..2"])[0];
-    let cuda = provider.package_name("cuda");
-    let mismatched = EnvLiteral {
-        package: cuda,
-        kind: EnvLiteralKind::Matches(rocm_version_set),
-    };
-    let model = vec![vec![(mismatched, true)]];
-
-    let mut solver = Solver::new(provider);
-    let problem = UniversalProblem::new().environment_model(model);
-    let failure = solver
-        .solve_universal(problem)
-        .expect_err("expected the solve to fail");
-    assert!(matches!(
-        failure,
-        UniversalFailure::InvalidInput(InvalidUniversalInput::VersionSetPackageMismatch {
-            source: EnvInputSource::EnvironmentModel,
-            ..
-        })
-    ));
-}
+// A former test that a `Matches` literal naming a version set of the wrong
+// package is rejected as `VersionSetPackageMismatch` was removed: the
+// `EnvLiteral::Matches` variant derives its package from the version set, so
+// that mismatch is now unrepresentable at the type level.
 
 // ===========================================================================
 // M4: Seeded partition (assumptions)
@@ -3114,7 +3078,7 @@ fn universal_resolve_with_own_cells(
     UniversalSolution,
 ) {
     let requirements = provider.requirements(specs);
-    let environment_model: Vec<Vec<(EnvLiteral<NameId>, bool)>> = model
+    let environment_model: EnvironmentModel<NameId> = model
         .iter()
         .map(|disjunction| {
             disjunction
@@ -3237,33 +3201,10 @@ fn test_universal_seed_rejects_absent_literal_for_present_package() {
     ));
 }
 
-/// A seed literal pairing a package with another package's version set is a
-/// caller error, surfaced as
-/// [`InvalidUniversalInput::VersionSetPackageMismatch`].
-#[test]
-fn test_universal_seed_rejects_version_set_package_mismatch() {
-    let mut provider = BundleBoxProvider::new();
-    provider.add_environment_package("cuda", true);
-    provider.add_environment_package("rocm", true);
-
-    let rocm_version_set = provider.version_sets(&["rocm 1..2"])[0];
-    let cuda = provider.package_name("cuda");
-    let mismatched = EnvLiteral {
-        package: cuda,
-        kind: EnvLiteralKind::Matches(rocm_version_set),
-    };
-    let seed = CellCondition::new(vec![(mismatched, true)]).unwrap();
-    let (_solver, result) = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
-    assert!(matches!(
-        result,
-        Err(UniversalFailure::InvalidInput(
-            InvalidUniversalInput::VersionSetPackageMismatch {
-                source: EnvInputSource::SeedPartition,
-                ..
-            }
-        ))
-    ));
-}
+// A former test that a seed `Matches` literal naming a version set of the
+// wrong package is rejected as `VersionSetPackageMismatch` was removed:
+// `EnvLiteral::Matches` derives its package from the version set, so that
+// mismatch is unrepresentable.
 
 /// Assumption-boundary case named by the design doc: a conflict at exactly
 /// level n+1, the root install level of a seeded solve. The seed
@@ -3283,10 +3224,10 @@ fn test_universal_seed_conflict_at_level_n_plus_one_drops_seed() {
     provider.add_package("b", Pack::new(1), &[], &[]);
 
     let requirements = provider.requirements(&["a"]);
-    let model = vec![vec![
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![
         parse_env_literal(&mut provider, "cuda absent"),
         parse_env_literal(&mut provider, "cuda 11..100"),
-    ]];
+    ])]);
     let seed = CellCondition::new(vec![
         parse_env_literal(&mut provider, "not cuda absent"),
         parse_env_literal(&mut provider, "not cuda 11..100"),
@@ -3384,7 +3325,10 @@ fn test_universal_seed_order_changes_generalization() {
     provider.add_package("pkg", Pack::new(1), &["glibc 217..1000"], &[]);
 
     let requirements = provider.requirements(&["pkg"]);
-    let model = vec![vec![parse_env_literal(&mut provider, "glibc 217..1000")]];
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![parse_env_literal(
+        &mut provider,
+        "glibc 217..1000",
+    )])]);
     let seeds = vec![
         CellCondition::new(vec![
             parse_env_literal(&mut provider, "glibc 217..1000"),
@@ -3431,10 +3375,10 @@ fn test_universal_invalidated_seed_dropped_region_reenumerated() {
     provider.add_package("a", Pack::new(1), &[], &["cuda 12..100"]);
 
     let requirements = provider.requirements(&["a"]);
-    let model = vec![vec![
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![
         parse_env_literal(&mut provider, "cuda absent"),
         parse_env_literal(&mut provider, "cuda 12..100"),
-    ]];
+    ])]);
     let seeds = vec![
         CellCondition::new(vec![parse_env_literal(&mut provider, "cuda absent")]).unwrap(),
         CellCondition::new(vec![
@@ -3509,7 +3453,10 @@ fn test_universal_stale_seed_heals_to_general_cell() {
     provider.add_package("a", Pack::new(1), &["cuda 12..100"], &[]);
 
     let requirements = provider.requirements(&["a"]);
-    let model = vec![vec![parse_env_literal(&mut provider, "cuda 12..100")]];
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![parse_env_literal(
+        &mut provider,
+        "cuda 12..100",
+    )])]);
     let seed = CellCondition::new(vec![
         parse_env_literal(&mut provider, "cuda 12..100"),
         parse_env_literal(&mut provider, "rocm 5..10"),
@@ -3545,8 +3492,8 @@ fn test_universal_self_contradictory_condition_rejected() {
 
     let positive = parse_env_literal(&mut provider, "cuda 11..100");
     let negative = parse_env_literal(&mut provider, "not cuda 11..100");
-    let err = CellCondition::new(vec![positive.clone(), negative]).unwrap_err();
-    assert_eq!(err.literal, positive.0);
+    let err = CellCondition::new(vec![positive, negative]).unwrap_err();
+    assert_eq!(err.literal, positive.literal);
 }
 
 /// Multiple constraints from different parents on the same package.
@@ -3955,19 +3902,15 @@ fn test_snapshot_universal_mode_enumerates_cells() {
     use resolvo::DenseIndex;
 
     let snapshot = environment_snapshot();
-    let name_glibc = NameId::from_index(1);
     let glibc_ge2 = VersionSetId::from_index(0);
 
     let mut provider = snapshot.provider();
     let req = provider.add_package_requirement(NameId::from_index(0), "*");
     let mut solver = Solver::new(provider);
-    let model = vec![vec![(
-        EnvLiteral {
-            package: name_glibc,
-            kind: EnvLiteralKind::Matches(glibc_ge2),
-        },
+    let model = EnvironmentModel::new(vec![EnvClause::new(vec![SignedEnvLiteral::new(
+        EnvLiteral::Matches(glibc_ge2),
         true,
-    )]];
+    )])]);
     let problem = UniversalProblem::new()
         .requirements(vec![req.into()])
         .environment_model(model);
@@ -3999,7 +3942,7 @@ fn test_snapshot_universal_mode_enumerates_cells() {
     // Projection onto simulated machines: glibc 2.x matches only `>=2`,
     // glibc 3.x matches both literals.
     let machine_2 = solution
-        .project(|literal| literal.kind == EnvLiteralKind::Matches(glibc_ge2))
+        .project(|literal| *literal == EnvLiteral::Matches(glibc_ge2))
         .expect("a cell covers glibc 2.x machines");
     assert_eq!(machine_2, &[SolvableId::from_index(1)]);
     let machine_3 = solution
@@ -4139,16 +4082,16 @@ fn test_universal_env_literals_decided_last() {
     provider.add_package("c8", Pack::new(1), &[], &[]);
 
     let requirements = provider.requirements(&["v", "w", "c1"]);
-    let environment_model = vec![
-        vec![
+    let environment_model = EnvironmentModel::new(vec![
+        EnvClause::new(vec![
             parse_env_literal(&mut provider, "osver 1..2"),
             parse_env_literal(&mut provider, "osver 2..3"),
-        ],
-        vec![
+        ]),
+        EnvClause::new(vec![
             parse_env_literal(&mut provider, "arch 1..2"),
             parse_env_literal(&mut provider, "arch 2..3"),
-        ],
-    ];
+        ]),
+    ]);
 
     let mut solver = Solver::new(provider);
     let solution = solver
@@ -4237,10 +4180,10 @@ fn test_universal_refutation_switch_trips_and_keeps_verdict() {
     }
 
     let requirements = provider.requirements(&["v", "a", "b"]);
-    let environment_model = vec![vec![
+    let environment_model = EnvironmentModel::new(vec![EnvClause::new(vec![
         parse_env_literal(&mut provider, "cuda absent"),
         parse_env_literal(&mut provider, "cuda 11..100"),
-    ]];
+    ])]);
 
     let mut solver = Solver::new(provider);
     solver.set_env_ordering_conflict_limit(2);
@@ -4285,10 +4228,10 @@ fn test_universal_refutation_switch_work_deadline_restarts() {
     }
 
     let requirements = provider.requirements(&["v", "a", "b"]);
-    let environment_model = vec![vec![
+    let environment_model = EnvironmentModel::new(vec![EnvClause::new(vec![
         parse_env_literal(&mut provider, "cuda absent"),
         parse_env_literal(&mut provider, "cuda 11..100"),
-    ]];
+    ])]);
 
     let mut solver = Solver::new(provider);
     solver.set_env_ordering_conflict_limit(u64::MAX);

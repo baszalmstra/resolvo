@@ -30,9 +30,9 @@
 //! [`EnvTestProvider`], which is deliberately `cfg(test)`-private.
 
 use crate::{
-    CellCondition, Condition, ConditionId, ConditionalRequirement, EnvLiteral, EnvLiteralKind,
-    LogicalOperator, NameId, Solver, UniversalFailure, UniversalProblem, Violation,
-    solver::env_test_provider::EnvTestProvider,
+    CellCondition, Condition, ConditionId, ConditionalRequirement, EnvClause, EnvLiteral,
+    EnvironmentModel, LogicalOperator, NameId, SignedEnvLiteral, Solver, UniversalFailure,
+    UniversalProblem, Violation, solver::env_test_provider::EnvTestProvider,
 };
 
 /// Number of seeds to run. Tuned so that the whole test finishes within a few
@@ -430,7 +430,7 @@ fn intern_condition(provider: &EnvTestProvider, condition: &GenCondition) -> Con
 fn build_environment_model(
     provider: &EnvTestProvider,
     universe: &Universe,
-) -> Vec<Vec<(EnvLiteral<NameId>, bool)>> {
+) -> EnvironmentModel<NameId> {
     universe
         .model
         .iter()
@@ -445,23 +445,14 @@ fn build_environment_model(
                         positive,
                     } => {
                         let version_set = provider.version_set(&env_name(pkg), lo, hi);
-                        (
-                            EnvLiteral {
-                                package: provider.pool.intern_package_name(env_name(pkg)),
-                                kind: EnvLiteralKind::Matches(version_set),
-                            },
-                            positive,
-                        )
+                        SignedEnvLiteral::new(EnvLiteral::Matches(version_set), positive)
                     }
-                    GenModelLiteral::Absent { pkg, positive } => (
-                        EnvLiteral {
-                            package: provider.pool.intern_package_name(env_name(pkg)),
-                            kind: EnvLiteralKind::Absent,
-                        },
+                    GenModelLiteral::Absent { pkg, positive } => SignedEnvLiteral::new(
+                        EnvLiteral::Absent(provider.pool.intern_package_name(env_name(pkg))),
                         positive,
                     ),
                 })
-                .collect()
+                .collect::<EnvClause<NameId>>()
         })
         .collect()
 }
@@ -589,16 +580,16 @@ fn eval_env_literal(
 ) -> bool {
     let index = env_name_ids
         .iter()
-        .position(|&name| name == literal.package)
+        .position(|&name| name == literal.package(provider))
         .expect("environment literal references a generated environment package");
-    match literal.kind {
-        EnvLiteralKind::Matches(version_set) => env[index].is_some_and(|value| {
+    match *literal {
+        EnvLiteral::Matches(version_set) => env[index].is_some_and(|value| {
             provider
                 .pool
                 .resolve_version_set(version_set)
                 .contains(value)
         }),
-        EnvLiteralKind::Absent => env[index].is_none(),
+        EnvLiteral::Absent(_) => env[index].is_none(),
     }
 }
 
@@ -608,9 +599,9 @@ fn cell_condition_holds(
     condition: &crate::CellCondition<NameId>,
     env: &EnvSample,
 ) -> bool {
-    condition
-        .literals()
-        .all(|(literal, sign)| eval_env_literal(provider, env_name_ids, literal, env) == *sign)
+    condition.literals().all(|signed| {
+        eval_env_literal(provider, env_name_ids, &signed.literal, env) == signed.positive
+    })
 }
 
 fn model_satisfied(universe: &Universe, env: &EnvSample) -> bool {
