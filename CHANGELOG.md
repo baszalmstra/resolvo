@@ -52,10 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A provider implements `environment_package(name) -> Option<EnvironmentPackage>`
   to declare which names are environment packages and
   `environment_version_set_relation(a, b) -> VersionSetRelation` as the
-  relation oracle over their version sets. Both are consulted **only** by
-  `Solver::solve_universal`; `DependencyProvider::get_candidates` describes
-  concrete packages only, so a plain `Solver::solve` can never observe an
-  environment package (enforced at the type level). Soundness contract for
+  relation oracle over their version sets. Both are consulted only for
+  universal solving; `DependencyProvider::get_candidates` describes concrete
+  packages only (enforced at the type level), so a solver used exclusively
+  through the plain `Solver::solve` never observes an environment package.
+  Once `Solver::solve_universal` has installed the classification it persists
+  on that solver's cache for its lifetime. Soundness contract for
   the oracle: answers other than `Unknown` must be correct; when in doubt
   return `Unknown` (a wrong `Disjoint`/`Subset` answer produces broken
   solutions, `Unknown` merely risks describing environment regions no real
@@ -69,12 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (and therefore `DependencySnapshot::provider()`) panics on an inconsistent
   table, and the new fallible `SnapshotProvider::try_new` returns
   `SnapshotRelationError` (`DuplicatePair` / `ContradictoryRelation`) instead.
-- `EnvLiteral`, `SignedEnvLiteral` and `EnvClause` now derive serde
-  `Serialize`/`Deserialize` (behind the `serde` feature); `CellCondition` and
-  `Presence` derive `Serialize` only, since deserialization must go through
-  their normalizing constructors.
+- `EnvLiteral`, `SignedEnvLiteral`, `EnvClause` and `EnvironmentModel` now
+  derive serde `Serialize`/`Deserialize` (behind the `serde` feature);
+  `CellCondition` and `Presence` derive `Serialize` only, since deserialization
+  must go through their normalizing constructors.
 
 ### Changed
+
+- [**breaking**] `SolverCache::get_or_cache_candidates` is no longer public:
+  its return type now carries the internal environment-package classification,
+  which is not part of the public API surface. The other `SolverCache`
+  accessors (`get_or_cache_matching_candidates`,
+  `get_or_cache_non_matching_candidates`, `get_or_cache_sorted_candidates`,
+  `get_or_cache_dependencies`) are unchanged.
 
 - The `#[non_exhaustive]` attribute is now applied to the public enums that
   providers and consumers match on and that may grow: `VersionSetRelation`,

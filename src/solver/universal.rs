@@ -262,7 +262,15 @@ fn is_env_variable<D: DependencyProvider>(state: &SolverState<D>, variable: Vari
 ///
 /// This is a newtype rather than a bare `Vec<Vec<_>>` so a CNF model cannot be
 /// confused with the DNF [`Presence`] type or with a single [`CellCondition`].
+///
+/// Both [`Serialize`](serde::Serialize) and [`Deserialize`](serde::Deserialize)
+/// are derived (behind the `serde` feature): unlike [`CellCondition`] and
+/// [`Presence`] the model has no construction-enforced invariant to bypass —
+/// the one structural requirement (no empty disjunction) is checked when the
+/// model is consumed, by [`Solver::solve_universal`] and
+/// [`UniversalSolution::from_cells`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnvironmentModel<N = NameId>(Vec<EnvClause<N>>);
 
 impl<N> Default for EnvironmentModel<N> {
@@ -461,10 +469,13 @@ impl<Id, N> UniversalSolution<Id, N> {
     /// literals describing a region of the environment space with the
     /// solvables chosen for that region and the dependency edges active there.
     ///
-    /// The cells are pairwise disjoint, listed in deterministic enumeration
-    /// order (the baseline cell first), and together cover the environment
-    /// model. The returned slice is read-only, so these invariants cannot be
-    /// broken after construction.
+    /// For a solution produced by [`Solver::solve_universal`] the cells are
+    /// pairwise disjoint, listed in deterministic enumeration order (the
+    /// baseline cell first), and together cover the environment model; the
+    /// returned slice is read-only, so those invariants cannot be broken
+    /// afterwards. A solution reconstructed with
+    /// [`UniversalSolution::from_cells`] is only as consistent as its input —
+    /// re-check it with [`UniversalSolution::verify`].
     pub fn cells(&self) -> &[Cell<Id, N>] {
         &self.cells
     }

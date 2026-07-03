@@ -614,10 +614,10 @@ pub trait DependencyProvider: Sized + Interner {
     /// This method describes only *concrete* packages. Environment packages
     /// (whose value is unknown at solve time) are not visible here: they are
     /// classified separately by
-    /// [`UniversalDependencyProvider::environment_package`] and consulted only
-    /// during [`Solver::solve_universal`]. A concrete solve therefore never
-    /// sees an environment package, which this signature enforces at the type
-    /// level.
+    /// [`UniversalDependencyProvider::environment_package`], which is consulted
+    /// only for universal solving (see [`Solver::solve_universal`]). This
+    /// signature enforces at the type level that a package classified as an
+    /// environment package is never described through `get_candidates`.
     async fn get_candidates(&self, name: Self::NameId) -> Option<Candidates<Self::SolvableId>>;
 
     /// Sort the specified solvables based on which solvable to try first. The
@@ -645,12 +645,15 @@ pub trait DependencyProvider: Sized + Interner {
 /// *environment packages* for universal solving (see
 /// [`Solver::solve_universal`]).
 ///
-/// The methods of this trait are consulted only by
-/// [`Solver::solve_universal`]; a plain [`Solver::solve`] never calls them.
-/// Concrete solving therefore cannot observe environment packages, which is
-/// enforced by construction: the shared solver internals classify a package as
-/// an environment package only when the caller drove a universal solve through
-/// a provider that implements this trait.
+/// The methods of this trait are consulted only for universal solving: a
+/// solver used exclusively through the plain [`Solver::solve`] never calls
+/// them, so purely concrete solving cannot observe environment packages. This
+/// is enforced by construction: the shared solver internals classify a package
+/// as an environment package only after [`Solver::solve_universal`] has
+/// installed the classification on that solver. Once installed it persists
+/// (alongside the cached candidates) for the solver's lifetime, so packages
+/// keep a consistent classification across any subsequent solves on the same
+/// solver.
 pub trait UniversalDependencyProvider: DependencyProvider {
     /// Declares `name` as an environment package whose value is unknown at
     /// solve time. Consulted (and cached) before

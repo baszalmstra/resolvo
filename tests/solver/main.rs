@@ -3697,9 +3697,10 @@ fn test_m5_conflict_display_requires_env_package() {
 }
 
 /// (M5-b) Universal solve with two disjoint requirements on the same env
-/// package: the requirements are rendered as environment requirements (never
-/// as missing packages) and the oracle consistency clause between them is
-/// rendered as a mutual-exclusivity conflict.
+/// package: the requirement is rendered as an environment requirement (never
+/// as a missing package). The witness cell pins the other literal, so the
+/// scoped conflict shows the requirement contradicting the cell directly (the
+/// oracle mutual-exclusivity clause is not part of the scoped chain).
 #[test]
 fn test_m5_conflict_display_oracle_disjoint() {
     let mut provider = BundleBoxProvider::new();
