@@ -6,9 +6,9 @@ use bundle_box::{BundleBoxProvider, Pack};
 use insta::assert_snapshot;
 use itertools::Itertools;
 use resolvo::{
-    CellCondition, ConditionalRequirement, DependencyProvider, EnvLiteral, EnvLiteralKind,
-    Interner, NameId, Problem, SolvableId, Solver, UniversalFailure, UniversalProblem,
-    UniversalSolution, UnsolvableOrCancelled, VersionSetId,
+    CellCondition, ConditionalRequirement, DependencyProvider, EnvInputSource, EnvLiteral,
+    EnvLiteralKind, Interner, InvalidUniversalInput, NameId, Problem, SolvableId, Solver,
+    UniversalFailure, UniversalProblem, UniversalSolution, UnsolvableOrCancelled, VersionSetId,
 };
 use tracing_test::traced_test;
 
@@ -2359,6 +2359,7 @@ fn universal_solve_snapshot(
         Err(UniversalFailure::Unsolvable { cell, .. }) => {
             format!("unsolvable in cell: {}", cell.display(solver.provider()))
         }
+        Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
     }
 }
@@ -2412,6 +2413,7 @@ fn universal_solve_snapshot_async(
         Err(UniversalFailure::Unsolvable { cell, .. }) => {
             format!("unsolvable in cell: {}", cell.display(solver.provider()))
         }
+        Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
     }
 }
@@ -2914,37 +2916,112 @@ fn test_universal_edges_env_requirement_has_no_target() {
     ");
 }
 
-/// The environment model may only reference environment packages; a
-/// concrete package is reported with a clear panic.
+/// Runs a universal solve of `specs` under `model` and returns the failure it
+/// must produce. Panics if the solve does not fail.
+fn universal_solve_expect_failure(
+    mut provider: BundleBoxProvider,
+    specs: &[&str],
+    model: &[&[&str]],
+) -> UniversalFailure<NameId> {
+    let requirements = provider.requirements(specs);
+    let environment_model = model
+        .iter()
+        .map(|disjunction| {
+            disjunction
+                .iter()
+                .map(|literal| parse_env_literal(&mut provider, literal))
+                .collect()
+        })
+        .collect();
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(environment_model);
+    solver
+        .solve_universal(problem)
+        .expect_err("expected the solve to fail")
+}
+
+/// The environment model may only reference environment packages; a concrete
+/// package surfaces as [`InvalidUniversalInput::NotAnEnvironmentPackage`].
 #[test]
-#[should_panic(expected = "is not an environment package")]
 fn test_universal_model_rejects_concrete_package() {
     let mut provider = BundleBoxProvider::new();
     provider.add_package("b", Pack::new(1), &[], &[]);
 
-    let _ = universal_solve_snapshot(provider, &[], &[&["b 1..2"]]);
+    let failure = universal_solve_expect_failure(provider, &[], &[&["b 1..2"]]);
+    assert!(matches!(
+        failure,
+        UniversalFailure::InvalidInput(InvalidUniversalInput::NotAnEnvironmentPackage {
+            source: EnvInputSource::EnvironmentModel,
+            ..
+        })
+    ));
 }
 
 /// An absent literal in the model for a package declared with
-/// `can_be_absent: false` is reported with a clear panic.
+/// `can_be_absent: false` surfaces as
+/// [`InvalidUniversalInput::AbsentLiteralForPresentPackage`].
 #[test]
-#[should_panic(expected = "can_be_absent: false")]
 fn test_universal_model_rejects_absent_literal_for_present_package() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", false);
 
-    let _ = universal_solve_snapshot(provider, &[], &[&["cuda absent"]]);
+    let failure = universal_solve_expect_failure(provider, &[], &[&["cuda absent"]]);
+    assert!(matches!(
+        failure,
+        UniversalFailure::InvalidInput(InvalidUniversalInput::AbsentLiteralForPresentPackage {
+            source: EnvInputSource::EnvironmentModel,
+            ..
+        })
+    ));
 }
 
-/// An empty disjunction in the model makes the model unsatisfiable and is
-/// reported with a clear panic.
+/// An empty disjunction in the model makes the model unsatisfiable and
+/// surfaces as [`InvalidUniversalInput::EmptyModelDisjunction`].
 #[test]
-#[should_panic(expected = "empty disjunction")]
 fn test_universal_model_rejects_empty_disjunction() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", true);
 
-    let _ = universal_solve_snapshot(provider, &[], &[&[]]);
+    let failure = universal_solve_expect_failure(provider, &[], &[&[]]);
+    assert!(matches!(
+        failure,
+        UniversalFailure::InvalidInput(InvalidUniversalInput::EmptyModelDisjunction)
+    ));
+}
+
+/// A [`EnvLiteralKind::Matches`] literal whose version set belongs to a
+/// different package than the literal names surfaces as
+/// [`InvalidUniversalInput::VersionSetPackageMismatch`], before any solving.
+#[test]
+fn test_universal_model_rejects_version_set_package_mismatch() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+
+    // Build a literal that claims to be about `cuda` but carries a version set
+    // interned for `rocm`.
+    let rocm_version_set = provider.version_sets(&["rocm 1..2"])[0];
+    let cuda = provider.package_name("cuda");
+    let mismatched = EnvLiteral {
+        package: cuda,
+        kind: EnvLiteralKind::Matches(rocm_version_set),
+    };
+    let model = vec![vec![(mismatched, true)]];
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new().environment_model(model);
+    let failure = solver
+        .solve_universal(problem)
+        .expect_err("expected the solve to fail");
+    assert!(matches!(
+        failure,
+        UniversalFailure::InvalidInput(InvalidUniversalInput::VersionSetPackageMismatch {
+            source: EnvInputSource::EnvironmentModel,
+            ..
+        })
+    ));
 }
 
 // ===========================================================================
@@ -3014,6 +3091,7 @@ fn format_universal_result(
         Err(UniversalFailure::Unsolvable { cell, .. }) => {
             format!("unsolvable in cell: {}", cell.display(solver.provider()))
         }
+        Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
     }
 }
@@ -3115,27 +3193,73 @@ fn test_universal_seeded_determinism() {
 }
 
 /// A seed literal whose package is not an environment package is a caller
-/// error and panics with a clear message.
+/// error, surfaced as [`InvalidUniversalInput::NotAnEnvironmentPackage`] with
+/// the [`EnvInputSource::SeedPartition`] source.
 #[test]
-#[should_panic(expected = "is not an environment package")]
 fn test_universal_seed_rejects_concrete_package() {
     let mut provider = BundleBoxProvider::new();
     provider.add_package("b", Pack::new(1), &[], &[]);
 
     let seed = CellCondition(vec![parse_env_literal(&mut provider, "b 1..2")]);
-    let _ = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+    let (_solver, result) = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+    assert!(matches!(
+        result,
+        Err(UniversalFailure::InvalidInput(
+            InvalidUniversalInput::NotAnEnvironmentPackage {
+                source: EnvInputSource::SeedPartition,
+                ..
+            }
+        ))
+    ));
 }
 
 /// An absent seed literal for a package declared with `can_be_absent: false`
-/// is a caller error and panics with a clear message.
+/// is a caller error, surfaced as
+/// [`InvalidUniversalInput::AbsentLiteralForPresentPackage`].
 #[test]
-#[should_panic(expected = "can_be_absent: false")]
 fn test_universal_seed_rejects_absent_literal_for_present_package() {
     let mut provider = BundleBoxProvider::new();
     provider.add_environment_package("cuda", false);
 
     let seed = CellCondition(vec![parse_env_literal(&mut provider, "cuda absent")]);
-    let _ = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+    let (_solver, result) = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+    assert!(matches!(
+        result,
+        Err(UniversalFailure::InvalidInput(
+            InvalidUniversalInput::AbsentLiteralForPresentPackage {
+                source: EnvInputSource::SeedPartition,
+                ..
+            }
+        ))
+    ));
+}
+
+/// A seed literal pairing a package with another package's version set is a
+/// caller error, surfaced as
+/// [`InvalidUniversalInput::VersionSetPackageMismatch`].
+#[test]
+fn test_universal_seed_rejects_version_set_package_mismatch() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+
+    let rocm_version_set = provider.version_sets(&["rocm 1..2"])[0];
+    let cuda = provider.package_name("cuda");
+    let mismatched = EnvLiteral {
+        package: cuda,
+        kind: EnvLiteralKind::Matches(rocm_version_set),
+    };
+    let seed = CellCondition(vec![(mismatched, true)]);
+    let (_solver, result) = universal_solve_with_seeds(provider, &[], &[], vec![seed]);
+    assert!(matches!(
+        result,
+        Err(UniversalFailure::InvalidInput(
+            InvalidUniversalInput::VersionSetPackageMismatch {
+                source: EnvInputSource::SeedPartition,
+                ..
+            }
+        ))
+    ));
 }
 
 /// Assumption-boundary case named by the design doc: a conflict at exactly
@@ -3600,6 +3724,7 @@ fn universal_failure_snapshot(
             writeln!(buf, "{}", conflict.display_user_friendly(&solver)).unwrap();
             buf
         }
+        Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
     }
 }

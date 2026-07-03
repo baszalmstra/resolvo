@@ -54,7 +54,8 @@ pub(crate) mod variable_map;
 mod watch_map;
 
 pub use universal::{
-    CellEdge, EnvironmentModel, UniversalFailure, UniversalProblem, UniversalSolution, Violation,
+    CellEdge, EnvInputSource, EnvironmentModel, InvalidUniversalInput, UniversalFailure,
+    UniversalProblem, UniversalSolution, Violation,
 };
 
 #[cfg(feature = "diagnostics")]

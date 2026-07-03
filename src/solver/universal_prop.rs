@@ -1013,6 +1013,9 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                 stats.unsolvable_nonvacuous += 1;
             }
         }
+        Err(UniversalFailure::InvalidInput(invalid)) => {
+            panic!("seed {seed}: unexpected invalid input: {invalid}");
+        }
         Err(UniversalFailure::Cancelled(_)) => {
             panic!("seed {seed}: unexpected cancellation");
         }

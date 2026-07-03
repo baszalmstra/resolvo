@@ -751,6 +751,11 @@ fn main() {
                             conflict.display_user_friendly(&solver)
                         )));
                     }
+                    Err(UniversalFailure::InvalidInput(invalid)) => {
+                        eprintln!("{}", style(format!("==> INVALID INPUT: {invalid}")).red());
+                        record.outcome = "invalid_input";
+                        record.error = Some(truncate_error(format!("{invalid}")));
+                    }
                     Err(UniversalFailure::Cancelled(_)) => {
                         eprintln!(
                             "{}",

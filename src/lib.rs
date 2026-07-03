@@ -55,8 +55,9 @@ pub use requirement::Requirement;
 #[cfg(feature = "diagnostics")]
 pub use solver::CellPinCounts;
 pub use solver::{
-    CellEdge, EmptySolvables, EnvironmentModel, Problem, Solver, SolverCache, UniversalFailure,
-    UniversalProblem, UniversalSolution, UnsolvableOrCancelled, Violation,
+    CellEdge, EmptySolvables, EnvInputSource, EnvironmentModel, InvalidUniversalInput, Problem,
+    Solver, SolverCache, UniversalFailure, UniversalProblem, UniversalSolution,
+    UnsolvableOrCancelled, Violation,
 };
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};

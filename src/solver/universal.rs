@@ -131,7 +131,7 @@
 //! ([`ConflictNode::EnvMatches`](crate::conflict::ConflictNode::EnvMatches) /
 //! [`ConflictNode::EnvAbsent`](crate::conflict::ConflictNode::EnvAbsent)).
 
-use std::{any::Any, marker::PhantomData};
+use std::{any::Any, fmt, marker::PhantomData};
 
 use crate::{
     CellCondition, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
@@ -313,9 +313,11 @@ impl<Id, N> UniversalProblem<Id, N> {
     /// contradicts itself is dropped, and the region it described is covered
     /// by the free enumeration that runs after all seeds.
     ///
-    /// Seeds may only reference environment packages; an absent literal for
-    /// a package declared with `can_be_absent: false` is also a caller error.
-    /// Both panic with a clear message.
+    /// Seeds may only reference environment packages; an absent literal for a
+    /// package declared with `can_be_absent: false` is also a caller error.
+    /// Both are rejected up front by [`Solver::solve_universal`] as
+    /// [`UniversalFailure::InvalidInput`] (see [`InvalidUniversalInput`]), as
+    /// distinct from a merely stale seed, which heals silently.
     pub fn seed_partition(self, seed_partition: Vec<CellCondition<N>>) -> Self {
         Self {
             seed_partition,
@@ -679,6 +681,113 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
     }
 }
 
+/// Names the [`UniversalProblem`] input that carried an invalid environment
+/// literal, so an [`InvalidUniversalInput`] can point at the offending field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvInputSource {
+    /// The environment model ([`UniversalProblem::environment_model`]).
+    EnvironmentModel,
+    /// The seed partition ([`UniversalProblem::seed_partition`]).
+    SeedPartition,
+}
+
+impl fmt::Display for EnvInputSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EnvInputSource::EnvironmentModel => f.write_str("environment model"),
+            EnvInputSource::SeedPartition => f.write_str("seed partition"),
+        }
+    }
+}
+
+/// A structurally invalid caller input to a [`UniversalProblem`], detected by
+/// [`Solver::solve_universal`] up front, before any solver state is built.
+///
+/// These are caller errors in the shape of the problem itself (a literal
+/// naming the wrong kind of package, an internally inconsistent literal, or an
+/// unsatisfiable model clause), not resolution outcomes: a well-formed problem
+/// that merely has no solution fails with [`UniversalFailure::Unsolvable`]
+/// instead. A stale seed that references still-valid environment packages but
+/// no longer matches any solution is *not* invalid input; it heals silently
+/// (see [`UniversalProblem::seed_partition`]).
+///
+/// Non-exhaustive: new structural checks may be added as further variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidUniversalInput<N = NameId> {
+    /// A literal references a package the provider does not classify as an
+    /// environment package
+    /// ([`UniversalDependencyProvider::environment_package`](crate::UniversalDependencyProvider::environment_package)
+    /// returned `None`). Only environment packages may appear in an
+    /// environment model or a seed partition.
+    NotAnEnvironmentPackage {
+        /// The input that referenced the package.
+        source: EnvInputSource,
+        /// The offending package.
+        package: N,
+    },
+    /// A [`Matches`](EnvLiteralKind::Matches) literal pairs a package with a
+    /// version set that belongs to a different package: the literal's
+    /// `package` disagrees with
+    /// [`version_set_name`](Interner::version_set_name) of its version set.
+    VersionSetPackageMismatch {
+        /// The input that referenced the literal.
+        source: EnvInputSource,
+        /// The package named by the literal.
+        package: N,
+        /// The version set the literal matches.
+        version_set: VersionSetId,
+        /// The package the version set actually belongs to.
+        version_set_package: N,
+    },
+    /// An [`Absent`](EnvLiteralKind::Absent) literal references an environment
+    /// package declared with `can_be_absent: false`, which therefore has no
+    /// absent literal.
+    AbsentLiteralForPresentPackage {
+        /// The input that referenced the literal.
+        source: EnvInputSource,
+        /// The offending package.
+        package: N,
+    },
+    /// The environment model contains an empty disjunction. An empty clause is
+    /// unsatisfiable, so it would make the whole model unsatisfiable.
+    EmptyModelDisjunction,
+}
+
+impl<N: fmt::Debug> fmt::Display for InvalidUniversalInput<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InvalidUniversalInput::NotAnEnvironmentPackage { source, package } => write!(
+                f,
+                "the {source} references package {package:?} which is not an environment package; \
+                 only packages classified by `UniversalDependencyProvider::environment_package` \
+                 may appear there",
+            ),
+            InvalidUniversalInput::VersionSetPackageMismatch {
+                source,
+                package,
+                version_set,
+                version_set_package,
+            } => write!(
+                f,
+                "the {source} pairs package {package:?} with version set {version_set:?}, which \
+                 belongs to package {version_set_package:?}",
+            ),
+            InvalidUniversalInput::AbsentLiteralForPresentPackage { source, package } => write!(
+                f,
+                "the {source} contains an absent literal for package {package:?} which was \
+                 declared with `can_be_absent: false`",
+            ),
+            InvalidUniversalInput::EmptyModelDisjunction => f.write_str(
+                "the environment model contains an empty disjunction, which makes the model \
+                 unsatisfiable",
+            ),
+        }
+    }
+}
+
+impl<N: fmt::Debug> std::error::Error for InvalidUniversalInput<N> {}
+
 /// The errors of an unsuccessful [`Solver::solve_universal`] call.
 #[derive(Debug)]
 pub enum UniversalFailure<N = NameId> {
@@ -693,6 +802,10 @@ pub enum UniversalFailure<N = NameId> {
         /// clauses that are relevant within the identified cell.
         conflict: Conflict,
     },
+    /// A caller-supplied input was structurally invalid. Detected up front,
+    /// before any solving, so the solver state is untouched. See
+    /// [`InvalidUniversalInput`].
+    InvalidInput(InvalidUniversalInput<N>),
     /// The solving process was cancelled.
     Cancelled(Box<dyn Any>),
 }
@@ -704,6 +817,37 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ///
     /// See the module documentation and the universal-solve design document
     /// for the underlying algorithm.
+    ///
+    /// # Errors
+    ///
+    /// Structurally invalid inputs are rejected up front, before any solver
+    /// state is built, as [`UniversalFailure::InvalidInput`]: every literal in
+    /// the [`environment_model`](UniversalProblem::environment_model) and in
+    /// every [`seed_partition`](UniversalProblem::seed_partition) condition
+    /// must reference an environment package (one classified by
+    /// [`UniversalDependencyProvider::environment_package`](crate::UniversalDependencyProvider::environment_package)),
+    /// a [`Matches`](EnvLiteralKind::Matches) literal's version set must belong
+    /// to the literal's own package, an [`Absent`](EnvLiteralKind::Absent)
+    /// literal requires `can_be_absent: true`, and no model disjunction may be
+    /// empty. See [`InvalidUniversalInput`] for the individual checks.
+    ///
+    /// ```ignore
+    /// // `some_pkg` is a concrete package, not an environment package.
+    /// let model = vec![vec![(
+    ///     EnvLiteral { package: some_pkg, kind: EnvLiteralKind::Absent },
+    ///     true,
+    /// )]];
+    /// let problem = UniversalProblem::new().environment_model(model);
+    /// let err = solver.solve_universal(problem).unwrap_err();
+    /// assert!(matches!(
+    ///     err,
+    ///     UniversalFailure::InvalidInput(InvalidUniversalInput::NotAnEnvironmentPackage { .. }),
+    /// ));
+    /// ```
+    ///
+    /// A modeled region that is genuinely unsolvable fails with
+    /// [`UniversalFailure::Unsolvable`] instead, and a cancellation with
+    /// [`UniversalFailure::Cancelled`].
     ///
     /// # Reproducibility
     ///
@@ -746,6 +890,13 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             _marker,
         } = problem;
 
+        // Reject structurally invalid inputs before touching solver state, so
+        // caller errors surface as `Err(InvalidInput(..))` rather than as a
+        // panic buried in the encode/seed path. A valid problem that is merely
+        // unsolvable is still reported by the enumeration below.
+        self.validate_universal_input(&environment_model, &seed_partition)
+            .map_err(UniversalFailure::InvalidInput)?;
+
         // First attempt: enumerate with trail-prefix preservation. When a
         // prefix-started run exceeds its work budget the attempt is
         // abandoned wholesale (the solver state shaped by reused transitions
@@ -781,6 +932,83 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 }
             }
         }
+    }
+
+    /// Validates the environment model and seed partition against the cheap
+    /// structural invariants of a [`UniversalProblem`], using only the
+    /// (synchronous) provider classification. Runs before any solver state is
+    /// built so caller errors surface through the [`Result`] channel; once it
+    /// returns `Ok`, the corresponding checks in the encode and seed paths are
+    /// internal invariants (`debug_assert!`) that this pass has already
+    /// enforced.
+    ///
+    /// A structurally valid but stale seed is accepted here: this pass only
+    /// rejects literals that can never denote a region of the environment
+    /// space, not seeds that merely no longer match a solution (those heal
+    /// during enumeration).
+    fn validate_universal_input(
+        &self,
+        environment_model: &EnvironmentModel<D::NameId>,
+        seed_partition: &[CellCondition<D::NameId>],
+    ) -> Result<(), InvalidUniversalInput<D::NameId>> {
+        for disjunction in environment_model {
+            if disjunction.is_empty() {
+                return Err(InvalidUniversalInput::EmptyModelDisjunction);
+            }
+            for (literal, _positive) in disjunction {
+                self.validate_env_literal(literal, EnvInputSource::EnvironmentModel)?;
+            }
+        }
+        for seed in seed_partition {
+            for (literal, _sign) in &seed.0 {
+                self.validate_env_literal(literal, EnvInputSource::SeedPartition)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates a single environment literal: its package must classify as an
+    /// environment package, a [`Matches`](EnvLiteralKind::Matches) literal's
+    /// version set must belong to that same package, and an
+    /// [`Absent`](EnvLiteralKind::Absent) literal requires the package to be
+    /// declared `can_be_absent: true`. `source` names the input for the error.
+    fn validate_env_literal(
+        &self,
+        literal: &EnvLiteral<D::NameId>,
+        source: EnvInputSource,
+    ) -> Result<(), InvalidUniversalInput<D::NameId>> {
+        let package = literal.package;
+        match literal.kind {
+            EnvLiteralKind::Matches(version_set) => {
+                // A matches literal must pair its package with a version set of
+                // that same package before we can meaningfully classify it.
+                let version_set_package = self.provider().version_set_name(version_set);
+                if version_set_package != package {
+                    return Err(InvalidUniversalInput::VersionSetPackageMismatch {
+                        source,
+                        package,
+                        version_set,
+                        version_set_package,
+                    });
+                }
+                if self.provider().environment_package(package).is_none() {
+                    return Err(InvalidUniversalInput::NotAnEnvironmentPackage { source, package });
+                }
+            }
+            EnvLiteralKind::Absent => match self.provider().environment_package(package) {
+                None => {
+                    return Err(InvalidUniversalInput::NotAnEnvironmentPackage { source, package });
+                }
+                Some(env_pkg) if !env_pkg.can_be_absent => {
+                    return Err(InvalidUniversalInput::AbsentLiteralForPresentPackage {
+                        source,
+                        package,
+                    });
+                }
+                Some(_) => {}
+            },
+        }
+        Ok(())
     }
 
     /// One enumeration pass over the environment model: the body of
@@ -1276,18 +1504,21 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Encodes the environment model CNF as [`Clause::EnvClause`] clauses.
     ///
     /// For every package referenced by a model literal the candidates are
-    /// resolved and required to classify as an environment package (cache
-    /// `PackageCandidates::Environment`); the literal variables are interned
-    /// together with their oracle consistency clauses.
+    /// resolved to record its environment metadata in the solver state; the
+    /// literal variables are interned together with their oracle consistency
+    /// clauses. The structural invariants asserted below (non-empty
+    /// disjunctions, environment-package classification, version-set/package
+    /// agreement, `can_be_absent` for absent literals) were already enforced
+    /// up front by [`Self::validate_universal_input`], so here they are
+    /// internal invariants rather than caller-facing errors.
     fn encode_environment_model(
         &mut self,
         model: &EnvironmentModel<D::NameId>,
     ) -> Result<(), UniversalFailure<D::NameId>> {
         for disjunction in model {
-            assert!(
+            debug_assert!(
                 !disjunction.is_empty(),
-                "the environment model contains an empty disjunction, which makes the model \
-                 unsatisfiable"
+                "invariant: empty model disjunctions are rejected by validate_universal_input"
             );
 
             let mut literals = Vec::with_capacity(disjunction.len());
@@ -1295,13 +1526,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 let variable = match env_literal.kind {
                     EnvLiteralKind::Matches(version_set) => {
                         let package_name = self.cache.provider().version_set_name(version_set);
-                        assert!(
+                        debug_assert!(
                             package_name == env_literal.package,
-                            "environment model literal for package '{}' references version set \
-                             '{}' which belongs to package '{}'",
-                            self.provider().display_name(env_literal.package),
-                            self.provider().display_version_set(version_set),
-                            self.provider().display_name(package_name),
+                            "invariant: version-set/package mismatches are rejected by \
+                             validate_universal_input"
                         );
                         self.declare_environment_package(package_name, "environment model")?;
                         self.state.intern_env_matches_with_oracle_clauses(
@@ -1315,11 +1543,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         let package_name = env_literal.package;
                         let env_pkg =
                             self.declare_environment_package(package_name, "environment model")?;
-                        assert!(
+                        debug_assert!(
                             env_pkg.can_be_absent,
-                            "the environment model contains an absent literal for package '{}' \
-                             which was declared with `can_be_absent: false`",
-                            self.provider().display_name(package_name),
+                            "invariant: absent literals for can_be_absent: false packages are \
+                             rejected by validate_universal_input"
                         );
                         self.state
                             .intern_env_absent_with_oracle_clauses(package_name)
@@ -1334,12 +1561,15 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         Ok(())
     }
 
-    /// Resolves the candidates for `package_name` and requires the package to
-    /// be an environment package. Records its metadata in the solver state
-    /// (mirroring what the encoder does in `on_candidates_available`).
+    /// Resolves the candidates for `package_name` and records its environment
+    /// metadata in the solver state (mirroring what the encoder does in
+    /// `on_candidates_available`).
     ///
-    /// `context` names the input that referenced the package (the
-    /// environment model or the seed partition) for the panic message.
+    /// `context` names the input that referenced the package (the environment
+    /// model or the seed partition) for the internal-invariant message. The
+    /// package is guaranteed to be an environment package: caller inputs are
+    /// screened by [`Self::validate_universal_input`] before this runs, so the
+    /// non-environment arm below is unreachable rather than a caller error.
     fn declare_environment_package(
         &mut self,
         package_name: D::NameId,
@@ -1351,10 +1581,9 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             .map_err(UniversalFailure::Cancelled)?;
         let env_pkg = match package_candidates {
             PackageCandidates::Environment(env_pkg) => *env_pkg,
-            PackageCandidates::Candidates(_) => panic!(
-                "the {context} references package '{}' which is not an environment package; only \
-                 packages declared via `PackageCandidates::Environment` can appear in the \
-                 {context}",
+            PackageCandidates::Candidates(_) => unreachable!(
+                "invariant: the {context} was screened by validate_universal_input, so package \
+                 '{}' must be an environment package",
                 self.provider().display_name(package_name),
             ),
         };
@@ -1375,13 +1604,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// a literal describes no environment at all (its partially pushed
     /// assumptions are retracted again).
     ///
-    /// # Panics
-    ///
-    /// Panics when the seed references a package that is not an environment
-    /// package, contains an absent literal for a package declared with
-    /// `can_be_absent: false`, or pairs a package with a version set that
-    /// belongs to a different package. These are caller errors, mirroring
-    /// the environment model validation.
+    /// Structural validity of the seed literals (environment-package
+    /// classification, version-set/package agreement, `can_be_absent` for
+    /// absent literals) is enforced up front by
+    /// [`Self::validate_universal_input`]; the assertions below are therefore
+    /// internal invariants, not caller-facing errors.
     fn push_seed_assumptions(
         &mut self,
         seed: &CellCondition<D::NameId>,
@@ -1403,13 +1630,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             let variable = match env_literal.kind {
                 EnvLiteralKind::Matches(version_set) => {
                     let package_name = self.cache.provider().version_set_name(version_set);
-                    assert!(
+                    debug_assert!(
                         package_name == env_literal.package,
-                        "seed partition literal for package '{}' references version set '{}' \
-                         which belongs to package '{}'",
-                        self.provider().display_name(env_literal.package),
-                        self.provider().display_version_set(version_set),
-                        self.provider().display_name(package_name),
+                        "invariant: version-set/package mismatches are rejected by \
+                         validate_universal_input"
                     );
                     self.declare_environment_package(package_name, "seed partition")?;
                     self.state.intern_env_matches_with_oracle_clauses(
@@ -1423,11 +1647,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     let package_name = env_literal.package;
                     let env_pkg =
                         self.declare_environment_package(package_name, "seed partition")?;
-                    assert!(
+                    debug_assert!(
                         env_pkg.can_be_absent,
-                        "the seed partition contains an absent literal for package '{}' which \
-                         was declared with `can_be_absent: false`",
-                        self.provider().display_name(package_name),
+                        "invariant: absent literals for can_be_absent: false packages are \
+                         rejected by validate_universal_input"
                     );
                     self.state
                         .intern_env_absent_with_oracle_clauses(package_name)
