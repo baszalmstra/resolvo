@@ -60,6 +60,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return `Unknown` (a wrong `Disjoint`/`Subset` answer produces broken
   solutions, `Unknown` merely risks describing environment regions no real
   machine has).
+- The snapshot environment relation table
+  (`DependencySnapshot::environment_version_set_relations`) now holds a named
+  `EnvVersionSetRelation { from, to, relation }` struct instead of a raw
+  `(VersionSetId, VersionSetId, VersionSetRelation)` tuple. `SnapshotProvider`
+  canonicalizes the table on construction so each unordered version set pair is
+  keyed once; a pair listed more than once is rejected. `SnapshotProvider::new`
+  (and therefore `DependencySnapshot::provider()`) panics on an inconsistent
+  table, and the new fallible `SnapshotProvider::try_new` returns
+  `SnapshotRelationError` (`DuplicatePair` / `ContradictoryRelation`) instead.
+- `EnvLiteral`, `SignedEnvLiteral` and `EnvClause` now derive serde
+  `Serialize`/`Deserialize` (behind the `serde` feature); `CellCondition` and
+  `Presence` derive `Serialize` only, since deserialization must go through
+  their normalizing constructors.
+
+### Changed
+
+- The `#[non_exhaustive]` attribute is now applied to the public enums that
+  providers and consumers match on and that may grow: `VersionSetRelation`,
+  `Violation`, `UniversalFailure`, `EnvInputSource` and the new
+  `SnapshotRelationError`. Matching them exhaustively now requires a wildcard
+  arm. The `UniversalProblem` builder methods and `SnapshotProvider::with_timeout`
+  are marked `#[must_use]`. The diagnostics-only
+  `Solver::universal_cell_retracts` returns `&[CellRetract]` (a named struct)
+  instead of `&[(u32, u32)]`.
 - `ConflictGraph` and `ConflictNode` carry a second generic parameter `N`
   (the name-id type) and gain environment-literal node variants
   `EnvMatches(VersionSetId)` and `EnvAbsent(N)`; `ConflictCause` gains

@@ -89,6 +89,29 @@ pub struct Package {
     pub environment: Option<EnvironmentPackage>,
 }
 
+/// A single precomputed relation between two version sets that target
+/// environment packages, as stored in a [`DependencySnapshot`].
+///
+/// The entry states how [`from`](EnvVersionSetRelation::from) relates to
+/// [`to`](EnvVersionSetRelation::to); the flipped order is answered by
+/// inverting `Subset`/`Superset`. [`SnapshotProvider`] canonicalizes the whole
+/// table on construction and rejects any unordered pair that is listed more
+/// than once (see [`SnapshotRelationError`]), so at most one entry describes
+/// any pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EnvVersionSetRelation {
+    /// The first version set of the pair.
+    pub from: VersionSetId,
+
+    /// The second version set of the pair.
+    pub to: VersionSetId,
+
+    /// The relation of [`from`](EnvVersionSetRelation::from) to
+    /// [`to`](EnvVersionSetRelation::to).
+    pub relation: VersionSetRelation,
+}
+
 /// A snapshot of an object that implements [`DependencyProvider`].
 #[derive(Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -136,15 +159,17 @@ pub struct DependencySnapshot {
     pub conditions: Mapping<ConditionId, Condition>,
 
     /// Pairwise relations between version sets that target environment
-    /// packages, precomputed by the snapshot generator. Each pair is stored
-    /// in one order only; the provider answers the flipped order by
+    /// packages, precomputed by the snapshot generator. Each unordered pair
+    /// may be listed at most once; the provider answers the flipped order by
     /// inverting `Subset`/`Superset`. Missing entries (and entries for pairs
-    /// never queried) mean [`VersionSetRelation::Unknown`].
+    /// never queried) mean [`VersionSetRelation::Unknown`]. A pair listed more
+    /// than once is rejected when the [`SnapshotProvider`] is constructed (see
+    /// [`SnapshotRelationError`]).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
-    pub environment_version_set_relations: Vec<(VersionSetId, VersionSetId, VersionSetRelation)>,
+    pub environment_version_set_relations: Vec<EnvVersionSetRelation>,
 }
 
 impl DependencySnapshot {
@@ -399,6 +424,100 @@ impl DependencySnapshot {
     }
 }
 
+/// The error returned by [`SnapshotProvider::try_new`] when a
+/// [`DependencySnapshot`]'s environment relation table
+/// (`environment_version_set_relations`) is inconsistent.
+///
+/// Every entry is canonicalized to a single key order (the lower version set
+/// id first, inverting `Subset`/`Superset` when the stored pair is flipped)
+/// before the table is indexed, so two entries that describe the same
+/// unordered pair collide. Any collision is rejected: an exact restatement as
+/// [`DuplicatePair`](SnapshotRelationError::DuplicatePair) and an incompatible
+/// restatement as
+/// [`ContradictoryRelation`](SnapshotRelationError::ContradictoryRelation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SnapshotRelationError {
+    /// Two entries describe the same unordered version set pair with the same
+    /// canonicalized relation. Each pair must be listed at most once.
+    DuplicatePair {
+        /// The lower-id version set of the colliding pair.
+        first: VersionSetId,
+        /// The higher-id version set of the colliding pair.
+        second: VersionSetId,
+        /// The relation both entries agree on (from `first` to `second`).
+        relation: VersionSetRelation,
+    },
+
+    /// Two entries describe the same unordered version set pair with
+    /// conflicting relations, leaving the table internally inconsistent.
+    ContradictoryRelation {
+        /// The lower-id version set of the colliding pair.
+        first: VersionSetId,
+        /// The higher-id version set of the colliding pair.
+        second: VersionSetId,
+        /// The relation implied by the earlier entry (from `first` to
+        /// `second`).
+        left: VersionSetRelation,
+        /// The relation implied by the later entry (from `first` to `second`).
+        right: VersionSetRelation,
+    },
+}
+
+impl Display for SnapshotRelationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotRelationError::DuplicatePair {
+                first,
+                second,
+                relation,
+            } => write!(
+                f,
+                "the environment relation table lists the version set pair \
+                 ({first:?}, {second:?}) more than once (relation {relation:?}); each \
+                 unordered pair may appear at most once",
+            ),
+            SnapshotRelationError::ContradictoryRelation {
+                first,
+                second,
+                left,
+                right,
+            } => write!(
+                f,
+                "the environment relation table gives contradictory relations for the \
+                 version set pair ({first:?}, {second:?}): {left:?} and {right:?}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotRelationError {}
+
+/// Inverts a relation for the flipped key order: `Subset` and `Superset` swap,
+/// the symmetric relations (`Disjoint`, `Equal`, `Unknown`) are unchanged.
+fn invert_relation(relation: VersionSetRelation) -> VersionSetRelation {
+    match relation {
+        VersionSetRelation::Subset => VersionSetRelation::Superset,
+        VersionSetRelation::Superset => VersionSetRelation::Subset,
+        symmetric => symmetric,
+    }
+}
+
+/// Canonicalizes a relation entry to a single key order: the lower version set
+/// id first. The returned relation reads from the first element of the key to
+/// the second (inverted when the pair had to be flipped).
+fn canonicalize_relation(
+    a: VersionSetId,
+    b: VersionSetId,
+    relation: VersionSetRelation,
+) -> ((VersionSetId, VersionSetId), VersionSetRelation) {
+    if a.to_index() <= b.to_index() {
+        ((a, b), relation)
+    } else {
+        ((b, a), invert_relation(relation))
+    }
+}
+
 /// Provides a [`DependencyProvider`] implementation for a
 /// [`DependencySnapshot`].
 pub struct SnapshotProvider<'s> {
@@ -425,28 +544,67 @@ impl<'s> From<&'s DependencySnapshot> for SnapshotProvider<'s> {
 
 impl<'s> SnapshotProvider<'s> {
     /// Create a new [`SnapshotProvider`] from a [`DependencySnapshot`].
+    ///
+    /// # Panics
+    ///
+    /// Panics with a descriptive [`SnapshotRelationError`] message if the
+    /// snapshot's `environment_version_set_relations` table lists the same
+    /// unordered version set pair more than once. Use
+    /// [`try_new`](Self::try_new) to handle that case without panicking. A
+    /// table produced by [`DependencySnapshot::from_provider`] is always
+    /// consistent; only a hand-built or deserialized snapshot can violate this.
     pub fn new(snapshot: &'s DependencySnapshot) -> Self {
-        let relations = snapshot
-            .environment_version_set_relations
-            .iter()
-            .map(|&(a, b, relation)| ((a, b), relation))
-            .collect();
+        Self::try_new(snapshot).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Like [`new`](Self::new) but returns a [`SnapshotRelationError`] instead
+    /// of panicking when the snapshot's environment relation table is
+    /// inconsistent.
+    ///
+    /// The table is canonicalized here: every entry is keyed by its unordered
+    /// version set pair (the lower id first, inverting `Subset`/`Superset` when
+    /// the stored pair is flipped) and a pair listed twice is rejected. Once
+    /// this returns `Ok`, the relation oracle answers from a table holding at
+    /// most one entry per unordered pair.
+    pub fn try_new(snapshot: &'s DependencySnapshot) -> Result<Self, SnapshotRelationError> {
+        let mut relations: HashMap<(VersionSetId, VersionSetId), VersionSetRelation> =
+            HashMap::default();
+        for entry in &snapshot.environment_version_set_relations {
+            let ((first, second), relation) =
+                canonicalize_relation(entry.from, entry.to, entry.relation);
+            if let Some(existing) = relations.insert((first, second), relation) {
+                if existing == relation {
+                    return Err(SnapshotRelationError::DuplicatePair {
+                        first,
+                        second,
+                        relation,
+                    });
+                }
+                return Err(SnapshotRelationError::ContradictoryRelation {
+                    first,
+                    second,
+                    left: existing,
+                    right: relation,
+                });
+            }
+        }
         let additional_base = if snapshot.version_sets.is_empty() {
             0
         } else {
             snapshot.version_sets.max() + 1
         };
-        Self {
+        Ok(Self {
             snapshot,
             additional_version_sets: Vec::new(),
             stop_time: None,
             relations,
             additional_base,
-        }
+        })
     }
 
     /// Adds a timeout to this provider. Solving will stop when the specified
     /// time is reached.
+    #[must_use]
     pub fn with_timeout(self, stop_time: SystemTime) -> Self {
         Self {
             stop_time: Some(stop_time),
@@ -627,11 +785,7 @@ impl UniversalDependencyProvider for SnapshotProvider<'_> {
             return relation;
         }
         if let Some(&relation) = self.relations.get(&(b, a)) {
-            return match relation {
-                VersionSetRelation::Subset => VersionSetRelation::Superset,
-                VersionSetRelation::Superset => VersionSetRelation::Subset,
-                symmetric => symmetric,
-            };
+            return invert_relation(relation);
         }
         VersionSetRelation::Unknown
     }

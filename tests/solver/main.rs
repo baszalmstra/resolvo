@@ -2354,6 +2354,7 @@ fn universal_solve_snapshot(
         }
         Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+        Err(_) => "unexpected universal failure".to_string(),
     }
 }
 
@@ -2409,6 +2410,7 @@ fn universal_solve_snapshot_async(
         }
         Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+        Err(_) => "unexpected universal failure".to_string(),
     }
 }
 
@@ -3060,6 +3062,7 @@ fn format_universal_result(
         }
         Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+        Err(_) => "unexpected universal failure".to_string(),
     }
 }
 
@@ -3668,6 +3671,7 @@ fn universal_failure_snapshot(
         }
         Err(UniversalFailure::InvalidInput(invalid)) => format!("invalid input: {invalid}"),
         Err(UniversalFailure::Cancelled(_)) => "cancelled".to_string(),
+        Err(_) => "unexpected universal failure".to_string(),
     }
 }
 
@@ -3745,7 +3749,7 @@ fn environment_snapshot() -> resolvo::snapshot::DependencySnapshot {
     use resolvo::{
         DenseIndex, Dependencies, EnvironmentPackage, KnownDependencies, Mapping,
         VersionSetRelation,
-        snapshot::{DependencySnapshot, Package, Solvable, VersionSet},
+        snapshot::{DependencySnapshot, EnvVersionSetRelation, Package, Solvable, VersionSet},
     };
 
     let name_a = NameId::from_index(0);
@@ -3844,11 +3848,11 @@ fn environment_snapshot() -> resolvo::snapshot::DependencySnapshot {
         packages,
         strings: Mapping::default(),
         conditions: Mapping::default(),
-        environment_version_set_relations: vec![(
-            glibc_ge2,
-            glibc_ge3,
-            VersionSetRelation::Superset,
-        )],
+        environment_version_set_relations: vec![EnvVersionSetRelation {
+            from: glibc_ge2,
+            to: glibc_ge3,
+            relation: VersionSetRelation::Superset,
+        }],
     }
 }
 
@@ -3955,7 +3959,10 @@ fn test_snapshot_universal_mode_enumerates_cells() {
 #[cfg(feature = "serde")]
 #[test]
 fn test_snapshot_environment_serde_roundtrip() {
-    use resolvo::{DenseIndex, VersionSetRelation, snapshot::DependencySnapshot};
+    use resolvo::{
+        DenseIndex, VersionSetRelation,
+        snapshot::{DependencySnapshot, EnvVersionSetRelation},
+    };
 
     let snapshot = environment_snapshot();
     let json = serde_json::to_string(&snapshot).unwrap();
@@ -3970,11 +3977,102 @@ fn test_snapshot_environment_serde_roundtrip() {
     );
     assert_eq!(
         deserialized.environment_version_set_relations,
-        vec![(
-            VersionSetId::from_index(0),
-            VersionSetId::from_index(1),
-            VersionSetRelation::Superset,
-        )]
+        vec![EnvVersionSetRelation {
+            from: VersionSetId::from_index(0),
+            to: VersionSetId::from_index(1),
+            relation: VersionSetRelation::Superset,
+        }]
+    );
+}
+
+/// A relation table that states the same unordered version set pair twice with
+/// incompatible relations is rejected when the provider is built: `try_new`
+/// reports a [`SnapshotRelationError::ContradictoryRelation`] and the
+/// infallible `new` (used by `provider()`) panics. The two entries are given
+/// in opposite key orders to exercise canonicalization: `(0, 1) = Subset` and
+/// `(1, 0) = Subset` canonicalize to `(0, 1) = Subset` and `(0, 1) = Superset`,
+/// which contradict.
+#[test]
+fn test_snapshot_contradictory_relation_table_is_rejected() {
+    use resolvo::{
+        DenseIndex, VersionSetRelation,
+        snapshot::{EnvVersionSetRelation, SnapshotProvider, SnapshotRelationError},
+    };
+
+    let mut snapshot = environment_snapshot();
+    let vs0 = VersionSetId::from_index(0);
+    let vs1 = VersionSetId::from_index(1);
+    snapshot.environment_version_set_relations = vec![
+        EnvVersionSetRelation {
+            from: vs0,
+            to: vs1,
+            relation: VersionSetRelation::Subset,
+        },
+        EnvVersionSetRelation {
+            from: vs1,
+            to: vs0,
+            relation: VersionSetRelation::Subset,
+        },
+    ];
+
+    let err = match SnapshotProvider::try_new(&snapshot) {
+        Ok(_) => panic!("expected a contradictory relation table to be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        SnapshotRelationError::ContradictoryRelation {
+            first: vs0,
+            second: vs1,
+            left: VersionSetRelation::Subset,
+            right: VersionSetRelation::Superset,
+        }
+    );
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = snapshot.provider();
+    }))
+    .is_err();
+    assert!(panicked, "provider() must panic on a contradictory table");
+}
+
+/// A relation table that lists the same unordered pair twice with the same
+/// canonicalized relation is rejected as a duplicate. Here `(0, 1) = Subset`
+/// and `(1, 0) = Superset` both canonicalize to `(0, 1) = Subset`.
+#[test]
+fn test_snapshot_duplicate_relation_table_is_rejected() {
+    use resolvo::{
+        DenseIndex, VersionSetRelation,
+        snapshot::{EnvVersionSetRelation, SnapshotProvider, SnapshotRelationError},
+    };
+
+    let mut snapshot = environment_snapshot();
+    let vs0 = VersionSetId::from_index(0);
+    let vs1 = VersionSetId::from_index(1);
+    snapshot.environment_version_set_relations = vec![
+        EnvVersionSetRelation {
+            from: vs0,
+            to: vs1,
+            relation: VersionSetRelation::Subset,
+        },
+        EnvVersionSetRelation {
+            from: vs1,
+            to: vs0,
+            relation: VersionSetRelation::Superset,
+        },
+    ];
+
+    let err = match SnapshotProvider::try_new(&snapshot) {
+        Ok(_) => panic!("expected a duplicate relation table to be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        SnapshotRelationError::DuplicatePair {
+            first: vs0,
+            second: vs1,
+            relation: VersionSetRelation::Subset,
+        }
     );
 }
 
@@ -4119,7 +4217,7 @@ fn test_universal_env_literals_decided_last() {
     // target must already sit at the top of the trail. Without the ordering
     // they are decided right after the variant parents install, far below
     // the chain, and the first retract throws most of the trail away.
-    let (first_target, first_depth) = retracts[0];
+    let (first_target, first_depth) = (retracts[0].target, retracts[0].depth);
     assert!(
         first_target + 2 >= first_depth,
         "cell 0: retract target {first_target} is far below the trail depth {first_depth}; \
@@ -4131,10 +4229,7 @@ fn test_universal_env_literals_decided_last() {
     // known rebuilds the trail in the deferred shape, and every transition
     // after that keeps everything but the env-sensitive tail. Without the
     // ordering every transition that flips an axis retracts deep.
-    let deep_transitions = retracts
-        .iter()
-        .filter(|&&(target, depth)| target + 2 < depth)
-        .count();
+    let deep_transitions = retracts.iter().filter(|r| r.target + 2 < r.depth).count();
     assert!(
         deep_transitions <= 1,
         "{deep_transitions} transitions retracted far below the trail depth; environment \

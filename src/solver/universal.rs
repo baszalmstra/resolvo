@@ -226,6 +226,26 @@ impl CellPinCounts {
     }
 }
 
+/// One diagnostics observation of a free-phase cell's trail retraction during
+/// a universal enumeration (see `Solver::universal_cell_retracts`).
+///
+/// Records how far the trail was retracted before the cell's blocking clause
+/// was added, relative to how deep the trail was at that point. A
+/// [`target`](CellRetract::target) close to the [`depth`](CellRetract::depth)
+/// means trail-prefix preservation kept most of the trail, which is the
+/// load-bearing metric of the env-literals-last decision ordering.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub struct CellRetract {
+    /// The retract target chosen before adding the cell's blocking clause,
+    /// clamped to the trail depth (an unfalsified blocking clause needs no
+    /// retraction).
+    pub target: u32,
+
+    /// The trail depth at that point.
+    pub depth: u32,
+}
+
 /// Returns true when the variable represents an environment literal (either
 /// a matches or an absent literal).
 fn is_env_variable<D: DependencyProvider>(state: &SolverState<D>, variable: VariableId) -> bool {
@@ -305,6 +325,7 @@ impl<Id, N> UniversalProblem<Id, N> {
     /// Creates a new empty [`UniversalProblem`]. Use the setter methods to
     /// build the problem before passing it to
     /// [`Solver::solve_universal`].
+    #[must_use]
     pub fn new() -> Self {
         Self {
             requirements: Vec::new(),
@@ -317,6 +338,7 @@ impl<Id, N> UniversalProblem<Id, N> {
 
     /// Sets the requirements that _must_ have one candidate solvable included
     /// in the solution of every cell.
+    #[must_use]
     pub fn requirements(self, requirements: Vec<ConditionalRequirement>) -> Self {
         Self {
             requirements,
@@ -326,6 +348,7 @@ impl<Id, N> UniversalProblem<Id, N> {
 
     /// Sets the additional constraints imposed on individual packages that
     /// the solvable (if any) chosen for that package _must_ adhere to.
+    #[must_use]
     pub fn constraints(self, constraints: Vec<VersionSetId>) -> Self {
         Self {
             constraints,
@@ -340,6 +363,7 @@ impl<Id, N> UniversalProblem<Id, N> {
     /// solvable, otherwise the universal solve fails with
     /// [`UniversalFailure::Unsolvable`]. An empty CNF means "all
     /// environments".
+    #[must_use]
     pub fn environment_model(self, environment_model: EnvironmentModel<N>) -> Self {
         Self {
             environment_model,
@@ -364,6 +388,7 @@ impl<Id, N> UniversalProblem<Id, N> {
     /// Both are rejected up front by [`Solver::solve_universal`] as
     /// [`UniversalFailure::InvalidInput`] (see [`InvalidUniversalInput`]), as
     /// distinct from a merely stale seed, which heals silently.
+    #[must_use]
     pub fn seed_partition(self, seed_partition: Vec<CellCondition<N>>) -> Self {
         Self {
             seed_partition,
@@ -504,6 +529,7 @@ pub struct CellEdge<Id = SolvableId> {
 /// [`Violation::UnprovenDisjointness`], which callers may choose to treat as
 /// a warning instead of an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Violation<N = NameId> {
     /// The conditions of two cells with different solvable sets are not
     /// provably disjoint, and all relevant oracle answers were definite: the
@@ -816,6 +842,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
 /// Names the [`UniversalProblem`] input that carried an invalid environment
 /// literal, so an [`InvalidUniversalInput`] can point at the offending field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EnvInputSource {
     /// The environment model ([`UniversalProblem::environment_model`]).
     EnvironmentModel,
@@ -898,6 +925,7 @@ impl<N: fmt::Debug> std::error::Error for InvalidUniversalInput<N> {}
 
 /// The errors of an unsuccessful [`Solver::solve_universal`] call.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum UniversalFailure<N = NameId> {
     /// Some region of the environment model has no solution. The whole
     /// universal solve fails because the model is total: every modeled
@@ -1305,7 +1333,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         self.state
                             .propagation_counters
                             .cell_retracts
-                            .push((retract_target.min(depth), depth));
+                            .push(CellRetract {
+                                target: retract_target.min(depth),
+                                depth,
+                            });
                     }
 
                     self.state.assumption_levels = 0;
@@ -1421,7 +1452,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// within a few levels of the trail depth, which is what makes trail
     /// reuse collapse per-cell costs.
     #[cfg(feature = "diagnostics")]
-    pub fn universal_cell_retracts(&self) -> &[(u32, u32)] {
+    pub fn universal_cell_retracts(&self) -> &[CellRetract] {
         &self.state.propagation_counters.cell_retracts
     }
 

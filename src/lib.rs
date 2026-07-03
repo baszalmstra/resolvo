@@ -52,13 +52,13 @@ pub use id::{
 };
 use itertools::Itertools;
 pub use requirement::Requirement;
-#[cfg(feature = "diagnostics")]
-pub use solver::CellPinCounts;
 pub use solver::{
     Cell, CellEdge, EmptySolvables, EnvInputSource, EnvironmentModel, InvalidUniversalInput,
     Problem, Solver, SolverCache, UniversalFailure, UniversalProblem, UniversalSolution,
     UnsolvableOrCancelled, Violation,
 };
+#[cfg(feature = "diagnostics")]
+pub use solver::{CellPinCounts, CellRetract};
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
 
@@ -71,6 +71,7 @@ pub use utils::{IndexedSet, Mapping, MappingIter};
 /// machine has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum VersionSetRelation {
     /// No value matches both version sets.
     Disjoint,
@@ -123,6 +124,7 @@ pub(crate) enum PackageCandidates<S = SolvableId> {
 /// version set via [`Interner::version_set_name`], and only an
 /// [`Absent`](EnvLiteral::Absent) literal carries a package name of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EnvLiteral<N> {
     /// The environment's value for the package exists and matches this version
     /// set. The package the literal refers to is the version set's package,
@@ -161,6 +163,7 @@ impl<N> EnvLiteral<N> {
 /// by [`CellCondition`] (a conjunction), so the two differ only in how their
 /// literals combine, never in the literal representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SignedEnvLiteral<N> {
     /// The environment literal.
     pub literal: EnvLiteral<N>,
@@ -193,6 +196,7 @@ impl<N> From<(EnvLiteral<N>, bool)> for SignedEnvLiteral<N> {
 /// same literals: a disjunction and a conjunction are not interchangeable even
 /// though both range over signed environment literals.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnvClause<N>(Vec<SignedEnvLiteral<N>>);
 
 impl<N> Default for EnvClause<N> {
@@ -248,7 +252,14 @@ impl<N> FromIterator<(EnvLiteral<N>, bool)> for EnvClause<N> {
 /// This is a *conjunction*; the disjunction counterpart is [`EnvClause`]. The
 /// two are intentionally distinct types and cannot be substituted for one
 /// another.
+///
+/// Only [`Serialize`](serde::Serialize) is derived (behind the `serde`
+/// feature), not [`Deserialize`](serde::Deserialize): reconstructing from
+/// serialized data must go through [`CellCondition::new`], which re-establishes
+/// the deduplication/no-contradiction invariant that a derived `Deserialize`
+/// would bypass.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CellCondition<N>(Vec<SignedEnvLiteral<N>>);
 
 impl<N> Default for CellCondition<N> {
@@ -406,7 +417,13 @@ impl<N: Debug> std::error::Error for ContradictoryLiteral<N> {}
 /// Produced by [`UniversalSolution::merged`] and [`UniversalSolution::edges`],
 /// which OR together the conditions of the cells a solvable (or edge) appears
 /// in, simplified within the bounds of the environment model.
+///
+/// Only [`Serialize`](serde::Serialize) is derived (behind the `serde`
+/// feature), not [`Deserialize`](serde::Deserialize): reconstructing from
+/// serialized data must go through [`Presence::new`], which re-establishes the
+/// duplicate-disjunct normalization that a derived `Deserialize` would bypass.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Presence<N>(Vec<CellCondition<N>>);
 
 impl<N> Presence<N> {

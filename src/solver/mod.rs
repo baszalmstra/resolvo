@@ -59,7 +59,7 @@ pub use universal::{
 };
 
 #[cfg(feature = "diagnostics")]
-pub use universal::CellPinCounts;
+pub use universal::{CellPinCounts, CellRetract};
 
 /// Describes the problem that is to be solved by the solver.
 ///
@@ -790,7 +790,7 @@ pub(crate) struct PropagationCounters {
     /// clause (clamped to the trail depth; an unfalsified blocking clause
     /// needs no retraction) and the trail depth at that point. Empty for a
     /// plain solve and for seeded cells.
-    pub cell_retracts: Vec<(u32, u32)>,
+    pub cell_retracts: Vec<universal::CellRetract>,
     /// For each recorded cell of a universal solve, the number of cell
     /// literals each pinning rule contributed (load-bearing extraction
     /// versus disjointness-repair appends). Empty for a plain solve.

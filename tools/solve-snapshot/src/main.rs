@@ -767,6 +767,10 @@ fn main() {
                         );
                         record.outcome = "timeout";
                     }
+                    Err(_) => {
+                        eprintln!("{}", style("==> UNEXPECTED FAILURE").red());
+                        record.outcome = "error";
+                    }
                 }
                 #[cfg(feature = "diagnostics")]
                 {
