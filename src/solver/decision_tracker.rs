@@ -36,6 +36,19 @@ pub(crate) struct DecisionTracker {
     /// truncation happened means nothing is invalidated); the `Default`
     /// of zero after `clear()` invalidates everything, as it must.
     assert_floor: usize,
+
+    /// The lowest stack length observed since the last call to
+    /// [`Self::take_encode_floor`]. The clause-encode scans of
+    /// [`crate::solver::Solver`] (`run_sat`'s new-solvables rescan and
+    /// `has_pending_clause_encodes`) keep a cursor of how far into the
+    /// trail they have already looked; a backjump can replace trail
+    /// entries below that cursor with different assignments, and this
+    /// floor tells the scans how far to lower the cursor to see them.
+    /// Like `assert_floor` it is armed to `usize::MAX` when taken (no
+    /// truncation happened means no entry below the cursor changed); the
+    /// `Default` of zero after `clear()` invalidates everything, as it
+    /// must.
+    encode_floor: usize,
 }
 
 impl DecisionTracker {
@@ -139,6 +152,7 @@ impl DecisionTracker {
         self.propagate_index = self.stack.len();
         self.sync_floor = self.sync_floor.min(self.stack.len());
         self.assert_floor = self.assert_floor.min(self.stack.len());
+        self.encode_floor = self.encode_floor.min(self.stack.len());
 
         let top_decision = self.stack.last().unwrap();
         (decision, self.map.level(top_decision.variable))
@@ -171,6 +185,21 @@ impl DecisionTracker {
     /// cleared tracker reports a floor of zero: everything is invalidated.
     pub(crate) fn take_assert_floor(&mut self) -> usize {
         std::mem::replace(&mut self.assert_floor, usize::MAX)
+    }
+
+    /// Returns the lowest stack length observed since the previous call and
+    /// re-arms the marker to `usize::MAX`.
+    ///
+    /// The clause-encode scans lower their trail cursor to this floor before
+    /// scanning: every trail position at or beyond it may hold a different
+    /// assignment than when the cursor last passed it (a truncation to
+    /// length `n` pops exactly the positions `>= n`), while positions below
+    /// it are untouched since. When nothing was undone the floor is
+    /// `usize::MAX` and the cursor stands. A fresh or cleared tracker
+    /// reports a floor of zero: everything must be rescanned. See
+    /// [`Self::encode_floor`].
+    pub(crate) fn take_encode_floor(&mut self) -> usize {
+        std::mem::replace(&mut self.encode_floor, usize::MAX)
     }
 }
 

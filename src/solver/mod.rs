@@ -511,6 +511,26 @@ pub(crate) struct SolverState<D: DependencyProvider> {
 
     pub(crate) decision_tracker: DecisionTracker,
 
+    /// How far into the trail the clause-encode scans ([`Solver::run_sat`]'s
+    /// new-solvables rescan and [`Solver::has_pending_clause_encodes`]) have
+    /// already looked.
+    ///
+    /// Invariant: every trail entry below the cursor has already been
+    /// scanned while it was on the trail, so any positive solvable
+    /// assignment among them is already present in
+    /// [`Self::clauses_added_for_solvable`] — solvables are inserted into
+    /// that set when their dependency fetch is *queued* (see
+    /// `Encoder::queue_solvable`), and the set is monotone: entries are
+    /// only inserted, never removed, for the lifetime of this state.
+    /// Rescanning below the cursor is therefore a no-op. A backjump can
+    /// replace trail entries below the cursor with different assignments;
+    /// [`DecisionTracker::take_encode_floor`] reports the deepest
+    /// truncation since the previous scan, and every scan lowers the
+    /// cursor to that floor before looking. The cursor is only raised
+    /// after the encode call for a scanned batch succeeded, so an error
+    /// return cannot skip entries.
+    encode_scan_cursor: usize,
+
     /// The number of assumption decision levels currently active: decisions
     /// at levels `1..=assumption_levels` are seeded-cell assumptions pushed
     /// by `solve_universal`, derived from [`ClauseId::assumption`]. Zero
@@ -651,6 +671,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             requires_aux_vars: Default::default(),
             requires_gate_requirers: Default::default(),
             decision_tracker: Default::default(),
+            encode_scan_cursor: 0,
             assumption_levels: 0,
             propagated_total: 0,
             prefix_budget_deadline: None,
@@ -1391,11 +1412,19 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // Determine which solvables are part of the solution for which we did not yet
             // get any dependencies. If we find any such solvable it means we
             // did not arrive at the full solution yet.
+            // Trail entries below the scan cursor were already scanned (and
+            // hence queued for encoding, see
+            // [`SolverState::encode_scan_cursor`]); only look at the suffix.
+            // A backjump since the previous scan may have replaced entries
+            // below the cursor, so lower it to the deepest truncation first.
+            let encode_floor = self.state.decision_tracker.take_encode_floor();
+            self.state.encode_scan_cursor = self.state.encode_scan_cursor.min(encode_floor);
+            let scanned_trail_len = self.state.decision_tracker.stack_len();
             new_solvables.clear();
             new_solvables.extend(
-                self.state
-                    .decision_tracker
-                    .stack()
+                self.state.decision_tracker.assignments()[self.state.encode_scan_cursor..]
+                    .iter()
+                    .copied()
                     // Filter only decisions that led to a positive assignment
                     .filter(|d| d.value)
                     // Select solvables for which we do not yet have dependencies
@@ -1488,6 +1517,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             {
                 self.state.propagation_counters.encoding_duration += encoding_start.elapsed();
             }
+
+            // The encode succeeded: every positive solvable assignment in the
+            // scanned batch is now queued in `clauses_added_for_solvable`
+            // (the ones that were not already), so the cursor may pass it.
+            // An encode error above skips this and the batch is rescanned.
+            self.state.encode_scan_cursor = scanned_trail_len;
 
             // Serially process the outputs, to reduce the need for synchronization
             for &clause_id in &conflicting_clauses {
@@ -1966,18 +2001,27 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// [`Solver::run_sat`] would find it). Used by [`Solver::decide`] to
     /// postpone deferred env decisions until the formula for every chosen
     /// solvable is present.
-    fn has_pending_clause_encodes(&self) -> bool {
-        self.state.decision_tracker.stack().any(|d| {
-            d.value
-                && d.variable
-                    .as_solvable_or_root(&self.state.variable_map)
-                    .is_some_and(|solvable_or_root| {
-                        !self
-                            .state
-                            .clauses_added_for_solvable
-                            .contains(solvable_or_root)
-                    })
-        })
+    ///
+    /// Trail entries below [`SolverState::encode_scan_cursor`] are already
+    /// queued for encoding and can never match; only the suffix is scanned.
+    /// Taking the encode floor here is sound because it is folded into the
+    /// same cursor the `run_sat` scan uses.
+    fn has_pending_clause_encodes(&mut self) -> bool {
+        let encode_floor = self.state.decision_tracker.take_encode_floor();
+        self.state.encode_scan_cursor = self.state.encode_scan_cursor.min(encode_floor);
+        self.state.decision_tracker.assignments()[self.state.encode_scan_cursor..]
+            .iter()
+            .any(|d| {
+                d.value
+                    && d.variable
+                        .as_solvable_or_root(&self.state.variable_map)
+                        .is_some_and(|solvable_or_root| {
+                            !self
+                                .state
+                                .clauses_added_for_solvable
+                                .contains(solvable_or_root)
+                        })
+            })
     }
 
     /// Executes one iteration of the CDCL loop
