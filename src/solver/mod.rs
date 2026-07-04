@@ -2,7 +2,6 @@ use std::{any::Any, fmt::Display};
 
 use ahash::{HashMap, HashSet};
 use assertion_scans::AssertionScans;
-use cache::EnvRelationHook;
 pub use cache::SolverCache;
 use clause::{Clause, EnvClause, EnvClauseKind, EnvConstrainsClause, Literal, WatchedLiterals};
 use conditions::{DeferredRequirement, Disjunction, DisjunctionId, condition_disjunct_holds};
@@ -3462,13 +3461,13 @@ impl<D: DependencyProvider> SolverState<D> {
     ///
     /// Returns the variable id of `L_S`.
     ///
-    /// `env_relation` is the universal-solve relation oracle hook (installed on
-    /// the cache by [`Solver::solve_universal`]); this method is only reachable
-    /// while it is present, so a missing hook is a bug.
+    /// The relation oracle is consulted through `cache`'s memoized accessor
+    /// ([`SolverCache::env_version_set_relation`]); this method is only
+    /// reachable during a universal solve, which installs the relation hook
+    /// on the cache before any encoding, so a missing hook is a bug.
     pub(crate) fn intern_env_matches_with_oracle_clauses(
         &mut self,
-        provider: &D,
-        env_relation: Option<EnvRelationHook<D>>,
+        cache: &SolverCache<D>,
         version_set_id: VersionSetId,
         package_name: D::NameId,
     ) -> VariableId {
@@ -3505,12 +3504,7 @@ impl<D: DependencyProvider> SolverState<D> {
             // `b` = the previously interned literal; the match arms below
             // depend on this argument order. Only reachable during a universal
             // solve, which installs the relation hook before encoding.
-            let relation = env_relation
-                .expect("env_relation hook must be installed for universal solves")(
-                provider,
-                version_set_id,
-                *prior_vs,
-            );
+            let relation = cache.env_version_set_relation(version_set_id, *prior_vs);
 
             match relation {
                 VersionSetRelation::Disjoint => {

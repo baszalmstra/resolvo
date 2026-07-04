@@ -75,6 +75,16 @@ pub struct SolverCache<D: DependencyProvider> {
     /// outlives the per-solve state reset) so the encoder can thread it into
     /// [`SolverState::intern_env_matches_with_oracle_clauses`](crate::solver::SolverState).
     env_relation: Option<EnvRelationHook<D>>,
+
+    /// Memo for [`Self::env_version_set_relation`]: the relation of two
+    /// version sets is a pure function of the provider, so each ordered pair
+    /// is asked of the provider at most once per cache lifetime. Keyed by
+    /// the ordered pair as queried (the relation is direction-sensitive:
+    /// Subset and Superset flip). Like the other provider caches it survives
+    /// the per-pass `SolverState` resets of a universal enumeration, so the
+    /// oracle-consistency encoding of reseed passes and the disjointness
+    /// repair of every cell share the answers.
+    env_relation_memo: RefCell<HashMap<(VersionSetId, VersionSetId), VersionSetRelation>>,
 }
 
 impl<D: DependencyProvider> SolverCache<D> {
@@ -93,6 +103,7 @@ impl<D: DependencyProvider> SolverCache<D> {
             hint_dependencies_available: Default::default(),
             env_classify: None,
             env_relation: None,
+            env_relation_memo: Default::default(),
         }
     }
 
@@ -125,10 +136,25 @@ impl<D: DependencyProvider> SolverCache<D> {
         self.env_relation = Some(relation);
     }
 
-    /// Returns the installed environment relation oracle hook, if any (see
-    /// [`SolverCache::env_relation`]). `None` outside a universal solve.
-    pub(crate) fn env_relation(&self) -> Option<EnvRelationHook<D>> {
-        self.env_relation
+    /// Answers the environment version-set relation oracle through the memo
+    /// (see [`SolverCache::env_relation_memo`]): the provider is asked at
+    /// most once per ordered pair, repeated queries hit the map.
+    ///
+    /// Only reachable during a universal solve, which installs the relation
+    /// hook before any encoding; a missing hook is a bug.
+    pub(crate) fn env_version_set_relation(
+        &self,
+        a: VersionSetId,
+        b: VersionSetId,
+    ) -> VersionSetRelation {
+        let relation = self
+            .env_relation
+            .expect("env_relation hook must be installed for universal solves");
+        *self
+            .env_relation_memo
+            .borrow_mut()
+            .entry((a, b))
+            .or_insert_with(|| relation(&self.provider, a, b))
     }
 
     /// Returns the candidates for the package with the given name. This will

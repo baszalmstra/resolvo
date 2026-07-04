@@ -241,6 +241,43 @@ impl CellPinCounts {
     }
 }
 
+/// Inverted index over the recorded cells' literals of one enumeration
+/// pass: variable id -> a pair of cell-index bitsets, one per literal sign
+/// (`[negative occurrences, positive occurrences]`, bit `i` = recorded
+/// cell `i` contains the literal with that sign). Maintained by
+/// `Solver::enumerate_universal` as cells are recorded;
+/// `Solver::repair_disjointness` ORs the complementary-sign bitsets of the
+/// new cell's literals to find the earlier cells that share a variable at
+/// the opposite sign (which are provably disjoint and need no repair)
+/// word-parallel, without scanning every cell pair.
+#[derive(Default)]
+struct CellLiteralIndex {
+    by_variable: ahash::HashMap<VariableId, [Vec<u64>; 2]>,
+}
+
+impl CellLiteralIndex {
+    /// Records that cell `cell_index` contains `(variable, value)`.
+    fn record(&mut self, variable: VariableId, value: bool, cell_index: usize) {
+        let bits = &mut self.by_variable.entry(variable).or_default()[usize::from(value)];
+        let word = cell_index / 64;
+        if word >= bits.len() {
+            bits.resize(word + 1, 0);
+        }
+        bits[word] |= 1 << (cell_index % 64);
+    }
+
+    /// ORs the bitset of cells containing `variable` with the sign opposite
+    /// to `value` into `marks` (sized by the caller to cover every recorded
+    /// cell).
+    fn mark_complementary(&self, variable: VariableId, value: bool, marks: &mut [u64]) {
+        if let Some(bits) = self.by_variable.get(&variable) {
+            for (mark, &bits) in marks.iter_mut().zip(&bits[usize::from(!value)]) {
+                *mark |= bits;
+            }
+        }
+    }
+}
+
 /// The per-cell capture inputs shared by `Solver::extract_cell` and
 /// `Solver::capture_cell_edges`, collected in one trail scan by
 /// `Solver::collect_cell_capture_inputs` (see there for the exact
@@ -1312,8 +1349,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
         let mut cells: Vec<Cell<D::SolvableId, D::NameId>> = Vec::new();
         // The same cells in solver variable space, used for disjointness
-        // checks against new cells.
+        // checks against new cells, plus the inverted literal index the
+        // disjointness repair uses to skip provably disjoint pairs.
         let mut cell_assignments: Vec<Vec<(VariableId, bool)>> = Vec::new();
+        let mut cell_literal_index = CellLiteralIndex::default();
 
         // Cells from a previous solve are solved first, in order, each under
         // its condition pushed as assumption decisions (design doc 5.7). When
@@ -1367,7 +1406,12 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // the retraction after the edges are captured.
                     let capture_inputs = self.collect_cell_capture_inputs();
                     let (mut cell, mut pins) = self.extract_cell(&capture_inputs);
-                    self.repair_disjointness(&mut cell, &cell_assignments, &mut pins);
+                    self.repair_disjointness(
+                        &mut cell,
+                        &cell_assignments,
+                        &cell_literal_index,
+                        &mut pins,
+                    );
                     #[cfg(feature = "diagnostics")]
                     self.state.propagation_counters.cell_pins.push(pins);
 
@@ -1378,6 +1422,9 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     let edges = self.capture_cell_edges(&capture_inputs);
                     let cell_is_empty = cell.is_empty();
                     cells.push(Cell::new(condition, solvables, edges));
+                    for &(variable, value) in &cell {
+                        cell_literal_index.record(variable, value, cell_assignments.len());
+                    }
                     cell_assignments.push(cell.clone());
 
                     #[cfg(feature = "diagnostics")]
@@ -1835,8 +1882,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         let package_name = self.cache.provider().version_set_name(version_set);
                         self.declare_environment_package(package_name, "environment model")?;
                         self.state.intern_env_matches_with_oracle_clauses(
-                            self.cache.provider(),
-                            self.cache.env_relation(),
+                            &self.cache,
                             version_set,
                             package_name,
                         )
@@ -1935,8 +1981,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     let package_name = self.cache.provider().version_set_name(version_set);
                     self.declare_environment_package(package_name, "seed partition")?;
                     self.state.intern_env_matches_with_oracle_clauses(
-                        self.cache.provider(),
-                        self.cache.env_relation(),
+                        &self.cache,
                         version_set,
                         package_name,
                     )
@@ -2394,14 +2439,36 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ///
     /// `pins` is the literal-attribution record started by
     /// [`Self::extract_cell`]; the repair adds its agreement pins and
-    /// distinguishing appends to it.
+    /// distinguishing appends to it. `literal_index` is the inverted index
+    /// over the earlier cells' literals maintained by the enumeration loop
+    /// (see [`CellLiteralIndex`]).
     fn repair_disjointness(
         &self,
         cell: &mut Vec<(VariableId, bool)>,
         earlier_cells: &[Vec<(VariableId, bool)>],
+        literal_index: &CellLiteralIndex,
         pins: &mut CellPinCounts,
     ) {
-        for earlier in earlier_cells {
+        // Fast path: an earlier cell that shares a variable with `cell` at
+        // the COMPLEMENTARY sign is provably disjoint (the first rule of
+        // [`Self::provably_disjoint`]), and a provably disjoint earlier cell
+        // contributes nothing to the repair, so it can be skipped without
+        // running the full pairwise check. The inverted index marks those
+        // cells word-parallel in O(|cell| x cells/64) instead of a literal
+        // pair scan per cell. The marks stay valid throughout the loop below
+        // even though the repair appends literals to `cell`: appending never
+        // removes the complementary pair, so the full check would still
+        // conclude "disjoint" (and skip) for every marked cell.
+        let mut complementary = vec![0u64; earlier_cells.len().div_ceil(64)];
+        for &(variable, value) in cell.iter() {
+            literal_index.mark_complementary(variable, value, &mut complementary);
+        }
+
+        for (earlier_index, earlier) in earlier_cells.iter().enumerate() {
+            if complementary[earlier_index / 64] & (1 << (earlier_index % 64)) != 0 {
+                debug_assert!(self.provably_disjoint(cell, earlier));
+                continue;
+            }
             if self.provably_disjoint(cell, earlier) {
                 continue;
             }
@@ -2471,9 +2538,12 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     (VariableOrigin::EnvMatches(vs_a), VariableOrigin::EnvMatches(vs_b)) => {
                         let provider = self.provider();
                         // The relation oracle is only defined for version
-                        // sets of the same package.
+                        // sets of the same package. Queried through the
+                        // cache's memo ([`SolverCache::env_version_set_relation`]):
+                        // the repair re-asks about the same literal pairs for
+                        // every later cell.
                         if provider.version_set_name(vs_a) == provider.version_set_name(vs_b)
-                            && provider.environment_version_set_relation(vs_a, vs_b)
+                            && self.cache.env_version_set_relation(vs_a, vs_b)
                                 == VersionSetRelation::Disjoint
                         {
                             return true;

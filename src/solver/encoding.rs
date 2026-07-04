@@ -598,8 +598,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 &RequirementCandidates::Environment(version_set) => {
                     let package_name = self.cache.provider().version_set_name(version_set);
                     vec![self.state.intern_env_matches_with_oracle_clauses(
-                        self.cache.provider(),
-                        self.cache.env_relation(),
+                        self.cache,
                         version_set,
                         package_name,
                     )]
@@ -692,8 +691,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                             // The complement of an env literal L_S is `not L_S`.
                             let package_name = self.cache.provider().version_set_name(version_set);
                             let variable = self.state.intern_env_matches_with_oracle_clauses(
-                                self.cache.provider(),
-                                self.cache.env_relation(),
+                                self.cache,
                                 version_set,
                                 package_name,
                             );
@@ -1060,12 +1058,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         env_pkg: EnvironmentPackage,
     ) {
         let package_name = self.cache.provider().version_set_name(constraint);
-        let matches_var = self.state.intern_env_matches_with_oracle_clauses(
-            self.cache.provider(),
-            self.cache.env_relation(),
-            constraint,
-            package_name,
-        );
+        let matches_var =
+            self.state
+                .intern_env_matches_with_oracle_clauses(self.cache, constraint, package_name);
 
         // Intern the absent literal if the package can be absent. It usually
         // already exists (interned by `on_candidates_available`), but task
