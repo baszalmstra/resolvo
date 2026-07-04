@@ -158,14 +158,21 @@ use crate::{
 
 /// The result of one enumeration pass (see `Solver::enumerate_universal`):
 /// either a complete partition, or the trail-reuse attempt was abandoned and
-/// the enumeration must re-run from scratch without it. The abandoned
-/// attempt's cells are NOT reused as seeds: replaying a large recorded
-/// partition is itself a search liability (a heavily seeded re-enumeration
-/// has been observed to behave far worse than the plain restart-from-zero
-/// enumeration), and the fallback must be exactly the no-reuse baseline.
+/// the enumeration must re-run from scratch without it.
 enum EnumerationOutcome<Id, N> {
     Done(UniversalSolution<Id, N>),
-    ReuseAbandoned,
+    /// The trail-reuse attempt exceeded its work budget. The payload is the
+    /// seed list for the reuse-free retry: the cells the attempt recorded
+    /// before the abort (in recording order; each a verified-disjoint
+    /// region whose seeded replay is an assumption-driven solve, the cheap
+    /// path), followed by any original seeds the attempt had not yet
+    /// processed. Every seed that WAS processed is either reflected in a
+    /// recorded cell or was legitimately dropped as stale, so the
+    /// concatenation preserves the original seed partition's influence and
+    /// the stale-seed-drop semantics while saving the abandoned attempt's
+    /// coverage work (measured: idx-33-class problems used to pay 40-48%
+    /// of their cost re-deriving the discarded first attempt).
+    ReuseAbandoned(Vec<CellCondition<N>>),
 }
 
 /// The number of ordinary decision levels (decisions on variables that are
@@ -1249,10 +1256,14 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// prefix-started run exceeds its work budget the attempt is abandoned
     /// wholesale (the solver state shaped by reused transitions performs
     /// badly under real search and is not repairable in place) and the
-    /// enumeration re-runs from a fresh state with reuse disabled, exactly
-    /// as if trail reuse did not exist. The wasted attempt is bounded by the
-    /// work budgets; the fallback never aborts, so at most one rebuild
-    /// happens.
+    /// enumeration re-runs from a fresh state with reuse disabled, seeded
+    /// by the cells the abandoned attempt already recorded (followed by its
+    /// unprocessed original seeds, see
+    /// [`EnumerationOutcome::ReuseAbandoned`]) so the coverage work spent
+    /// before the abort is replayed as cheap assumption-driven solves
+    /// instead of being re-searched from zero. The wasted attempt is
+    /// bounded by the work budgets; the fallback never aborts, so at most
+    /// one rebuild happens.
     #[allow(clippy::type_complexity)]
     fn enumerate_universal_with_fallback(
         &mut self,
@@ -1269,21 +1280,22 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             true,
         )? {
             EnumerationOutcome::Done(solution) => Ok(solution),
-            EnumerationOutcome::ReuseAbandoned => {
+            EnumerationOutcome::ReuseAbandoned(retry_seeds) => {
                 prop_hit!(UNIVERSAL_REUSE_ABANDONED);
                 tracing::debug!(
-                    "trail reuse exceeded its work budget; re-enumerating from scratch \
-                     without it"
+                    "trail reuse exceeded its work budget; re-enumerating without it, \
+                     seeded by the {} cells found so far (plus unprocessed seeds)",
+                    retry_seeds.len(),
                 );
                 match self.enumerate_universal(
                     requirements.to_vec(),
                     constraints.to_vec(),
                     environment_model.clone(),
-                    seed_partition.to_vec(),
+                    retry_seeds,
                     false,
                 )? {
                     EnumerationOutcome::Done(solution) => Ok(solution),
-                    EnumerationOutcome::ReuseAbandoned => {
+                    EnumerationOutcome::ReuseAbandoned(_) => {
                         unreachable!("the budget is never armed when trail reuse is disabled")
                     }
                 }
@@ -1696,7 +1708,19 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             reuse_trail,
                             "bug: the prefix budget is never armed without trail reuse"
                         );
-                        return Ok(EnumerationOutcome::ReuseAbandoned);
+                        // Carry the abandoned attempt's coverage work into
+                        // the retry: the recorded cells (in order), then any
+                        // original seeds not yet processed at the abort (the
+                        // prefix budget only arms after the seeds ran out,
+                        // so the leftover is normally empty; chaining keeps
+                        // the contract exact either way). See
+                        // `EnumerationOutcome::ReuseAbandoned`.
+                        let retry_seeds = cells
+                            .iter()
+                            .map(|cell| cell.condition().clone())
+                            .chain(pending_seeds)
+                            .collect();
+                        return Ok(EnumerationOutcome::ReuseAbandoned(retry_seeds));
                     }
                     // A free episode that exceeded the witness-probe budget
                     // (see `WITNESS_PROBE_BUDGET`) escalates to the

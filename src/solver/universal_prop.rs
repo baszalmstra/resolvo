@@ -2214,35 +2214,36 @@ fn build_env_tail_chain_provider(chain_len: usize) -> (EnvTestProvider, VersionS
 
 /// Trail-reuse abandonment fallback: with the kept-prefix work budget forced
 /// to zero (the test-only override), the first prefix-started run aborts
-/// with `PrefixBudgetExhausted` and `solve_universal` re-enumerates from
-/// scratch with reuse disabled. The fallback must complete, produce the same
-/// partition as an unhindered solve (trail reuse does not change the
-/// partition of this scenario, so the fallback's reuse-free enumeration is
-/// byte-comparable), and stay a reseed fixed point.
+/// with `PrefixBudgetExhausted` and `solve_universal` re-enumerates with
+/// reuse disabled, seeded by the cells the abandoned attempt recorded.
+///
+/// CONTRACT NOTE: this test used to assert byte-identity with an unhindered
+/// enumeration, which held while the fallback re-ran the original (empty)
+/// seed list from scratch. The fallback now deliberately seeds the retry
+/// with the abandoned attempt's cells to save its coverage work, and a
+/// seeded re-enumeration may legitimately HEAL the partition (record more
+/// general cells than its seeds, design doc 5.7), so byte-identity with the
+/// unseeded baseline is no longer the contract. What must hold instead: the
+/// fallback completes, the partition verifies and projects correctly on
+/// every modeled environment, the reseed fixed point holds, and the
+/// fallback is deterministic.
 #[test]
 fn test_universal_trail_reuse_abandonment_fallback() {
     use crate::solver::prop_counters::hits;
     let abandoned_before = hits::get(&hits::UNIVERSAL_REUSE_ABANDONED);
     let abort_before = hits::get(&hits::PREFIX_BUDGET_ABORT);
 
-    // The baseline partition, solved without any override.
-    let (provider, top_any) = build_env_tail_chain_provider(3);
-    let mut baseline_solver = Solver::new(provider);
-    let baseline = baseline_solver
-        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
-        .expect("solvable");
-
-    // The same problem with the prefix budget forced to zero: the transition
-    // into the second cell keeps a trail prefix, arms the budget, aborts and
-    // falls back to a reuse-free enumeration.
+    // The prefix budget forced to zero: the transition into the second cell
+    // keeps a trail prefix, arms the budget, aborts and falls back to a
+    // reuse-free enumeration seeded with the first attempt's cells.
     let (provider, top_any) = build_env_tail_chain_provider(3);
     let mut solver = Solver::new(provider);
     solver.set_test_prefix_budget_override(Some(0));
     let solution = solver
         .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
-        .expect("the fallback must complete");
+        .expect("(a) the fallback must complete");
 
-    // (a) The fallback ran: both the propagation-side abort and the
+    // The fallback ran: both the propagation-side abort and the
     // enumeration-side abandonment fired.
     assert!(
         hits::get(&hits::PREFIX_BUDGET_ABORT) > abort_before,
@@ -2253,15 +2254,47 @@ fn test_universal_trail_reuse_abandonment_fallback() {
         "the abandonment fallback must have run"
     );
 
-    // (b) The partition verifies and is byte-identical to the unhindered
-    // (trail-reuse) enumeration, which for this scenario equals the
-    // reuse-free one.
+    // (b) The partition verifies, and projects correctly onto every modeled
+    // environment: exactly one cell matches each `env0` version, and that
+    // cell drags the chain (`y` and the `z`s) exactly where `env0 in 5..10`
+    // activates the conditional requirement.
     assert_eq!(solution.verify(solver.provider()), Ok(()));
-    assert_eq!(
-        format!("{:?}", solution.cells()),
-        format!("{:?}", baseline.cells()),
-        "the fallback enumeration must produce the baseline partition"
-    );
+    let provider = solver.provider();
+    for env0 in 0..12u32 {
+        let matching: Vec<_> = solution
+            .cells()
+            .iter()
+            .filter(|cell| {
+                cell.condition().literals().all(|signed| {
+                    let holds = match signed.literal {
+                        EnvLiteral::Matches(version_set) => provider
+                            .pool
+                            .resolve_version_set(version_set)
+                            .contains(env0),
+                        // env0 is declared can_be_absent: false.
+                        EnvLiteral::Absent(_) => false,
+                    };
+                    holds == signed.positive
+                })
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one cell must match env0={env0} (got {})",
+            matching.len()
+        );
+        let expects_chain = (5..10).contains(&env0);
+        let has_y = matching[0].solvables().iter().any(|&solvable| {
+            provider.pool.resolve_solvable(solvable).name == provider.pool.intern_package_name("y")
+        });
+        assert_eq!(
+            has_y,
+            expects_chain,
+            "env0={env0} must install y iff env0 in 5..10 (cell {})",
+            matching[0].condition().display(provider),
+        );
+    }
 
     // (c) Reseed fixed point after abandonment: re-solving with the
     // partition's own conditions as seeds (still under the zero budget)
@@ -2282,6 +2315,20 @@ fn test_universal_trail_reuse_abandonment_fallback() {
         format!("{:?}", solution.cells()),
         format!("{:?}", reseeded.cells()),
         "the reseed fixed point must hold after abandonment"
+    );
+
+    // (d) Determinism: an identical fresh run of the fallback reproduces
+    // the partition byte-identically.
+    let (provider, top_any) = build_env_tail_chain_provider(3);
+    let mut second = Solver::new(provider);
+    second.set_test_prefix_budget_override(Some(0));
+    let repeat = second
+        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+        .expect("the repeated fallback must complete");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", repeat.cells()),
+        "identical fallback runs must be byte-identical"
     );
 }
 
