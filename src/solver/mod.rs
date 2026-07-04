@@ -1016,6 +1016,16 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.deferred_requirements_count()
     }
 
+    /// Returns a counter that increases whenever the solver's cache learns
+    /// something new from the provider (a package's candidates or a
+    /// solvable's dependencies). This is a measurement observation point
+    /// (benchmarks use it to count provider round-trips, e.g. the fetches
+    /// saved by the lazy conditional-candidates path); it carries no solver
+    /// semantics.
+    pub fn provider_fetch_count(&self) -> usize {
+        self.cache.fetch_count()
+    }
+
     /// Overrides the per-run conflict limit of the refutation switch (see
     /// [`ENV_ORDERING_CONFLICT_LIMIT`]). Diagnostics-only: tests use a low
     /// limit to exercise the switch on small universes, and benchmark

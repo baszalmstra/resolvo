@@ -19,9 +19,9 @@ use rand::{
     rngs::StdRng,
 };
 use resolvo::{
-    CellCondition, ConditionalRequirement, EnvClause, EnvLiteral, EnvironmentModel, NameId,
-    Problem, SignedEnvLiteral, SolvableId, Solver, UniversalFailure, UniversalProblem,
-    UniversalSolution, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
+    CellCondition, Condition, ConditionalRequirement, EnvClause, EnvLiteral, EnvironmentModel,
+    Interner, NameId, Problem, SignedEnvLiteral, SolvableId, Solver, UniversalFailure,
+    UniversalProblem, UniversalSolution, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
     snapshot::{DependencySnapshot, SnapshotProvider},
 };
 
@@ -103,6 +103,15 @@ struct Opts {
     /// reseeded solution is byte-identical, in extra CSV columns.
     #[clap(long)]
     reseed: bool,
+
+    /// With this probability, each generated root requirement becomes a
+    /// conditional requirement `req IF version-set-of-another-randomly-chosen
+    /// -concrete-package` (the condition targets a different package than the
+    /// requirement). The default of 0 draws nothing extra from the rng, so
+    /// the generated problem corpus stays byte-identical to earlier versions
+    /// of this tool.
+    #[clap(long, default_value = "0.0")]
+    conditional_prob: f64,
 }
 
 /// One signed environment literal in the model file, e.g.
@@ -144,6 +153,10 @@ struct Record {
     verify: Option<String>,
     projected: Option<String>,
     error: Option<String>,
+    /// Provider round-trips of the solve (see
+    /// [`Solver::provider_fetch_count`]): what the lazy
+    /// conditional-candidates path is meant to reduce.
+    fetches: Option<usize>,
 }
 
 /// The CSV row written with `--reseed`: every [`Record`] column (in the same
@@ -164,6 +177,8 @@ struct ReseedRecord {
     verify: Option<String>,
     projected: Option<String>,
     error: Option<String>,
+    /// Provider round-trips of the original solve (see [`Record::fetches`]).
+    fetches: Option<usize>,
     /// Wall time of the cold-cache seeded re-solve in seconds.
     reseed_duration: Option<f64>,
     /// Enumeration passes the seeded re-solve took (see
@@ -173,6 +188,8 @@ struct ReseedRecord {
     /// (its `Debug` cell listing compares equal; ids are comparable because
     /// the fresh provider is constructed identically from the snapshot).
     reseed_identical: Option<bool>,
+    /// Provider round-trips of the cold-cache seeded re-solve.
+    reseed_fetches: Option<usize>,
 }
 
 impl ReseedRecord {
@@ -189,6 +206,7 @@ impl ReseedRecord {
             verify,
             projected,
             error,
+            fetches,
         } = record;
         ReseedRecord {
             index,
@@ -202,9 +220,11 @@ impl ReseedRecord {
             verify,
             projected,
             error,
+            fetches,
             reseed_duration: reseed.as_ref().map(|m| m.duration),
             reseed_passes: reseed.as_ref().map(|m| m.passes),
             reseed_identical: reseed.as_ref().map(|m| m.identical),
+            reseed_fetches: reseed.as_ref().map(|m| m.fetches),
         }
     }
 }
@@ -214,15 +234,27 @@ struct ReseedMeasurement {
     duration: f64,
     passes: u32,
     identical: bool,
+    fetches: usize,
 }
 
 /// One randomly drawn root requirement, kept as a spec (instead of a built
 /// [`ConditionalRequirement`]) so it can be replayed onto a FRESH provider:
-/// `Package` requirements intern an additional version set on the provider
-/// they are built against, and the reseed flow needs the identical ids on
-/// its own provider instance.
+/// `Package` requirements intern an additional version set (and conditional
+/// requirements an additional condition) on the provider they are built
+/// against, and the reseed flow needs the identical ids on its own provider
+/// instance.
 #[derive(Copy, Clone)]
-enum RequirementSpec {
+struct RequirementSpec {
+    target: TargetSpec,
+    /// When set (drawn with `--conditional-prob`), the requirement is the
+    /// conditional `target IF condition`, where the condition is a version
+    /// set on a concrete package different from the target's.
+    condition: Option<VersionSetId>,
+}
+
+/// The target of one randomly drawn root requirement.
+#[derive(Copy, Clone)]
+enum TargetSpec {
     /// `add_package_requirement(name, "*")`.
     Package(NameId),
     /// A version set requirement straight from the snapshot.
@@ -233,20 +265,48 @@ enum RequirementSpec {
 
 /// Builds the root requirements for `specs` against `provider`. Replaying
 /// the same specs in the same order onto identically constructed providers
-/// yields identical requirement ids (`add_package_requirement` allocates
-/// deterministically).
+/// yields identical requirement ids (`add_package_requirement` and
+/// `add_condition` allocate deterministically).
 fn build_requirements(
     provider: &mut SnapshotProvider<'_>,
     specs: &[RequirementSpec],
 ) -> Vec<ConditionalRequirement> {
     specs
         .iter()
-        .map(|&spec| match spec {
-            RequirementSpec::Package(name) => provider.add_package_requirement(name, "*").into(),
-            RequirementSpec::VersionSet(version_set) => version_set.into(),
-            RequirementSpec::Union(union) => union.into(),
+        .map(|&spec| {
+            let mut requirement: ConditionalRequirement = match spec.target {
+                TargetSpec::Package(name) => provider.add_package_requirement(name, "*").into(),
+                TargetSpec::VersionSet(version_set) => version_set.into(),
+                TargetSpec::Union(union) => union.into(),
+            };
+            if let Some(version_set) = spec.condition {
+                requirement.condition =
+                    Some(provider.add_condition(Condition::Requirement(version_set)));
+            }
+            requirement
         })
         .collect()
+}
+
+/// Formats a (possibly conditional) requirement. This tool only generates
+/// `Condition::Requirement` conditions, so nested binary conditions do not
+/// need to be rendered.
+fn display_requirement(
+    provider: &SnapshotProvider<'_>,
+    requirement: &ConditionalRequirement,
+) -> String {
+    let target = requirement.requirement.display(provider).to_string();
+    match requirement.condition {
+        None => target,
+        Some(condition) => match provider.resolve_condition(condition) {
+            Condition::Requirement(version_set) => format!(
+                "{target} if {} {}",
+                provider.display_name(provider.version_set_name(version_set)),
+                provider.display_version_set(version_set),
+            ),
+            Condition::Binary(..) => format!("{target} if <binary condition>"),
+        },
+    }
 }
 
 /// Resolves the environment model file against the snapshot: package names
@@ -584,6 +644,9 @@ fn main() {
     if opts.reseed && opts.mode == Mode::Concrete {
         panic!("--reseed only applies to universal mode");
     }
+    if !(0.0..=1.0).contains(&opts.conditional_prob) {
+        panic!("--conditional-prob must be within 0..=1");
+    }
     let mode_label = match opts.mode {
         Mode::Concrete => "concrete",
         Mode::Universal => "universal",
@@ -634,7 +697,7 @@ fn main() {
         // Determine the number of requirements to solve for.
         let num_requirements = rng.random_range(1..=10usize);
         for _ in 0..num_requirements {
-            match requirement_dist.sample(&mut rng) {
+            let target = match requirement_dist.sample(&mut rng) {
                 0 => {
                     // Add a package requirement
                     let (package, _) = snapshot
@@ -643,7 +706,7 @@ fn main() {
                         .filter(|(_, package)| package.environment.is_none())
                         .choose(&mut rng)
                         .unwrap();
-                    specs.push(RequirementSpec::Package(package));
+                    TargetSpec::Package(package)
                 }
                 1 => {
                     // Add a version set requirement
@@ -653,7 +716,7 @@ fn main() {
                         .filter(|&(id, _)| !is_env_version_set(id))
                         .choose(&mut rng)
                         .unwrap();
-                    specs.push(RequirementSpec::VersionSet(version_set_id));
+                    TargetSpec::VersionSet(version_set_id)
                 }
                 2 => {
                     // Add a version set union requirement
@@ -663,10 +726,43 @@ fn main() {
                         .filter(|(_, sets)| !sets.iter().any(|&id| is_env_version_set(id)))
                         .choose(&mut rng)
                         .unwrap();
-                    specs.push(RequirementSpec::Union(version_set_union_id));
+                    TargetSpec::Union(version_set_union_id)
                 }
                 _ => unreachable!(),
-            }
+            };
+
+            // With --conditional-prob, make the requirement conditional on a
+            // version set of another randomly chosen concrete package. The
+            // strict `> 0.0` guard keeps the rng untouched at the default, so
+            // the generated corpus stays byte-identical.
+            let condition =
+                if opts.conditional_prob > 0.0 && rng.random::<f64>() < opts.conditional_prob {
+                    let target_names: Vec<NameId> = match target {
+                        TargetSpec::Package(name) => vec![name],
+                        TargetSpec::VersionSet(id) => {
+                            vec![snapshot.version_sets.get(id).unwrap().name]
+                        }
+                        TargetSpec::Union(union) => snapshot
+                            .version_set_unions
+                            .get(union)
+                            .unwrap()
+                            .iter()
+                            .map(|&id| snapshot.version_sets.get(id).unwrap().name)
+                            .collect(),
+                    };
+                    snapshot
+                        .version_sets
+                        .iter()
+                        .filter(|&(id, version_set)| {
+                            !is_env_version_set(id) && !target_names.contains(&version_set.name)
+                        })
+                        .choose(&mut rng)
+                        .map(|(id, _)| id)
+                } else {
+                    None
+                };
+
+            specs.push(RequirementSpec { target, condition });
         }
 
         if i < opts.skip {
@@ -686,7 +782,7 @@ fn main() {
             requirements.iter().format_with("\n", |requirement, f| {
                 f(&format_args!(
                     "- {}",
-                    style(requirement.requirement.display(&provider)).dim()
+                    style(display_requirement(&provider, requirement)).dim()
                 ))
             })
         );
@@ -696,7 +792,7 @@ fn main() {
             .format_with("\n", |requirement, f| {
                 f(&format_args!(
                     "{}",
-                    requirement.requirement.display(&provider)
+                    display_requirement(&provider, requirement)
                 ))
             })
             .to_string();
@@ -713,6 +809,7 @@ fn main() {
             verify: None,
             projected: None,
             error: None,
+            fetches: None,
         };
 
         let mut reseed_measurement: Option<ReseedMeasurement> = None;
@@ -724,6 +821,7 @@ fn main() {
                 let mut solver = Solver::new(provider);
                 let result = solver.solve(problem);
                 record.duration = start.elapsed().as_secs_f64();
+                record.fetches = Some(solver.provider_fetch_count());
                 match result {
                     Ok(solution) => {
                         eprintln!(
@@ -793,6 +891,7 @@ fn main() {
                 }
                 let result = solver.solve_universal(problem);
                 record.duration = start.elapsed().as_secs_f64();
+                record.fetches = Some(solver.provider_fetch_count());
                 match result {
                     Ok(solution) => {
                         let distinct: HashSet<_> = solution
@@ -883,6 +982,7 @@ fn main() {
                             let reseed_result = reseed_solver.solve_universal(reseed_problem);
                             let duration = reseed_start.elapsed().as_secs_f64();
                             let passes = reseed_solver.universal_enumeration_passes();
+                            let fetches = reseed_solver.provider_fetch_count();
                             let identical = match &reseed_result {
                                 Ok(reseeded) => {
                                     format!("{:?}", solution.cells())
@@ -908,6 +1008,7 @@ fn main() {
                                 duration,
                                 passes,
                                 identical,
+                                fetches,
                             });
                         }
                     }

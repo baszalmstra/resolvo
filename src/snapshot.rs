@@ -534,6 +534,14 @@ pub struct SnapshotProvider<'s> {
     /// highest inserted id itself, so using it directly would shadow the
     /// snapshot's last version set.
     additional_base: usize,
+
+    /// Conditions interned through [`Self::add_condition`], mirroring
+    /// `additional_version_sets`.
+    additional_conditions: Vec<Condition>,
+
+    /// The first condition id available for `additional_conditions`: one past
+    /// the highest id used by the snapshot (see `additional_base`).
+    additional_condition_base: usize,
 }
 
 impl<'s> From<&'s DependencySnapshot> for SnapshotProvider<'s> {
@@ -593,12 +601,19 @@ impl<'s> SnapshotProvider<'s> {
         } else {
             snapshot.version_sets.max() + 1
         };
+        let additional_condition_base = if snapshot.conditions.is_empty() {
+            0
+        } else {
+            snapshot.conditions.max() + 1
+        };
         Ok(Self {
             snapshot,
             additional_version_sets: Vec::new(),
             stop_time: None,
             relations,
             additional_base,
+            additional_conditions: Vec::new(),
+            additional_condition_base,
         })
     }
 
@@ -632,6 +647,17 @@ impl<'s> SnapshotProvider<'s> {
         });
 
         VersionSetId::from_index(id)
+    }
+
+    /// Interns an additional [`Condition`] that is not part of the snapshot,
+    /// e.g. to synthesize conditional requirements for benchmarking. Interning
+    /// is deterministic: replaying the same calls in the same order onto
+    /// identically constructed providers yields identical ids (mirroring
+    /// [`Self::add_package_requirement`]).
+    pub fn add_condition(&mut self, condition: Condition) -> ConditionId {
+        let id = self.additional_condition_base + self.additional_conditions.len();
+        self.additional_conditions.push(condition);
+        ConditionId::from_index(id)
     }
 
     fn solvable(&self, solvable: SolvableId) -> &Solvable {
@@ -709,11 +735,16 @@ impl Interner for SnapshotProvider<'_> {
     }
 
     fn resolve_condition(&self, condition: ConditionId) -> Condition {
-        self.snapshot
-            .conditions
-            .get(condition)
-            .expect("missing condition")
-            .clone()
+        let idx = condition.to_index();
+        if idx >= self.additional_condition_base {
+            self.additional_conditions[idx - self.additional_condition_base].clone()
+        } else {
+            self.snapshot
+                .conditions
+                .get(condition)
+                .expect("missing condition")
+                .clone()
+        }
     }
 }
 
