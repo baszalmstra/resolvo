@@ -361,14 +361,6 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// per assignment instead of hashing every trail variable.
     cell_capture_index: Vec<(u32, u32)>,
 
-    /// Cross-cell cache of the universal edge capture (see
-    /// [`universal::EdgeCaptureCache`]): the active edge computed per
-    /// `requires_clauses` entry, invalidated between cells through the trail
-    /// diff. Lives in the solver state so the per-pass
-    /// `SolverState::default()` reset discards it together with the clauses
-    /// and decisions it was computed from.
-    edge_capture_cache: universal::EdgeCaptureCache<D::SolvableId>,
-
     /// For every solvable variable whose install adds or activates clauses
     /// that assign environment literals, the environment literal variables
     /// those clauses assign: the env candidates of its `Requires` clauses
@@ -687,7 +679,6 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             blocking_clauses: Default::default(),
             env_support_clauses: Default::default(),
             cell_capture_index: Default::default(),
-            edge_capture_cache: Default::default(),
             env_sensitive_parents: Default::default(),
             env_ordering_active: false,
             universal_mode: false,
@@ -3292,9 +3283,6 @@ impl<D: DependencyProvider> SolverState<D> {
         let map_entry = self.requires_clauses.entry(parent);
         let index = map_entry.index();
         map_entry.or_default().push(entry);
-        // Tell the universal edge-capture cache that its growth scan has a
-        // new entry to index (see `EdgeCaptureCache::registered_entries`).
-        self.edge_capture_cache.registered_entries += 1;
         // Stored offset by one: 0 means "no entry" (the `IdMap` default).
         let index = u32::try_from(index + 1)
             .expect("the number of requires parents never exceeds the variable count");
