@@ -622,32 +622,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             .collect::<Vec<_>>();
 
         // A conditional requirement can be the only path through which its
-        // target packages are reachable. The unconditional path queues those
-        // packages in [`Self::on_dependencies_available`] and the lazy
-        // conditional paths do so when a disjunct fires (see
-        // [`Self::on_condition_data_available`] and
-        // [`Self::queue_deferred_requirement`]), which is what emits their
-        // candidate-level clauses (locked, excluded) through
-        // [`Self::on_candidates_available`]. The eager universal-mode path
-        // (see [`Self::queue_conditional_requirement`]) reaches this handler
-        // without ever having queued them, so queue the concrete target
-        // packages here; `queue_package` deduplicates, making this a no-op on
-        // the other paths. Environment packages are deliberately not queued:
-        // they have no candidate-level clauses (locked/excluded are rejected
-        // for them), and queueing them here would intern their absent
-        // literals in a different order on inputs that are otherwise
-        // unaffected.
-        if requirement.condition.is_some() {
-            for (candidate_set, version_set) in candidates
-                .iter()
-                .zip(requirement.requirement.version_sets(self.cache.provider()))
-            {
-                if matches!(candidate_set, RequirementCandidates::Concrete(_)) {
-                    let package_name = self.cache.provider().version_set_name(version_set);
-                    self.queue_package(package_name);
-                }
-            }
-        }
+        // target packages are reachable. Every path into this handler has
+        // already queued those packages so that their candidate-level clauses
+        // (locked, excluded) are emitted through
+        // [`Self::on_candidates_available`]: the unconditional path in
+        // [`Self::on_dependencies_available`], and the conditional paths when
+        // a disjunct fires (see [`Self::on_condition_data_available`] and
+        // [`Self::queue_deferred_requirement`]). Regression coverage:
+        // `test_universal_locked_behind_conditional_requirement`.
 
         // Make sure that for every candidate that we require we also have a forbid
         // clause to force one solvable per package name.
@@ -779,11 +761,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             // Requirements over environment literals stay direct: their
             // clauses feed `env_support_clauses` and `env_sensitive_parents`
             // (universal cell extraction and the env-literals-last ordering),
-            // which key on the requirer's own clause. Unlike the
-            // lazy-conditional path (see [`SolverState::universal_mode`]) the
-            // gate encoding is fully synchronous, so it keeps registration
-            // order deterministic and is safe in universal mode; the
-            // requirer -> requirement bookkeeping that cell-edge capture
+            // which key on the requirer's own clause. The gate encoding is
+            // fully synchronous, so it keeps registration order deterministic;
+            // the requirer -> requirement bookkeeping that cell-edge capture
             // needs is recorded in [`Encoder::add_shared_requires`].
             if condition.is_none()
                 && !no_candidates
@@ -1296,13 +1276,6 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     ) {
         match requirement.condition {
             None => self.queue_requirement_candidates(solvable_id, requirement, None),
-            // In universal mode, resolve the condition eagerly (one fetch) so
-            // that requires clauses register in a decision-order-independent
-            // order, which the cell enumeration relies on. A plain solve keeps
-            // the lazy deferred path. See [`SolverState::universal_mode`].
-            Some(_) if self.state.universal_mode => {
-                self.queue_requirement_candidates(solvable_id, requirement, None)
-            }
             Some(condition) => self.queue_condition_data(solvable_id, requirement, condition),
         }
     }
@@ -1352,11 +1325,10 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 ),
             );
 
-            // When the condition was already resolved (the deferred fired
-            // path) use it as-is. Otherwise resolve it inline here, in the
-            // same future as the requirement candidates, so the requires
-            // clause encodes in one round-trip (matters for the encode order
-            // that universal cell enumeration depends on).
+            // When the condition was already resolved (the fired conditional
+            // paths always pass it) use it as-is. Otherwise resolve it inline
+            // here, in the same future as the requirement candidates, so the
+            // requires clause encodes in one round-trip.
             let condition_fut = async {
                 if let Some(condition_data) = condition_data {
                     return Ok(Some(condition_data));

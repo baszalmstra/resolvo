@@ -70,22 +70,21 @@ use crate::{
 /// restriction.
 const GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES: bool = true;
 
-/// SOLVER BUG (exposed by this stage, FIXED): in universal mode the encoder
-/// resolves conditional requirements eagerly
-/// (`queue_conditional_requirement` short-circuits to
-/// `queue_requirement_candidates`), and that path never ran `queue_package`
-/// for the requirement's target packages. The lazy conditional path does
-/// exactly that "so that locked / excluded clauses are emitted as on the
-/// eager path" (`on_condition_data_available`). As a result,
+/// SOLVER BUG (exposed by this stage, FIXED): universal mode used to
+/// resolve conditional requirements eagerly (`queue_conditional_requirement`
+/// short-circuited to `queue_requirement_candidates`), and that path never
+/// ran `queue_package` for the requirement's target packages. As a result,
 /// `Candidates::locked` and `Candidates::excluded` of a package reachable
 /// ONLY through conditional requirements were silently ignored by
 /// `solve_universal`: the solver installed a non-locked or excluded
-/// version. Plain `solve` was unaffected.
-/// `on_requirement_candidates_available` now queues the concrete target
-/// packages of every conditional requirement, so the candidate-level
-/// clauses are emitted no matter which path encoded the requirement. See
-/// `test_universal_locked_behind_conditional_requirement` for the minimized
-/// regression test (generator seed 150 was the original finding).
+/// version. Plain `solve` was unaffected. The eager path first gained the
+/// missing `queue_package` calls; since universal mode switched to the
+/// shared lazy conditional path, the target packages are queued when a
+/// disjunct fires (`on_condition_data_available` /
+/// `queue_deferred_requirement`), which is the mechanism the plain solve
+/// always used. See `test_universal_locked_behind_conditional_requirement`
+/// for the minimized regression test (generator seed 150 was the original
+/// finding).
 ///
 /// While `false`, the generator only marks ROOT-REQUIRED packages as
 /// locked/excluded: root requirements are unconditional, so

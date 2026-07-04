@@ -387,13 +387,19 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     env_ordering_active: bool,
 
     /// Whether the solver is running a universal solve. Set by
-    /// `solve_universal` before any encoding. The encoder uses it to resolve
-    /// conditional requirements *eagerly* (in one fetch) rather than via the
-    /// lazy deferred path: universal cell enumeration depends on the order in
-    /// which requires clauses are registered, and the deferred path's extra
-    /// fetch round-trip reorders them, which breaks the reseed fixed-point.
-    /// A plain solve keeps the lazy path (it has no such ordering
-    /// requirement).
+    /// `solve_universal` before any encoding. Gates the universal-only
+    /// bookkeeping that only cell-edge capture reads (`requires_clauses` and
+    /// `cell_capture_index`, see [`SolverState::push_requires_clause_entry`]),
+    /// so plain concrete solves skip it.
+    ///
+    /// Conditional requirements take the same lazy deferred path in both
+    /// modes (`Encoder::queue_conditional_requirement`): clause registration
+    /// order then depends on when conditions fire, which is a deterministic
+    /// function of the solve itself. The reproducibility of
+    /// `solve_universal`'s output is provided by its reseed fixed-point
+    /// iteration over a saturated cache — and by the cold-entry single-pass
+    /// rule for cold replays, which replay the same fire order verbatim —
+    /// (design doc 5.7), not by an order-independent encode.
     universal_mode: bool,
 
     /// Conflicts handled by the current `run_sat` call (reset on entry).
@@ -3747,18 +3753,6 @@ impl<D: DependencyProvider> SolverState<D> {
     /// Register a new deferred requirement. Used by the encoder when it
     /// detects that a conditional requirement's disjunct does not yet hold.
     pub(crate) fn push_deferred(&mut self, entry: DeferredRequirement<D::SolvableId>) {
-        // Universal solving must encode conditional requirements eagerly so
-        // that requires-clause registration order (hence the decide scan
-        // order, hence the enumerated cells) is independent of runtime
-        // decisions; the lazy deferral's extra encode round-trip would
-        // reorder it and break the reseed fixed point. `universal_mode` gates
-        // the eager path in `queue_conditional_requirement`, so nothing should
-        // ever defer here in a universal solve. (See `Self::universal_mode`.)
-        debug_assert!(
-            !self.universal_mode,
-            "universal solving must not defer conditional requirements: \
-             deferral reorders clause registration and breaks enumeration determinism"
-        );
         self.deferred_requirements
             .entry(entry.condition)
             .or_default()

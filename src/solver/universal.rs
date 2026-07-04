@@ -1067,13 +1067,16 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// that order is the `decide()` scan order, so it shapes which cell is
     /// found first and hence the exact partition. Registration order is stable
     /// under the default synchronous runtime (`NowOrNeverRuntime`, where
-    /// encoder futures resolve in submission order) and under the eager
-    /// conditional encoding that universal solving forces (see
-    /// [`SolverState::universal_mode`]). A runtime that resolves the provider's
-    /// futures in a nondeterministic order would make the registration order,
-    /// and therefore the cell partition, nondeterministic; for reproducible
-    /// solutions (e.g. lockfiles) drive `solve_universal` with a deterministic
-    /// runtime.
+    /// encoder futures resolve in submission order). Conditional requirements
+    /// whose condition has not fired yet are registered later, when their
+    /// condition first holds (the lazy deferred path, shared with plain
+    /// solves); that point is itself a deterministic function of the solve,
+    /// and the reseed fixed-point iteration (design doc 5.7) verifies that a
+    /// replay re-fires them identically before returning. A runtime that
+    /// resolves the provider's futures in a nondeterministic order would make
+    /// the registration order, and therefore the cell partition,
+    /// nondeterministic; for reproducible solutions (e.g. lockfiles) drive
+    /// `solve_universal` with a deterministic runtime.
     #[allow(clippy::type_complexity)]
     pub fn solve_universal(
         &mut self,
@@ -1368,9 +1371,8 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.cache
             .set_env_relation(<D as UniversalDependencyProvider>::environment_version_set_relation);
 
-        // Universal enumeration depends on the order in which requires clauses
-        // are registered; resolve conditional requirements eagerly so the
-        // encode order is independent of runtime decisions (see
+        // Enable the universal-only bookkeeping (requires-clause capture
+        // indexes) that cell-edge capture reads (see
         // `SolverState::universal_mode`). Must be set after the reset above.
         self.state.universal_mode = true;
 
