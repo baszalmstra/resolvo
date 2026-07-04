@@ -70,29 +70,32 @@ use crate::{
 /// restriction.
 const GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES: bool = true;
 
-/// SOLVER BUG (exposed by this stage, excluded from generation): in
-/// universal mode the encoder resolves conditional requirements eagerly
+/// SOLVER BUG (exposed by this stage, FIXED): in universal mode the encoder
+/// resolves conditional requirements eagerly
 /// (`queue_conditional_requirement` short-circuits to
-/// `queue_requirement_candidates`), and that path never runs
-/// `queue_package` for the requirement's target packages. The lazy
-/// conditional path does exactly that "so that locked / excluded clauses
-/// are emitted as on the eager path" (`on_condition_data_available`). As a
-/// result, `Candidates::locked` and `Candidates::excluded` of a package
-/// reachable ONLY through conditional requirements are silently ignored by
-/// `solve_universal`: the solver installs a non-locked or excluded version.
-/// Plain `solve` is unaffected. See
-/// `test_universal_locked_behind_conditional_requirement_bug` for the
-/// minimized reproduction (generator seed 150 was the original finding).
+/// `queue_requirement_candidates`), and that path never ran `queue_package`
+/// for the requirement's target packages. The lazy conditional path does
+/// exactly that "so that locked / excluded clauses are emitted as on the
+/// eager path" (`on_condition_data_available`). As a result,
+/// `Candidates::locked` and `Candidates::excluded` of a package reachable
+/// ONLY through conditional requirements were silently ignored by
+/// `solve_universal`: the solver installed a non-locked or excluded
+/// version. Plain `solve` was unaffected.
+/// `on_requirement_candidates_available` now queues the concrete target
+/// packages of every conditional requirement, so the candidate-level
+/// clauses are emitted no matter which path encoded the requirement. See
+/// `test_universal_locked_behind_conditional_requirement` for the minimized
+/// regression test (generator seed 150 was the original finding).
 ///
-/// While `false` (the default), the generator only marks ROOT-REQUIRED
-/// packages as locked/excluded: root requirements are unconditional, so
+/// While `false`, the generator only marks ROOT-REQUIRED packages as
+/// locked/excluded: root requirements are unconditional, so
 /// `on_dependencies_available` queues their packages and the lock/exclusion
-/// clauses are emitted. Flipping this to `true` lifts the restriction and
-/// makes the 1000-seed gate fail (projections install locked-out versions).
-/// Favored (a pure preference) and unknown-deps (whose exclusion is emitted
-/// when the solvable's dependencies are fetched, which happens before any
-/// install survives) are not affected and stay unrestricted.
-const GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES: bool = false;
+/// clauses are emitted. `true` (the default since the fix) lifts the
+/// restriction. Favored (a pure preference) and unknown-deps (whose
+/// exclusion is emitted when the solvable's dependencies are fetched, which
+/// happens before any install survives) were never affected and stay
+/// unrestricted.
+const GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES: bool = true;
 
 /// SOLVER BUG (exposed by this stage, excluded from generation): a concrete
 /// condition version set with an EMPTY complement (every version of the
@@ -1919,16 +1922,16 @@ fn test_universal_locked_unconditional_requirement() {
     insta::assert_snapshot!(cells_to_string(&solver, &solution), @"<all environments> -> [a=1, b=1]");
 }
 
-/// SOLVER BUG reproduction (see
-/// [`GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES`]): a locked package
-/// reachable ONLY through a conditional requirement is not respected by
-/// `solve_universal` -- the eager universal condition path never queues the
+/// Regression test (see [`GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES`]):
+/// a locked package reachable ONLY through a conditional requirement is
+/// respected by `solve_universal` (design doc 5.5: "Candidates::locked /
+/// favored keep working unchanged for concrete packages"). The eager
+/// universal condition path used to skip `queue_package` for the
 /// requirement's target package, so `on_candidates_available` (which emits
-/// the lock and exclusion clauses) never runs for it. The second cell below
-/// installs `b=2` although `b` is locked to `b=1`. Un-ignore once fixed.
+/// the lock and exclusion clauses) never ran for it and the second cell
+/// installed `b=2` although `b` is locked to `b=1`.
 #[test]
-#[ignore = "solver bug: universal eager conditional path drops locked/excluded clauses"]
-fn test_universal_locked_behind_conditional_requirement_bug() {
+fn test_universal_locked_behind_conditional_requirement() {
     let mut provider = EnvTestProvider::default();
     provider.add_env_package("env0", false);
     let e_57 = provider.version_set("env0", 5, 7);
@@ -1953,13 +1956,22 @@ fn test_universal_locked_behind_conditional_requirement_bug() {
         .requirements(vec![a_any.into()])
         .environment_model(EnvironmentModel::default());
     let solution = solver.solve_universal(problem).expect("solvable");
+    // The condition splits the space: a baseline cell without b, and an
+    // `env0 in 5..7` cell where the requirement is active and must be
+    // satisfied by the LOCKED version b=1.
+    let mut saw_b1 = false;
     for cell in solution.cells() {
         assert!(
             !cell.solvables().contains(&_b2),
             "b is locked to b=1, but cell {} installs b=2",
             cell.condition().display(solver.provider()),
         );
+        saw_b1 |= cell.solvables().contains(&b1);
     }
+    assert!(
+        saw_b1,
+        "some cell must activate the conditional requirement and install the locked b=1"
+    );
 }
 
 /// Regression test (see [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]):

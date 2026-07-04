@@ -621,6 +621,34 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             })
             .collect::<Vec<_>>();
 
+        // A conditional requirement can be the only path through which its
+        // target packages are reachable. The unconditional path queues those
+        // packages in [`Self::on_dependencies_available`] and the lazy
+        // conditional paths do so when a disjunct fires (see
+        // [`Self::on_condition_data_available`] and
+        // [`Self::queue_deferred_requirement`]), which is what emits their
+        // candidate-level clauses (locked, excluded) through
+        // [`Self::on_candidates_available`]. The eager universal-mode path
+        // (see [`Self::queue_conditional_requirement`]) reaches this handler
+        // without ever having queued them, so queue the concrete target
+        // packages here; `queue_package` deduplicates, making this a no-op on
+        // the other paths. Environment packages are deliberately not queued:
+        // they have no candidate-level clauses (locked/excluded are rejected
+        // for them), and queueing them here would intern their absent
+        // literals in a different order on inputs that are otherwise
+        // unaffected.
+        if requirement.condition.is_some() {
+            for (candidate_set, version_set) in candidates
+                .iter()
+                .zip(requirement.requirement.version_sets(self.cache.provider()))
+            {
+                if matches!(candidate_set, RequirementCandidates::Concrete(_)) {
+                    let package_name = self.cache.provider().version_set_name(version_set);
+                    self.queue_package(package_name);
+                }
+            }
+        }
+
         // Make sure that for every candidate that we require we also have a forbid
         // clause to force one solvable per package name.
         //
