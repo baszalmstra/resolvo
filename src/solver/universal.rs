@@ -854,7 +854,7 @@ impl<Id: Copy + Eq, N: Copy + Eq> UniversalSolution<Id, N> {
             );
         }
 
-        let assignment = find_witness_indexed(literals.len(), &clauses)?;
+        let assignment = find_witness_indexed_nested(literals.len(), &clauses)?;
         Some(CellCondition::from_literals_unchecked(
             literals
                 .into_iter()
@@ -2635,16 +2635,25 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// variables that occur in no environment-only clause are unconstrained
     /// and left out of the witness, mirroring how cells record only
     /// load-bearing literals.
-    fn find_environment_witness(&self) -> Option<Vec<(VariableId, bool)>> {
-        let mut clauses: Vec<Vec<Literal>> = Vec::new();
+    ///
+    /// The clause set is dominated by the O(m^2) pairwise oracle consistency
+    /// clauses, so the input is assembled into the solver's reusable
+    /// [`WitnessScratch`] flat arena (one bulk copy, no per-clause
+    /// allocation) instead of a fresh `Vec<Vec<Literal>>` per call; at a few
+    /// hundred cells that construction used to dominate the check.
+    fn find_environment_witness(&mut self) -> Option<Vec<(VariableId, bool)>> {
+        let scratch = &mut self.witness_scratch;
+        scratch.clear();
         for kind in &self.state.clauses.kinds {
             match *kind {
                 // The only clauses that constrain the environment space
                 // itself: oracle consistency (relations between env literals)
                 // and the model/blocking clauses.
-                Clause::EnvOracleConsistency(lit_a, lit_b) => clauses.push(vec![lit_a, lit_b]),
+                Clause::EnvOracleConsistency(lit_a, lit_b) => {
+                    scratch.push_clause(&[lit_a, lit_b]);
+                }
                 Clause::EnvClause(env_clause_id) => {
-                    clauses.push(self.state.env_clauses[env_clause_id].literals.clone());
+                    scratch.push_clause(&self.state.env_clauses[env_clause_id].literals);
                 }
                 // Everything else constrains which SOLVABLES are valid GIVEN
                 // an environment, not which environments exist, so it must NOT
@@ -2667,7 +2676,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 | Clause::EnvConstrains(..) => {}
             }
         }
-        find_witness(&clauses)
+        scratch.find_witness()
     }
 }
 
@@ -2824,6 +2833,117 @@ fn merge_disjunct_pair<N: Copy + Eq>(
 /// assigned the opposite of `negate`.
 type IndexedLiteral = (usize, bool);
 
+/// A borrowed set of witness-search clauses stored in one flat literal
+/// arena: clause `i` spans `literals[clause_ends[i - 1]..clause_ends[i]]`
+/// (the first clause starts at 0). The flat layout lets the witness input be
+/// assembled with bulk copies instead of one heap allocation per clause,
+/// which matters because the input is dominated by the O(m^2) pairwise
+/// oracle consistency clauses.
+#[derive(Copy, Clone)]
+struct IndexedClauses<'a> {
+    literals: &'a [IndexedLiteral],
+    clause_ends: &'a [usize],
+}
+
+impl<'a> IndexedClauses<'a> {
+    /// The clauses in insertion order, each as a slice of the flat arena.
+    fn iter(self) -> impl Iterator<Item = &'a [IndexedLiteral]> {
+        let literals = self.literals;
+        self.clause_ends.iter().scan(0, move |start, &end| {
+            let clause = &literals[*start..end];
+            *start = end;
+            Some(clause)
+        })
+    }
+}
+
+/// Reusable scratch buffers for [`Solver::find_environment_witness`]: the
+/// witness formula in flat indexed form, plus the variable table mapping
+/// witness indices back to solver [`VariableId`]s.
+///
+/// The buffers live on the `Solver` (not on [`SolverState`]) purely to reuse
+/// their allocations across enumeration passes and reseed rounds: every
+/// `find_witness` call rebuilds the contents from the clauses pushed since
+/// `clear`, so no stale state can survive the per-pass
+/// `SolverState::default()` reset.
+#[derive(Default)]
+pub(crate) struct WitnessScratch {
+    /// Flat clause arena. [`Self::push_clause`] records raw variable indices
+    /// ([`VariableId::to_index`]); [`Self::find_witness`] rewrites them in
+    /// place to dense witness indices.
+    literals: Vec<IndexedLiteral>,
+    /// End offset of each pushed clause in `literals`.
+    clause_ends: Vec<usize>,
+    /// Per variable index: the variable's dense witness index plus one, or 0
+    /// for variables that occur in no pushed clause. Rebuilt on every
+    /// [`Self::find_witness`] call.
+    variable_index: Vec<u32>,
+    /// The constrained variables in ascending [`VariableId`] order; a
+    /// variable's dense witness index is its position here.
+    variables: Vec<VariableId>,
+}
+
+impl WitnessScratch {
+    /// Discards the previously pushed clauses, keeping the allocations.
+    fn clear(&mut self) {
+        self.literals.clear();
+        self.clause_ends.clear();
+    }
+
+    /// Appends one clause to the formula.
+    fn push_clause(&mut self, literals: &[Literal]) {
+        self.literals.extend(
+            literals
+                .iter()
+                .map(|literal| (literal.variable().to_index(), literal.negate())),
+        );
+        self.clause_ends.push(self.literals.len());
+    }
+
+    /// Searches for an assignment of solver variables satisfying all pushed
+    /// clauses (see [`find_witness_indexed`] for the search itself).
+    ///
+    /// The search scope is exactly the variables that occur in the clauses;
+    /// unconstrained variables are left out of the witness, mirroring how
+    /// cells record only load-bearing literals. Dense witness indices are
+    /// assigned in ascending `VariableId` order — each variable's rank among
+    /// the distinct constrained variables, exactly the numbering the
+    /// previous sort + dedup + binary-search construction produced — so the
+    /// search's variable visit order, and with it the canonical
+    /// lexicographically-smallest witness, is unchanged.
+    fn find_witness(&mut self) -> Option<Vec<(VariableId, bool)>> {
+        self.variable_index.clear();
+        self.variables.clear();
+        if let Some(max_index) = self.literals.iter().map(|&(index, _)| index).max() {
+            // Mark the occurring variables, then assign dense indices with
+            // one ascending scan (yielding sorted order by construction),
+            // then rewrite the arena in place through the O(1) lookup table.
+            self.variable_index.resize(max_index + 1, 0);
+            for &(index, _) in &self.literals {
+                self.variable_index[index] = 1;
+            }
+            for index in 0..=max_index {
+                if self.variable_index[index] != 0 {
+                    self.variables.push(VariableId::from_index(index));
+                    self.variable_index[index] = self.variables.len() as u32;
+                }
+            }
+            for literal in &mut self.literals {
+                literal.0 = self.variable_index[literal.0] as usize - 1;
+            }
+        }
+
+        let assignment = find_witness_indexed(
+            self.variables.len(),
+            IndexedClauses {
+                literals: &self.literals,
+                clause_ends: &self.clause_ends,
+            },
+        )?;
+        Some(self.variables.iter().copied().zip(assignment).collect())
+    }
+}
+
 /// A dedicated backtracking search for an assignment satisfying all the
 /// given clauses, generic over a dense variable index so that it is reusable
 /// both over solver `VariableId`s (the coverage-termination check of the
@@ -2839,14 +2959,11 @@ type IndexedLiteral = (usize, bool);
 /// so the witness stays as close to the baseline machine as possible and the
 /// search is deterministic. Returns one value per variable index, or `None`
 /// when no assignment satisfies all clauses.
-fn find_witness_indexed(
-    variable_count: usize,
-    clauses: &[Vec<IndexedLiteral>],
-) -> Option<Vec<bool>> {
+fn find_witness_indexed(variable_count: usize, clauses: IndexedClauses<'_>) -> Option<Vec<bool>> {
     debug_assert!(
         clauses
+            .literals
             .iter()
-            .flatten()
             .all(|&(index, _)| index < variable_count),
         "every clause literal must reference a variable below `variable_count`"
     );
@@ -2859,7 +2976,7 @@ fn find_witness_indexed(
     // variables first prunes the hundreds of accumulated blocking clauses
     // orders of magnitude faster than ascending index order.
     let mut occurrences = vec![0usize; variable_count];
-    for &(index, _) in clauses.iter().flatten() {
+    for &(index, _) in clauses.literals {
         occurrences[index] += 1;
     }
     let mut order: Vec<usize> = (0..variable_count).collect();
@@ -2905,7 +3022,7 @@ fn find_witness_indexed(
 /// accumulated (a high-cell-count solve used to spend minutes here, orders
 /// of magnitude longer than the enumeration itself).
 fn search_indexed(
-    clauses: &[Vec<IndexedLiteral>],
+    clauses: IndexedClauses<'_>,
     assignment: &mut [Option<bool>],
     order: &[usize],
 ) -> bool {
@@ -2941,13 +3058,13 @@ fn search_indexed(
 /// pushing every assigned index onto `propagated`. Returns false when a
 /// clause is violated (all literals assigned and false).
 fn propagate_indexed(
-    clauses: &[Vec<IndexedLiteral>],
+    clauses: IndexedClauses<'_>,
     assignment: &mut [Option<bool>],
     propagated: &mut Vec<usize>,
 ) -> bool {
     loop {
         let mut changed = false;
-        for clause in clauses {
+        for clause in clauses.iter() {
             let mut unit: Option<IndexedLiteral> = None;
             let mut unassigned = 0usize;
             let mut satisfied = false;
@@ -2986,39 +3103,39 @@ fn propagate_indexed(
     }
 }
 
+/// Flattens nested clause vectors into the flat arena form and runs
+/// [`find_witness_indexed`]. Used by the post-hoc verifier, which assembles
+/// its clauses ad hoc; the hot coverage check assembles the flat form
+/// directly in [`WitnessScratch`].
+fn find_witness_indexed_nested(
+    variable_count: usize,
+    clauses: &[Vec<IndexedLiteral>],
+) -> Option<Vec<bool>> {
+    let mut literals = Vec::new();
+    let mut clause_ends = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        literals.extend_from_slice(clause);
+        clause_ends.push(literals.len());
+    }
+    find_witness_indexed(
+        variable_count,
+        IndexedClauses {
+            literals: &literals,
+            clause_ends: &clause_ends,
+        },
+    )
+}
+
 /// Searches for an assignment of solver variables satisfying all the given
-/// clauses by mapping the variables onto a dense index for
-/// [`find_witness_indexed`].
-///
-/// The search scope is exactly the variables that occur in the clauses;
-/// unconstrained variables are left out of the witness, mirroring how cells
-/// record only load-bearing literals.
+/// clauses: a test-facing convenience wrapper around [`WitnessScratch`]
+/// (which `find_environment_witness` drives directly with reused buffers).
+#[cfg(test)]
 fn find_witness(clauses: &[Vec<Literal>]) -> Option<Vec<(VariableId, bool)>> {
-    let mut variables: Vec<VariableId> = clauses
-        .iter()
-        .flatten()
-        .map(|literal| literal.variable())
-        .collect();
-    variables.sort_by_key(|variable| variable.to_index());
-    variables.dedup();
-
-    let index_of = |variable: VariableId| {
-        variables
-            .binary_search_by_key(&variable.to_index(), |v| v.to_index())
-            .expect("every clause variable is in `variables`")
-    };
-    let indexed_clauses: Vec<Vec<IndexedLiteral>> = clauses
-        .iter()
-        .map(|clause| {
-            clause
-                .iter()
-                .map(|literal| (index_of(literal.variable()), literal.negate()))
-                .collect()
-        })
-        .collect();
-
-    let assignment = find_witness_indexed(variables.len(), &indexed_clauses)?;
-    Some(variables.into_iter().zip(assignment).collect())
+    let mut scratch = WitnessScratch::default();
+    for clause in clauses {
+        scratch.push_clause(clause);
+    }
+    scratch.find_witness()
 }
 
 #[cfg(test)]
@@ -3528,7 +3645,10 @@ mod test {
     #[test]
     fn test_find_witness_indexed_false_first() {
         let clauses = vec![vec![(0, false), (1, false)]];
-        assert_eq!(find_witness_indexed(2, &clauses), Some(vec![false, true]));
+        assert_eq!(
+            find_witness_indexed_nested(2, &clauses),
+            Some(vec![false, true])
+        );
     }
 
     /// The indexed search assigns every variable, including ones that occur
@@ -3536,13 +3656,16 @@ mod test {
     #[test]
     fn test_find_witness_indexed_assigns_unconstrained_variables() {
         let clauses = vec![vec![(1, true)]];
-        assert_eq!(find_witness_indexed(2, &clauses), Some(vec![false, false]));
+        assert_eq!(
+            find_witness_indexed_nested(2, &clauses),
+            Some(vec![false, false])
+        );
     }
 
     /// An empty clause is unsatisfiable: no witness.
     #[test]
     fn test_find_witness_indexed_empty_clause() {
-        assert_eq!(find_witness_indexed(2, &[vec![]]), None);
+        assert_eq!(find_witness_indexed_nested(2, &[vec![]]), None);
     }
 
     /// Regression test for the unit-propagation search: deciding `x0 =
@@ -3562,7 +3685,7 @@ mod test {
             vec![(2, true), (1, true)],
         ];
         assert_eq!(
-            find_witness_indexed(3, &clauses),
+            find_witness_indexed_nested(3, &clauses),
             Some(vec![true, false, false])
         );
     }

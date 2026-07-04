@@ -211,6 +211,11 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// Holds the current state of the solver.
     pub(crate) state: SolverState<D>,
 
+    /// Reusable scratch buffers of the universal coverage check (see
+    /// [`universal::WitnessScratch`]): rebuilt on every use, kept here only
+    /// so their allocations survive enumeration passes and reseed rounds.
+    witness_scratch: universal::WitnessScratch,
+
     /// The activity add factor. This is a value that is added to the activity
     /// score of each package that is part of a conflict.
     activity_add: f32,
@@ -902,6 +907,7 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             cache: SolverCache::new(provider),
             async_runtime: NowOrNeverRuntime,
             state: SolverState::default(),
+            witness_scratch: universal::WitnessScratch::default(),
             activity_add: 1.0,
             activity_decay: 0.95,
             env_ordering_conflict_limit: ENV_ORDERING_CONFLICT_LIMIT,
@@ -1079,6 +1085,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             async_runtime: runtime,
             cache: self.cache,
             state: self.state,
+            witness_scratch: self.witness_scratch,
             activity_decay: self.activity_decay,
             activity_add: self.activity_add,
             env_ordering_conflict_limit: self.env_ordering_conflict_limit,
