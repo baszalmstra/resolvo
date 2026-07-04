@@ -16,15 +16,33 @@ use crate::{
 
 /// A simple half-open version range `[start, end)` used as the version
 /// set of [`EnvTestProvider`].
+///
+/// The `alias` tag participates in `Hash`/`Eq` (so the pool interns two
+/// aliased copies of the same range as DISTINCT version set ids) but not in
+/// [`Range::contains`] or the relation oracle, which see the same range.
+/// This is the only way to reach the [`VersionSetRelation::Equal`] arm of
+/// the oracle-consistency encoding: without it, equal ranges dedup to one
+/// id and the oracle is never asked about them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Range {
     start: u32,
     end: u32,
+    alias: u32,
 }
 
 impl Range {
     pub fn new(start: u32, end: u32) -> Self {
-        Self { start, end }
+        Self {
+            start,
+            end,
+            alias: 0,
+        }
+    }
+
+    /// A range that compares/hashes distinct from the plain `[start, end)`
+    /// range but denotes the same set of versions (see the type docs).
+    pub fn new_aliased(start: u32, end: u32, alias: u32) -> Self {
+        Self { start, end, alias }
     }
 
     pub fn contains(&self, version: u32) -> bool {
@@ -34,7 +52,11 @@ impl Range {
 
 impl Display for Range {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}..{}", self.start, self.end)
+        if self.alias == 0 {
+            write!(f, "{}..{}", self.start, self.end)
+        } else {
+            write!(f, "{}..{}#{}", self.start, self.end, self.alias)
+        }
     }
 }
 
@@ -73,6 +95,22 @@ impl EnvTestProvider {
         let name_id = self.pool.intern_package_name(name);
         self.pool
             .intern_version_set(name_id, Range::new(start, end))
+    }
+
+    /// Interns a version set denoting the same versions as
+    /// `version_set(name, start, end)` under a DISTINCT id (see
+    /// [`Range::new_aliased`]). `alias` must be non-zero.
+    pub fn version_set_aliased(
+        &self,
+        name: &str,
+        start: u32,
+        end: u32,
+        alias: u32,
+    ) -> VersionSetId {
+        assert_ne!(alias, 0, "alias 0 is the plain range");
+        let name_id = self.pool.intern_package_name(name);
+        self.pool
+            .intern_version_set(name_id, Range::new_aliased(start, end, alias))
     }
 
     pub fn add_package(&mut self, name: &str, version: u32) -> SolvableId {
@@ -237,7 +275,9 @@ impl UniversalDependencyProvider for EnvTestProvider {
     ) -> VersionSetRelation {
         let a = self.pool.resolve_version_set(a);
         let b = self.pool.resolve_version_set(b);
-        if a == b {
+        // The alias tag is deliberately ignored: two distinct ids can denote
+        // the same range, which is what makes the Equal arm reachable.
+        if a.start == b.start && a.end == b.end {
             VersionSetRelation::Equal
         } else if a.end <= b.start || b.end <= a.start {
             VersionSetRelation::Disjoint

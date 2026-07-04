@@ -1765,3 +1765,456 @@ fn test_universal_empty_complement_condition_lost_tracker_bug() {
         );
     }
 }
+
+// ===========================================================================
+// Targeted tests for paths the generator cannot reach structurally: the
+// trail-reuse abandonment fallback, the relation oracle's Equal arm, the
+// trail-reshape full retraction, and the reseed-orbit early exit.
+// ===========================================================================
+
+/// Builds the provider of the trail-reuse scenarios: `top` (one version,
+/// root-required) needs `y` only where `env0 in 5..10` holds, and `y` drags
+/// a chain of `chain_len` two-version packages (`z0` .. `z{n-1}`) behind it.
+/// Every chain install is a real `decide()` level, so the second cell stacks
+/// `chain_len + 1` ordinary decision levels above the environment literal.
+fn build_env_tail_chain_provider(chain_len: usize) -> (EnvTestProvider, VersionSetId) {
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let e_5_10 = provider.version_set("env0", 5, 10);
+    let top = provider.add_package("top", 1);
+    let y2 = provider.add_package("y", 2);
+    let y1 = provider.add_package("y", 1);
+    let mut z_ids = Vec::new();
+    for i in 0..chain_len {
+        let name = format!("z{i}");
+        let z2 = provider.add_package(&name, 2);
+        let z1 = provider.add_package(&name, 1);
+        z_ids.push((z1, z2));
+    }
+    let y_any = provider.version_set("y", 1, 3);
+    let cond = provider
+        .pool
+        .intern_condition(Condition::Requirement(e_5_10));
+    provider.set_dependencies(
+        top,
+        vec![ConditionalRequirement {
+            condition: Some(cond),
+            requirement: y_any.into(),
+        }],
+        vec![],
+    );
+    let z0_any = provider.version_set("z0", 1, 3);
+    provider.set_dependencies(y1, vec![z0_any.into()], vec![]);
+    provider.set_dependencies(y2, vec![z0_any.into()], vec![]);
+    for (i, &(z1, z2)) in z_ids.iter().enumerate() {
+        let requirements: Vec<ConditionalRequirement> = if i + 1 < chain_len {
+            let next_any = provider.version_set(&format!("z{}", i + 1), 1, 3);
+            vec![next_any.into()]
+        } else {
+            vec![]
+        };
+        provider.set_dependencies(z1, requirements.clone(), vec![]);
+        provider.set_dependencies(z2, requirements, vec![]);
+    }
+    let top_any = provider.version_set("top", 1, 2);
+    (provider, top_any)
+}
+
+/// Trail-reuse abandonment fallback: with the kept-prefix work budget forced
+/// to zero (the test-only override), the first prefix-started run aborts
+/// with `PrefixBudgetExhausted` and `solve_universal` re-enumerates from
+/// scratch with reuse disabled. The fallback must complete, produce the same
+/// partition as an unhindered solve (trail reuse does not change the
+/// partition of this scenario, so the fallback's reuse-free enumeration is
+/// byte-comparable), and stay a reseed fixed point.
+#[test]
+fn test_universal_trail_reuse_abandonment_fallback() {
+    use crate::solver::prop_counters::hits;
+    let abandoned_before = hits::get(&hits::UNIVERSAL_REUSE_ABANDONED);
+    let abort_before = hits::get(&hits::PREFIX_BUDGET_ABORT);
+
+    // The baseline partition, solved without any override.
+    let (provider, top_any) = build_env_tail_chain_provider(3);
+    let mut baseline_solver = Solver::new(provider);
+    let baseline = baseline_solver
+        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+        .expect("solvable");
+
+    // The same problem with the prefix budget forced to zero: the transition
+    // into the second cell keeps a trail prefix, arms the budget, aborts and
+    // falls back to a reuse-free enumeration.
+    let (provider, top_any) = build_env_tail_chain_provider(3);
+    let mut solver = Solver::new(provider);
+    solver.set_test_prefix_budget_override(Some(0));
+    let solution = solver
+        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+        .expect("the fallback must complete");
+
+    // (a) The fallback ran: both the propagation-side abort and the
+    // enumeration-side abandonment fired.
+    assert!(
+        hits::get(&hits::PREFIX_BUDGET_ABORT) > abort_before,
+        "the zero budget must abort the prefix-started run"
+    );
+    assert!(
+        hits::get(&hits::UNIVERSAL_REUSE_ABANDONED) > abandoned_before,
+        "the abandonment fallback must have run"
+    );
+
+    // (b) The partition verifies and is byte-identical to the unhindered
+    // (trail-reuse) enumeration, which for this scenario equals the
+    // reuse-free one.
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", baseline.cells()),
+        "the fallback enumeration must produce the baseline partition"
+    );
+
+    // (c) Reseed fixed point after abandonment: re-solving with the
+    // partition's own conditions as seeds (still under the zero budget)
+    // reproduces it byte-identically.
+    let seeds: Vec<CellCondition<NameId>> = solution
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    let reseeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(vec![top_any.into()])
+                .seed_partition(seeds),
+        )
+        .expect("the seeded fallback must complete");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", reseeded.cells()),
+        "the reseed fixed point must hold after abandonment"
+    );
+}
+
+/// Trail reshape: recording the second cell of the chain scenario would pop
+/// more than `TRAIL_RESHAPE_ORDINARY_LEVELS` ordinary decision levels (the
+/// eleven two-version chain installs sit above the environment literal), so
+/// the enumeration widens the retraction to a full one. The partition still
+/// verifies and reseeds byte-identically; the hit counter proves the branch
+/// fired.
+#[test]
+fn test_universal_trail_reshape_full_retract() {
+    use crate::solver::prop_counters::hits;
+    let reshape_before = hits::get(&hits::TRAIL_RESHAPE_FULL_RETRACT);
+
+    let (provider, top_any) = build_env_tail_chain_provider(10);
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+        .expect("solvable");
+
+    assert!(
+        hits::get(&hits::TRAIL_RESHAPE_FULL_RETRACT) > reshape_before,
+        "the trail-reshape full retraction must have fired"
+    );
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_eq!(solution.cells().len(), 2, "one env-free cell, one env tail");
+
+    // Reseed fixed point across the reshape.
+    let seeds: Vec<CellCondition<NameId>> = solution
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    let reseeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(vec![top_any.into()])
+                .seed_partition(seeds),
+        )
+        .expect("seeded re-solve");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", reseeded.cells()),
+        "the reseed fixed point must hold across the trail reshape"
+    );
+}
+
+/// The `VersionSetRelation::Equal` arm of the oracle-consistency encoding is
+/// structurally unreachable through plain ranges (the pool dedups equal
+/// ranges to one version set id), so this test interns an ALIASED copy of
+/// the model's range (distinct id, same range; see `Range::new_aliased`).
+/// Interning the second literal emits both implication clauses; the solve
+/// produces one verified cell and stays a reseed fixed point.
+#[test]
+fn test_universal_oracle_equal_relation() {
+    use crate::solver::prop_counters::hits;
+    let equal_before = hits::get(&hits::ORACLE_EQUAL_CLAUSES);
+
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("cuda", false);
+    let cuda_plain = provider.version_set("cuda", 5, 10);
+    let cuda_alias = provider.version_set_aliased("cuda", 5, 10, 1);
+    assert_ne!(
+        cuda_plain, cuda_alias,
+        "the alias must intern a distinct id"
+    );
+    let a1 = provider.add_package("a", 1);
+    // The model uses the plain range; a's requirement uses the aliased one,
+    // so both literals intern and the oracle is asked about the pair.
+    provider.set_dependencies(a1, vec![cuda_alias.into()], vec![]);
+    let a_any = provider.version_set("a", 1, 2);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(vec![a_any.into()])
+        .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+            SignedEnvLiteral::new(EnvLiteral::Matches(cuda_plain), true),
+        ])]));
+    let solution = solver.solve_universal(problem).expect("solvable");
+
+    assert!(
+        hits::get(&hits::ORACLE_EQUAL_CLAUSES) > equal_before,
+        "the Equal oracle arm must have emitted its implication clauses"
+    );
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_eq!(solution.cells().len(), 1);
+    assert!(solution.cells()[0].solvables().contains(&a1));
+
+    // Reseed fixed point through the Equal-linked literals.
+    let seeds: Vec<CellCondition<NameId>> = solution
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    let reseeded = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(vec![a_any.into()])
+                .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+                    SignedEnvLiteral::new(EnvLiteral::Matches(cuda_plain), true),
+                ])]))
+                .seed_partition(seeds),
+        )
+        .expect("seeded re-solve");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", reseeded.cells()),
+    );
+}
+
+/// The reseed-orbit early exit (`inputs_tried.contains(&output)` in
+/// `solve_universal_impl`) fires when a seeded enumeration cycles between
+/// seed lists without reaching a fixed point, which reversed seed orders can
+/// provoke. Exactly one corpus universe hit it at the time this test was
+/// written (generator seed 79 of the pre-concrete-conditions generator);
+/// the universe is PINNED here as a literal so generator drift cannot
+/// silently lose the only deterministic coverage of the orbit exit.
+#[test]
+fn test_universal_reseed_orbit_pinned() {
+    use crate::solver::prop_counters::hits;
+
+    fn e(pkg: usize, lo: u32, hi: u32) -> GenCondition {
+        GenCondition::Env { pkg, lo, hi }
+    }
+    fn and(l: GenCondition, r: GenCondition) -> GenCondition {
+        GenCondition::And(Box::new(l), Box::new(r))
+    }
+    fn or(l: GenCondition, r: GenCondition) -> GenCondition {
+        GenCondition::Or(Box::new(l), Box::new(r))
+    }
+    fn req(target: usize, lo: u32, hi: u32, condition: Option<GenCondition>) -> GenRequirement {
+        GenRequirement {
+            target: GenTarget::Concrete(target),
+            lo,
+            hi,
+            union2: None,
+            condition,
+        }
+    }
+    fn env_req(target: usize, lo: u32, hi: u32, condition: Option<GenCondition>) -> GenRequirement {
+        GenRequirement {
+            target: GenTarget::Env(target),
+            lo,
+            hi,
+            union2: None,
+            condition,
+        }
+    }
+    fn version(requirements: Vec<GenRequirement>, constrains: Vec<GenConstrain>) -> PkgVersion {
+        PkgVersion {
+            requirements,
+            constrains,
+        }
+    }
+    fn cenv(pkg: usize, lo: u32, hi: u32) -> GenConstrain {
+        GenConstrain::Env { pkg, lo, hi }
+    }
+    fn cpkg(pkg: usize, lo: u32, hi: u32) -> GenConstrain {
+        GenConstrain::Concrete { pkg, lo, hi }
+    }
+    fn plain(versions: Vec<PkgVersion>) -> ConcretePkg {
+        ConcretePkg {
+            versions,
+            ..ConcretePkg::default()
+        }
+    }
+    fn m(pkg: usize, lo: u32, hi: u32) -> GenModelLiteral {
+        GenModelLiteral::Matches {
+            pkg,
+            lo,
+            hi,
+            positive: true,
+        }
+    }
+
+    let universe = Universe {
+        env_packages: vec![
+            EnvPkg {
+                can_be_absent: false,
+            },
+            EnvPkg {
+                can_be_absent: false,
+            },
+        ],
+        packages: vec![
+            plain(vec![
+                version(vec![req(3, 3, 4, None)], vec![cenv(0, 2, 4)]),
+                version(
+                    vec![
+                        req(3, 1, 3, Some(or(e(1, 2, 8), e(0, 0, 10)))),
+                        req(1, 1, 4, None),
+                    ],
+                    vec![cpkg(2, 3, 4)],
+                ),
+                version(vec![req(4, 3, 6, None)], vec![]),
+                version(
+                    vec![
+                        req(4, 1, 4, Some(e(1, 6, 8))),
+                        req(1, 3, 4, Some(and(e(0, 5, 7), e(0, 4, 9)))),
+                    ],
+                    vec![cenv(1, 8, 10), cpkg(4, 2, 4)],
+                ),
+                version(vec![req(1, 3, 4, None), req(2, 1, 6, None)], vec![]),
+            ]),
+            plain(vec![
+                version(vec![req(0, 1, 4, Some(e(0, 8, 10)))], vec![]),
+                version(
+                    vec![
+                        req(4, 1, 4, Some(or(e(1, 2, 7), e(1, 1, 7)))),
+                        req(0, 1, 6, Some(or(e(1, 4, 10), e(0, 6, 8)))),
+                    ],
+                    vec![cpkg(2, 1, 3)],
+                ),
+                version(vec![req(0, 2, 3, None)], vec![]),
+            ]),
+            plain(vec![
+                version(
+                    vec![
+                        req(0, 2, 6, Some(and(e(0, 3, 8), or(e(0, 7, 10), e(1, 4, 9))))),
+                        req(3, 1, 4, None),
+                    ],
+                    vec![cenv(0, 3, 6), cpkg(3, 1, 4)],
+                ),
+                version(
+                    vec![
+                        req(0, 1, 6, None),
+                        req(0, 1, 6, None),
+                        env_req(1, 2, 6, None),
+                    ],
+                    vec![],
+                ),
+                version(
+                    vec![
+                        req(4, 1, 6, None),
+                        req(4, 1, 6, Some(and(e(0, 0, 8), e(0, 3, 10)))),
+                    ],
+                    vec![],
+                ),
+            ]),
+            plain(vec![version(
+                vec![req(2, 1, 4, Some(e(1, 6, 10)))],
+                vec![cpkg(3, 1, 4)],
+            )]),
+            plain(vec![
+                version(
+                    vec![
+                        req(0, 1, 6, Some(e(0, 5, 10))),
+                        req(0, 1, 3, Some(e(1, 8, 9))),
+                    ],
+                    vec![cenv(1, 3, 5)],
+                ),
+                version(
+                    vec![req(0, 1, 6, None), req(2, 1, 6, Some(e(0, 7, 8)))],
+                    vec![cenv(0, 5, 9), cpkg(2, 1, 2)],
+                ),
+                version(vec![req(3, 1, 6, None)], vec![cenv(1, 3, 5)]),
+                version(
+                    vec![
+                        req(1, 2, 6, Some(or(e(1, 6, 7), e(1, 4, 9)))),
+                        req(0, 1, 6, None),
+                        env_req(1, 6, 10, Some(e(1, 6, 7))),
+                    ],
+                    vec![],
+                ),
+            ]),
+        ],
+        root_requirements: (0..5).map(|p| req(p, 1, 6, None)).collect(),
+        root_constrains: vec![],
+        model: vec![
+            vec![m(1, 7, 10), m(1, 8, 10), m(1, 3, 8)],
+            vec![m(0, 3, 10), m(0, 1, 4)],
+        ],
+    };
+
+    let provider = build_provider(&universe);
+    let root_requirements: Vec<ConditionalRequirement> = universe
+        .root_requirements
+        .iter()
+        .map(|requirement| build_requirement(&provider, requirement))
+        .collect();
+    let environment_model = build_environment_model(&provider, &universe);
+
+    // Mirror the property test's solve sequence exactly: original solve,
+    // in-order reseed, fixed-point reseed, then the REVERSED reseed that
+    // closes the orbit (a reversed seed list is one no enumeration produced,
+    // so iterating on it can cycle without a fixed point).
+    let mut solver = Solver::new(provider);
+    let problem = |seeds: Vec<CellCondition<NameId>>| {
+        UniversalProblem::new()
+            .requirements(root_requirements.clone())
+            .environment_model(environment_model.clone())
+            .seed_partition(seeds)
+    };
+    let solution = solver.solve_universal(problem(vec![])).expect("solvable");
+    assert!(
+        solution.cells().len() > 1,
+        "the pinned universe must enumerate multiple cells"
+    );
+    let seeds: Vec<CellCondition<NameId>> = solution
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    let reseeded = solver
+        .solve_universal(problem(seeds.clone()))
+        .expect("reseed");
+    let reseeded_seeds: Vec<CellCondition<NameId>> = reseeded
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    let _fixed_point = solver
+        .solve_universal(problem(reseeded_seeds))
+        .expect("fixed point");
+
+    let orbit_before = hits::get(&hits::RESEED_ORBIT_CLOSED);
+    let mut reversed = seeds;
+    reversed.reverse();
+    let reordered = solver
+        .solve_universal(problem(reversed))
+        .expect("reversed reseed");
+    assert!(
+        hits::get(&hits::RESEED_ORBIT_CLOSED) > orbit_before,
+        "the pinned universe must close a reseed orbit under reversed seeds"
+    );
+    // The orbit exit still returns a verified disjoint cover.
+    assert_eq!(reordered.verify(solver.provider()), Ok(()));
+}

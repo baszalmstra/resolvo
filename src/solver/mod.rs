@@ -234,6 +234,16 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// Floor of the work-based co-trigger (see
     /// [`ENV_ORDERING_WORK_FLOOR`]); overridable for experiments.
     env_ordering_work_floor: u64,
+
+    /// Test-only override of the kept-prefix work budget (see
+    /// [`SolverState::prefix_budget_deadline`]): when set, every
+    /// prefix-started run is armed with exactly this budget instead of
+    /// `max(fresh_solve_cost * PREFIX_BUDGET_FACTOR, PREFIX_BUDGET_FLOOR)`.
+    /// Forcing it to `0` makes the first prefix-started run abort
+    /// immediately, which is the only way tests can deterministically drive
+    /// the trail-reuse abandonment fallback of `solve_universal`.
+    #[cfg(test)]
+    test_prefix_budget_override: Option<u64>,
 }
 
 type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
@@ -894,6 +904,8 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             env_ordering_conflict_limit: ENV_ORDERING_CONFLICT_LIMIT,
             env_ordering_work_factor: ENV_ORDERING_WORK_FACTOR,
             env_ordering_work_floor: ENV_ORDERING_WORK_FLOOR,
+            #[cfg(test)]
+            test_prefix_budget_override: None,
         }
     }
 }
@@ -1048,6 +1060,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.propagation_counters.prefix_budget_aborts
     }
 
+    /// Overrides the kept-prefix work budget of universal trail reuse (see
+    /// [`Solver::test_prefix_budget_override`]). Test-only: forcing `Some(0)`
+    /// aborts the first prefix-started run and drives the trail-reuse
+    /// abandonment fallback deterministically.
+    #[cfg(test)]
+    pub(crate) fn set_test_prefix_budget_override(&mut self, budget: Option<u64>) {
+        self.test_prefix_budget_override = budget;
+    }
+
     /// Set the runtime of the solver to `runtime`.
     #[must_use]
     pub fn with_runtime<RT2: AsyncRuntime>(self, runtime: RT2) -> Solver<D, RT2> {
@@ -1060,6 +1081,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             env_ordering_conflict_limit: self.env_ordering_conflict_limit,
             env_ordering_work_factor: self.env_ordering_work_factor,
             env_ordering_work_floor: self.env_ordering_work_floor,
+            #[cfg(test)]
+            test_prefix_budget_override: self.test_prefix_budget_override,
         }
     }
 
@@ -1267,8 +1290,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // universal solve enters with restartable decisions above the
         // starting level; all other entries leave this disarmed.
         self.state.prefix_budget_deadline = if level > starting_level {
-            let budget =
+            #[allow(unused_mut)]
+            let mut budget =
                 (self.state.fresh_solve_cost * PREFIX_BUDGET_FACTOR).max(PREFIX_BUDGET_FLOOR);
+            #[cfg(test)]
+            if let Some(override_budget) = self.test_prefix_budget_override {
+                budget = override_budget;
+            }
             Some(self.state.propagated_total + budget)
         } else {
             None
