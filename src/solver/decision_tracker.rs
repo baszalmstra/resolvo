@@ -59,6 +59,28 @@ pub(crate) struct DecisionTracker {
     /// ([`Self::find_clause_for_assignment`]) is guarded by the decision
     /// map, and a variable without a current assignment reports no reason.
     reasons: Vec<ClauseId>,
+
+    /// The level-starting assignments of the trail, in trail order: one
+    /// entry `(position, level, variable)` per assignment whose level
+    /// exceeds the level of every earlier trail entry (`stack[position]`
+    /// opened `level`). These are exactly the `decide()` picks and
+    /// assumption decisions; propagations land on an already-opened level.
+    /// Pushed by [`Self::try_add_decision`], popped by [`Self::undo_last`]
+    /// when the trail shrinks below `position`, so
+    /// [`Self::starts_level`] answers in O(log levels) what a full trail
+    /// scan used to compute per query. The recorded levels are strictly
+    /// increasing.
+    level_starts: Vec<(usize, u32, VariableId)>,
+
+    /// Scalar mirror of `level_starts.last()`'s `(position, level)`, or
+    /// `(0, 0)` when it is empty, so the hot paths
+    /// ([`Self::try_add_decision`], [`Self::undo_last`]) compare against a
+    /// struct field instead of dereferencing into the vec on every
+    /// assignment and undo. The `(0, 0)` empty sentinel is safe: an entry
+    /// at position 0 could only be popped when the trail empties, which
+    /// `undo_last` never does (it always leaves at least one assignment)
+    /// and a full clear resets both structures.
+    last_level_start: (usize, u32),
 }
 
 impl DecisionTracker {
@@ -104,6 +126,20 @@ impl DecisionTracker {
         self.map.level(variable_id)
     }
 
+    /// Whether `variable_id`'s current assignment starts its decision level:
+    /// its level exceeds the level of every earlier trail entry (a `decide()`
+    /// pick or an assumption decision, never a propagation). Unassigned
+    /// variables report false. This answers in O(log levels) exactly what a
+    /// full trail scan computes with `level > previous_level` per entry.
+    pub(crate) fn starts_level(&self, variable_id: VariableId) -> bool {
+        let level = self.map.level(variable_id);
+        level > 0
+            && self
+                .level_starts
+                .binary_search_by_key(&level, |&(_, l, _)| l)
+                .is_ok_and(|index| self.level_starts[index].2 == variable_id)
+    }
+
     /// The decision level of the deepest decision on the stack, or 0 when no
     /// decisions have been made.
     pub(crate) fn deepest_level(&self) -> u32 {
@@ -140,6 +176,13 @@ impl DecisionTracker {
                     self.reasons.resize(index + 1, ClauseId::install_root());
                 }
                 self.reasons[index] = decision.derived_from;
+                // A level higher than everything on the trail so far means
+                // this assignment opens the level (see `level_starts`).
+                if level > self.last_level_start.1 {
+                    self.last_level_start = (self.stack.len(), level);
+                    self.level_starts
+                        .push((self.stack.len(), level, decision.variable));
+                }
                 self.stack.push(decision);
                 Ok(true)
             }
@@ -166,6 +209,23 @@ impl DecisionTracker {
     pub(crate) fn undo_last(&mut self) -> (Decision, u32) {
         let decision = self.stack.pop().unwrap();
         self.map.reset(decision.variable);
+
+        // Drop the level-start entry whose trail position was just popped,
+        // if any (at most one per pop: positions are strictly increasing
+        // and each pop removes one trail entry). With `level_starts` empty
+        // the mirror is `(0, 0)` and position 0 is never popped (see the
+        // field docs), so the condition stays false.
+        if self.last_level_start.0 >= self.stack.len() {
+            self.level_starts.pop();
+            self.last_level_start = self
+                .level_starts
+                .last()
+                .map_or((0, 0), |&(position, level, _)| (position, level));
+            debug_assert!(
+                self.last_level_start.0 < self.stack.len() || self.level_starts.is_empty(),
+                "bug: at most one level-start entry can sit at a popped position"
+            );
+        }
 
         self.propagate_index = self.stack.len();
         self.sync_floor = self.sync_floor.min(self.stack.len());

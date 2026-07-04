@@ -321,12 +321,29 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     blocking_clauses: Vec<(EnvClauseId, ClauseId)>,
 
     /// Index of clause ids that can contribute to a cell's support during
-    /// universal solving: `Requires` clauses whose requirement candidates are
+    /// universal solving, grouped by the clause's parent variable (the
+    /// requirer of a `Requires` clause, the parent of an `EnvConstrains`
+    /// clause): `Requires` clauses whose requirement candidates are
     /// environment literals or whose condition disjunction contains
-    /// environment literals, and `EnvConstrains` clauses. Populated at clause
-    /// creation in the encoder. Oracle consistency, model and blocking
-    /// clauses are never support.
-    env_support_clauses: Vec<ClauseId>,
+    /// environment literals, and `EnvConstrains` clauses. Populated at
+    /// clause creation in the encoder, so every per-parent list is sorted by
+    /// clause id (registration order). Oracle consistency, model and
+    /// blocking clauses are never support. Grouping by parent lets cell
+    /// extraction visit only the clauses of installed parents instead of
+    /// scanning every entry per cell; a clause never contributes support
+    /// while its parent is not installed. A parent's list is found through
+    /// `cell_capture_index`.
+    env_support_clauses: Vec<Vec<ClauseId>>,
+
+    /// Dense per-variable index (by variable index) into the two per-parent
+    /// structures the universal capture path walks, both offset by one with
+    /// `0` = none: the registration index of the variable's
+    /// `requires_clauses` entry, and the index of its list in
+    /// `env_support_clauses`. Lets the capture path find the installed
+    /// parents — and order them by registration, reproducing whole-map
+    /// iteration order — by scanning the trail with a single array read
+    /// per assignment instead of hashing every trail variable.
+    cell_capture_index: Vec<(u32, u32)>,
 
     /// For every solvable variable whose install adds or activates clauses
     /// that assign environment literals, the environment literal variables
@@ -642,6 +659,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_clause_ids: Default::default(),
             blocking_clauses: Default::default(),
             env_support_clauses: Default::default(),
+            cell_capture_index: Default::default(),
             env_sensitive_parents: Default::default(),
             env_ordering_active: false,
             universal_mode: false,
@@ -3214,6 +3232,40 @@ impl<D: DependencyProvider> SolverState<D> {
             &self.disjunctions,
             self.decision_tracker.assigned_value(parent),
         );
+    }
+
+    /// Records a `requires_clauses` entry for `parent` and keeps the dense
+    /// `cell_capture_index` in sync (see the field docs), so the universal
+    /// capture path can recover the parent's registration index from the
+    /// trail without hashing.
+    pub(crate) fn push_requires_clause_entry(&mut self, parent: VariableId, entry: RequiresClause) {
+        let map_entry = self.requires_clauses.entry(parent);
+        let index = map_entry.index();
+        map_entry.or_default().push(entry);
+        // Stored offset by one: 0 means "no entry" (the `IdMap` default).
+        let index = u32::try_from(index + 1)
+            .expect("the number of requires parents never exceeds the variable count");
+        let capture = self.cell_capture_index.get(parent);
+        self.cell_capture_index.set(parent, (index, capture.1));
+    }
+
+    /// Records `clause_id` as a potential cell-support clause of `parent`
+    /// (see the `env_support_clauses` field docs), keeping the dense
+    /// `cell_capture_index` in sync.
+    pub(crate) fn add_env_support_clause(&mut self, parent: VariableId, clause_id: ClauseId) {
+        // Stored offset by one: 0 means "no list" (the `IdMap` default).
+        let capture = self.cell_capture_index.get(parent);
+        let index = match capture.1 {
+            0 => {
+                self.env_support_clauses.push(Vec::new());
+                let index = u32::try_from(self.env_support_clauses.len())
+                    .expect("the number of support parents never exceeds the variable count");
+                self.cell_capture_index.set(parent, (capture.0, index));
+                index
+            }
+            index => index,
+        };
+        self.env_support_clauses[index as usize - 1].push(clause_id);
     }
 
     /// Registers a newly encoded env-constrains clause with the incremental

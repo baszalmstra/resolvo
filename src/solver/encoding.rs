@@ -766,7 +766,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             // requirement candidates are environment literals or its
             // condition disjunction contains environment literals.
             if has_env || disjunction_has_env {
-                self.state.env_support_clauses.push(clause_id);
+                self.state.add_env_support_clause(variable, clause_id);
             }
 
             // Installing this parent makes the clause assign an environment
@@ -800,11 +800,10 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             // (`requires_clauses`, iterated in `universal.rs` and the
             // `decide()` reference scan) and register it with the incremental
             // decide queue that drives selection.
-            self.state
-                .requires_clauses
-                .entry(variable)
-                .or_default()
-                .push((requirement.requirement, condition, clause_id));
+            self.state.push_requires_clause_entry(
+                variable,
+                (requirement.requirement, condition, clause_id),
+            );
             let names = requirement
                 .requirement
                 .version_sets(self.cache.provider())
@@ -897,10 +896,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // disjunction (the requirer's own clause is only the binary
         // implication to the gate).
         self.state
-            .requires_clauses
-            .entry(parent)
-            .or_default()
-            .push((requirement, None, shared_clause_id));
+            .push_requires_clause_entry(parent, (requirement, None, shared_clause_id));
 
         // The implication `parent -> gate`, encoded as the binary clause
         // `(gate ∨ ¬parent)` (the `AnyOf` shape).
@@ -1100,7 +1096,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // parent's install activates an env-literal decision: record the
         // literals so the parent is deferred while one of them is still
         // unassigned (env-literals-last ordering).
-        self.state.env_support_clauses.push(clause_id);
+        self.state.add_env_support_clause(parent_var, clause_id);
         let entry = self
             .state
             .env_sensitive_parents

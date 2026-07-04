@@ -241,6 +241,17 @@ impl CellPinCounts {
     }
 }
 
+/// The per-cell capture inputs shared by `Solver::extract_cell` and
+/// `Solver::capture_cell_edges`, collected in one trail scan by
+/// `Solver::collect_cell_capture_inputs` (see there for the exact
+/// semantics and ordering guarantees).
+struct CellCaptureInputs {
+    /// Registration indices of the installed requires parents, ascending.
+    requires_parents: Vec<u32>,
+    /// Support clauses of installed parents, in registration order.
+    support_clauses: Vec<ClauseId>,
+}
+
 /// One diagnostics observation of a free-phase cell's trail retraction during
 /// a universal enumeration (see `Solver::universal_cell_retracts`).
 ///
@@ -1351,7 +1362,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // solution actually depends on, so a stale over-specific
                     // seed heals (the repair step still re-specializes where
                     // needed to keep cells disjoint).
-                    let (mut cell, mut pins) = self.extract_cell();
+                    // The capture inputs are shared by cell extraction and
+                    // edge capture; nothing below touches the trail until
+                    // the retraction after the edges are captured.
+                    let capture_inputs = self.collect_cell_capture_inputs();
+                    let (mut cell, mut pins) = self.extract_cell(&capture_inputs);
                     self.repair_disjointness(&mut cell, &cell_assignments, &mut pins);
                     #[cfg(feature = "diagnostics")]
                     self.state.propagation_counters.cell_pins.push(pins);
@@ -1360,7 +1375,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     let solvables = self.chosen_solvables_canonical();
                     // Capture the edges while the cell's assignment is still on
                     // the decision stack, then bundle everything into one cell.
-                    let edges = self.capture_cell_edges();
+                    let edges = self.capture_cell_edges(&capture_inputs);
                     let cell_is_empty = cell.is_empty();
                     cells.push(Cell::new(condition, solvables, edges));
                     cell_assignments.push(cell.clone());
@@ -1643,6 +1658,62 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         chosen.into_iter().map(|(_, solvable)| solvable).collect()
     }
 
+    /// Collects, in one trail scan, the per-cell capture inputs of
+    /// [`Self::extract_cell`] and [`Self::capture_cell_edges`]: the clauses
+    /// and requires entries of the INSTALLED parents only, instead of every
+    /// registered entry per cell.
+    ///
+    /// - `requires_parents`: the registration indices (into
+    ///   `SolverState::requires_clauses`) of the installed parents
+    ///   (variables assigned true) that have requires entries, sorted
+    ///   ascending. Visiting these entries, each with its clause list in
+    ///   insertion order, reproduces exactly the visit order of iterating
+    ///   the whole map and skipping parents that are not installed.
+    /// - `support_clauses`: the support clauses
+    ///   (`SolverState::env_support_clauses`) whose parent is installed, in
+    ///   clause registration order. The per-parent lists are ascending in
+    ///   clause id (clauses are appended at creation), so a global sort by
+    ///   clause id restores exactly the order in which a full
+    ///   registration-order scan visits the clauses it does not skip.
+    ///
+    /// Uninstalled parents cannot contribute: a clause whose parent is not
+    /// assigned true is satisfied by `not parent` in every environment, and
+    /// both consumers skip exactly those entries. The trail is scanned with
+    /// one dense array read per assignment (see
+    /// `SolverState::cell_capture_index`).
+    ///
+    /// Must be called while the solution's decisions are still on the
+    /// decision stack; the result stays valid only while the trail is
+    /// untouched.
+    fn collect_cell_capture_inputs(&self) -> CellCaptureInputs {
+        let state = &self.state;
+        let mut requires_parents: Vec<u32> = Vec::new();
+        let mut support_clauses: Vec<ClauseId> = Vec::new();
+        for decision in state.decision_tracker.stack() {
+            if !decision.value {
+                continue;
+            }
+            // Both dense indices are stored offset by one; 0 = none.
+            let (parent_index, support_index) = state.cell_capture_index.get(decision.variable);
+            if parent_index != 0 {
+                requires_parents.push(parent_index - 1);
+            }
+            if support_index != 0 {
+                support_clauses
+                    .extend_from_slice(&state.env_support_clauses[support_index as usize - 1]);
+            }
+        }
+        // The trail order is not the registration order; restore it. Every
+        // variable occurs at most once on the trail and holds at most one
+        // registration index, so the indices are unique.
+        requires_parents.sort_unstable();
+        support_clauses.sort_unstable_by_key(|clause_id| clause_id.to_index());
+        CellCaptureInputs {
+            requires_parents,
+            support_clauses,
+        }
+    }
+
     /// Captures the dependency edges that are active in the current solution
     /// (design doc 5.8, "conditional edges"). Must be called while the
     /// solution's decisions are still on the decision stack.
@@ -1654,7 +1725,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// installed candidate of the requirement, or `None` when the requirement
     /// is on an environment package (its candidate is an environment literal,
     /// not a solvable).
-    fn capture_cell_edges(&self) -> Vec<CellEdge<D::SolvableId>> {
+    fn capture_cell_edges(&self, inputs: &CellCaptureInputs) -> Vec<CellEdge<D::SolvableId>> {
         let state = &self.state;
         let decision_map = state.decision_tracker.map();
         let mut edges: Vec<CellEdge<D::SolvableId>> = Vec::new();
@@ -1662,10 +1733,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // per-cell dedup stays linear rather than O(edges^2).
         let mut seen: ahash::HashSet<CellEdge<D::SolvableId>> = ahash::HashSet::default();
 
-        for (&parent_var, requirements) in state.requires_clauses.iter() {
-            if state.decision_tracker.assigned_value(parent_var) != Some(true) {
-                continue;
-            }
+        for &parent_index in &inputs.requires_parents {
+            let (&parent_var, requirements) = state
+                .requires_clauses
+                .get_index(parent_index as usize)
+                .expect("collect_cell_capture_inputs yields valid registration indices");
             let parent = match state.variable_map.origin(parent_var) {
                 VariableOrigin::Root => None,
                 VariableOrigin::Solvable(solvable) => Some(solvable),
@@ -1926,7 +1998,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Also returns, per pinning rule, how many literals the rule
     /// contributed (a [`CellPinCounts`]; the disjointness repair adds its
     /// own counts afterwards).
-    fn extract_cell(&self) -> (Vec<(VariableId, bool)>, CellPinCounts) {
+    fn extract_cell(&self, inputs: &CellCaptureInputs) -> (Vec<(VariableId, bool)>, CellPinCounts) {
         let state = &self.state;
         let decision_map = state.decision_tracker.map();
         let mut cell: Vec<(VariableId, bool)> = Vec::new();
@@ -1949,14 +2021,18 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 }
             };
 
-        for &clause_id in &state.env_support_clauses {
+        // Only the clauses of installed parents can contribute support: a
+        // clause whose parent is not installed is satisfied by `not parent`
+        // in every environment. The inputs hold exactly those clauses, in
+        // the registration order a full scan would visit them in.
+        for &clause_id in &inputs.support_clauses {
             match state.clauses.kinds[clause_id.to_index()] {
                 Clause::Requires(parent, disjunction, requirement) => {
-                    // Parent not installed: the clause is satisfied by
-                    // `not parent` in every environment, no support needed.
-                    if state.decision_tracker.assigned_value(parent) != Some(true) {
-                        continue;
-                    }
+                    debug_assert_eq!(
+                        state.decision_tracker.assigned_value(parent),
+                        Some(true),
+                        "bug: env_support_clauses is keyed by the clause's parent"
+                    );
 
                     // Some candidate installed: the requirement is satisfied
                     // regardless of the environment. If the satisfying
@@ -2086,9 +2162,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 }
                 Clause::EnvConstrains(env_constrains_id) => {
                     let payload = state.env_constrains[env_constrains_id];
-                    if state.decision_tracker.assigned_value(payload.parent) != Some(true) {
-                        continue;
-                    }
+                    debug_assert_eq!(
+                        state.decision_tracker.assigned_value(payload.parent),
+                        Some(true),
+                        "bug: env_support_clauses is keyed by the clause's parent"
+                    );
                     let absent_true = payload.absent_var.is_some_and(|absent| {
                         state.decision_tracker.assigned_value(absent) == Some(true)
                     });
@@ -2149,24 +2227,13 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // implications). Pinning trail-consistent literals only shrinks the
         // cell, so this is always sound.
         {
-            // Level-starting assignments are decide() picks or assumption
-            // decisions; their recorded clause is not an implying reason.
-            let mut level_starts: ahash::HashSet<VariableId> = ahash::HashSet::default();
-            let mut previous_level = 0;
-            for decision in state.decision_tracker.stack() {
-                let level = state.decision_tracker.level(decision.variable);
-                if level > previous_level {
-                    level_starts.insert(decision.variable);
-                }
-                previous_level = previous_level.max(level);
-            }
-
             let mut visited: ahash::HashSet<VariableId> = ahash::HashSet::default();
             let mut cone: Vec<VariableId> = Vec::new();
-            for (&parent, requirements) in state.requires_clauses.iter() {
-                if state.decision_tracker.assigned_value(parent) != Some(true) {
-                    continue;
-                }
+            for &parent_index in &inputs.requires_parents {
+                let (_, requirements) = state
+                    .requires_clauses
+                    .get_index(parent_index as usize)
+                    .expect("collect_cell_capture_inputs yields valid registration indices");
                 for (requirement, disjunction, _clause_id) in requirements {
                     // Only clauses whose condition holds drove a pick; a
                     // clause satisfied by its condition complement never
@@ -2219,9 +2286,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 if assigned && variable.as_solvable_or_root(&state.variable_map).is_some() {
                     continue;
                 }
-                // decide() picks are free choices; assumption decisions are
-                // environment literals and were pinned above.
-                if level_starts.contains(&variable) {
+                // Level-starting assignments are decide() picks (free
+                // choices, not implications) or assumption decisions
+                // (environment literals, pinned above); their recorded
+                // clause is not an implying reason.
+                if state.decision_tracker.starts_level(variable) {
                     continue;
                 }
                 let Some(reason) = state.decision_tracker.find_clause_for_assignment(variable)
