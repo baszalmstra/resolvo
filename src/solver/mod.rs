@@ -528,14 +528,17 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// [`variable_map::VariableOrigin::RequiresGate`].
     requires_aux_vars: HashMap<Requirement, (VariableId, ClauseId)>,
 
-    /// For each shared-requires gate, the requirers that imply it
-    /// (`(¬requirer ∨ gate)`) and the implication clause. The encoder forces the
-    /// gate true at its own (lazy, often higher) level, so a backtrack can
-    /// strand it (the implication is unit but watched literals never re-fire on
-    /// an unassignment); [`SolverState::force_stuck_gates`] uses this to
-    /// re-derive such gates. An [`IndexMap`] so the forcing order, and hence the
-    /// solution, stays deterministic.
-    requires_gate_requirers: IndexMap<VariableId, Vec<(VariableId, ClauseId)>, ahash::RandomState>,
+    /// For each auxiliary "gate" variable that must be true whenever one of
+    /// its requirers is true -- a shared-requires gate (`(¬requirer ∨ gate)`)
+    /// or an at-least-one tracker (`(¬candidate ∨ C_selected)`, see
+    /// [`conditions`]) -- the requirers that imply it and the binary
+    /// implication clause. The encoder forces the gate true at its own (lazy,
+    /// often higher) level, so a backtrack can strand it (the implication is
+    /// unit but watched literals never re-fire on an unassignment);
+    /// [`SolverState::force_stuck_gates`] uses this to re-derive such gates.
+    /// An [`IndexMap`] so the forcing order, and hence the solution, stays
+    /// deterministic.
+    implied_gate_requirers: IndexMap<VariableId, Vec<(VariableId, ClauseId)>, ahash::RandomState>,
 
     pub(crate) decision_tracker: DecisionTracker,
 
@@ -698,7 +701,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_packages: Default::default(),
 
             requires_aux_vars: Default::default(),
-            requires_gate_requirers: Default::default(),
+            implied_gate_requirers: Default::default(),
             decision_tracker: Default::default(),
             encode_scan_cursor: 0,
             assumption_levels: 0,
@@ -1494,8 +1497,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // conclude the solution is complete.
             let fired_conditions = self.state.fired_deferred_conditions();
 
-            // Re-derive shared-requires gates stranded by a backtrack, else the
-            // gated requirement would be silently dropped (see
+            // Re-derive implied gates (shared-requires gates and
+            // at-least-one condition trackers) stranded by a backtrack, else
+            // the gated requirement would be silently dropped (see
             // [`SolverState::force_stuck_gates`]).
             let forced_stuck_gates = self.state.force_stuck_gates(level);
 
@@ -3611,21 +3615,22 @@ impl<D: DependencyProvider> SolverState<D> {
         }
     }
 
-    /// Forces true every stranded shared-requires gate (unassigned, but with an
-    /// installed requirer that implies it), using the requirer's implication
-    /// clause as the reason so conflict analysis stays correct. Returns whether
-    /// any were forced. Assigned gates are left alone (a false gate with an
+    /// Forces true every stranded implied gate -- a shared-requires gate or
+    /// an at-least-one tracker that is unassigned, but has an installed
+    /// requirer that implies it -- using the requirer's implication clause as
+    /// the reason so conflict analysis stays correct. Returns whether any
+    /// were forced. Assigned gates are left alone (a false gate with an
     /// installed requirer is a real conflict propagation already reports).
     /// Forcing a gate never changes a requirer, so one in-place pass suffices.
     pub(crate) fn force_stuck_gates(&mut self, level: u32) -> bool {
         let Self {
-            requires_gate_requirers,
+            implied_gate_requirers,
             decision_tracker,
             ..
         } = self;
 
         let mut forced_any = false;
-        for (&gate, requirers) in requires_gate_requirers.iter() {
+        for (&gate, requirers) in implied_gate_requirers.iter() {
             if decision_tracker.assigned_value(gate).is_some() {
                 continue;
             }

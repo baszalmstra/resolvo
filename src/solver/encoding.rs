@@ -950,7 +950,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // Track the requirer so a backtrack that strands the gate can be
         // repaired (see [`SolverState::force_stuck_gates`]).
         self.state
-            .requires_gate_requirers
+            .implied_gate_requirers
             .entry(gate)
             .or_default()
             .push((parent, clause_id));
@@ -1751,7 +1751,15 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 if let Some(at_least_one_variable) = self.state.at_least_one_tracker.get(name_id) {
                     let (watched_literals, kind) =
                         WatchedLiterals::any_of(at_least_one_variable, candidate_var);
-                    self.state.add_clause(watched_literals, kind);
+                    let clause_id = self.state.add_clause(watched_literals, kind);
+                    // Track the implication so a backtrack that strands the
+                    // tracker can be repaired (see
+                    // [`SolverState::force_stuck_gates`]).
+                    self.state
+                        .implied_gate_requirers
+                        .entry(at_least_one_variable)
+                        .or_default()
+                        .push((candidate_var, clause_id));
                 }
             }
         }
@@ -1790,6 +1798,19 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 let (watched_literals, kind) =
                     WatchedLiterals::any_of(at_least_one_variable, helper_var);
                 let clause_id = self.state.add_clause(watched_literals, kind);
+
+                // Track the implication so a backtrack that strands the
+                // tracker can be repaired: the retroactive decision below is
+                // made at the CURRENT (encode-time) level, so a backjump can
+                // pop it while `helper_var` (assigned at a shallower level)
+                // survives, and the watches never re-fire for an assignment
+                // that predates the clause (see
+                // [`SolverState::force_stuck_gates`]).
+                self.state
+                    .implied_gate_requirers
+                    .entry(at_least_one_variable)
+                    .or_default()
+                    .push((helper_var, clause_id));
 
                 // Assign true if any of the variables is true.
                 if self.state.decision_tracker.assigned_value(helper_var) == Some(true) {

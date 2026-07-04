@@ -97,36 +97,36 @@ const GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES: bool = true;
 /// unrestricted.
 const GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES: bool = true;
 
-/// SOLVER BUG (exposed by this stage, excluded from generation): a concrete
-/// condition version set with an EMPTY complement (every version of the
-/// package matches) encodes as `not C_selected`, where the at-least-one
-/// tracker variable `C_selected` is forced true by `AnyOf` clauses when a
-/// candidate of the package is installed. That linkage breaks across
-/// backtracking: when the tracker variable is created while the candidate is
-/// already installed, the retroactive `C_selected := true` decision is made
-/// at the CURRENT (encode-time) level, so a later backjump can pop it while
-/// the candidate itself (assigned at a shallower level) survives -- and
-/// nothing ever re-derives it (the `AnyOf` watch only fires on new
-/// assignments of the candidate, and the assertion scans do not cover it).
-/// A requirement whose condition disjunct is gated on `not C_selected` is
-/// then silently skipped by `decide()` for the rest of the enumeration:
-/// `solve_universal` returns cells whose solvables violate an active
-/// conditional requirement (the condition package IS installed, the
-/// requirement's target is NOT). See
-/// `test_universal_empty_complement_condition_lost_tracker_bug` for the
-/// minimized reproduction (generator seed 309 was the original finding).
-/// The same loss seems latently possible in a plain `solve` (the deferred
-/// path encodes the same `not C_selected` literal), but plain solves stop at
-/// the first solution, where the encode-time assertion is still in force.
+/// SOLVER BUG (exposed by this stage, FIXED): a concrete condition version
+/// set with an EMPTY complement (every version of the package matches)
+/// encodes as `not C_selected`, where the at-least-one tracker variable
+/// `C_selected` is forced true by `AnyOf` clauses when a candidate of the
+/// package is installed. That linkage broke across backtracking: when the
+/// tracker variable is created while the candidate is already installed,
+/// the retroactive `C_selected := true` decision is made at the CURRENT
+/// (encode-time) level, so a later backjump could pop it while the
+/// candidate itself (assigned at a shallower level) survived -- and nothing
+/// ever re-derived it (the `AnyOf` watch only fires on new assignments of
+/// the candidate, and the assertion scans do not cover it). A requirement
+/// whose condition disjunct is gated on `not C_selected` was then silently
+/// skipped by `decide()` for the rest of the enumeration: `solve_universal`
+/// returned cells whose solvables violated an active conditional
+/// requirement (the condition package IS installed, the requirement's
+/// target is NOT). The tracker implications are now registered in
+/// `implied_gate_requirers` and repaired by `force_stuck_gates` in the
+/// solution-completeness loop, exactly like stranded shared-requires gates.
+/// See `test_universal_empty_complement_condition_lost_tracker` for the
+/// minimized regression test (generator seed 309 was the original finding).
+/// The same loss was latently possible in a plain `solve` (the deferred
+/// path encodes the same `not C_selected` literal) and is repaired by the
+/// same loop.
 ///
-/// While `false` (the default), the generator keeps every concrete condition
-/// leaf's version range strictly narrower than the package's version count,
-/// so the complement is never empty and the at-least-one tracker is never
-/// used by generated conditions. (The empty-complement encoding itself stays
-/// covered by a targeted scenario test with a favorable encode order.)
-/// Flipping this to `true` lifts the restriction and makes the 1000-seed
-/// gate fail (projections miss conditionally required packages).
-const GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS: bool = false;
+/// While `false`, the generator keeps every concrete condition leaf's
+/// version range strictly narrower than the package's version count, so the
+/// complement is never empty and the at-least-one tracker is never used by
+/// generated conditions. `true` (the default since the fix) lifts the
+/// restriction.
+const GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS: bool = true;
 
 /// Number of seeds to run. Tuned so that the whole test finishes within a few
 /// seconds in debug builds.
@@ -1865,10 +1865,9 @@ fn test_universal_solve_property() {
 }
 
 // ===========================================================================
-// Targeted scenarios for the generator features of this module: the working
-// counterparts of the excluded generator features, and the minimized
-// #[ignore] reproductions of the solver bugs the exclusions avoid (see the
-// GEN_* flags at the top of the module).
+// Targeted scenarios for the generator features of this module, and the
+// minimized regression tests for the solver bugs the generator originally
+// exposed (see the GEN_* flags at the top of the module).
 // ===========================================================================
 
 /// Formats a solution's cells as `condition -> [solvables]` lines.
@@ -2089,20 +2088,22 @@ fn test_universal_empty_complement_concrete_condition() {
     );
 }
 
-/// SOLVER BUG reproduction (see
-/// [`GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS`], minimized from generator
-/// seed 309): the at-least-one tracker assignment (`C_selected(d) := true`,
-/// made retroactively at encode level when `a=2`'s dependencies are encoded
-/// with `d=1` already installed) is popped by the backjump out of the
-/// `env0 in 5..7` conflict, while `d=1` (root level) survives. When `a=1` is
-/// installed afterwards, its `c if (d in 1..2)` clause reuses the existing
-/// tracker variable with no re-derivation, `decide()` skips the clause
-/// (condition literal undecided), and the second cell violates the active
-/// conditional requirement: `d` is installed but `c` is not. Un-ignore once
-/// fixed.
+/// Regression test (see [`GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS`],
+/// minimized from generator seed 309): the at-least-one tracker assignment
+/// (`C_selected(d) := true`, made retroactively at encode level when `a=2`'s
+/// dependencies are encoded with `d=1` already installed) is popped by the
+/// backjump out of the `env0 in 5..7` conflict, while `d=1` (root level)
+/// survives. The `AnyOf` watches never re-fire for an assignment that
+/// predates the clause, so nothing re-derived the tracker: when `a=1` was
+/// installed afterwards, its `c if (d in 1..2)` clause reused the existing
+/// tracker variable, `decide()` skipped the clause (condition literal
+/// undecided), and the second cell violated the active conditional
+/// requirement (`d` installed, `c` not). The tracker implications are now
+/// registered in `implied_gate_requirers`, so `force_stuck_gates` re-derives
+/// the stranded tracker in the solution-completeness loop and every cell
+/// installs `c`.
 #[test]
-#[ignore = "solver bug: at-least-one tracker assignment lost across backjump"]
-fn test_universal_empty_complement_condition_lost_tracker_bug() {
+fn test_universal_empty_complement_condition_lost_tracker() {
     let mut provider = EnvTestProvider::default();
     provider.add_env_package("env0", false);
     let e_57 = provider.version_set("env0", 5, 7);
