@@ -3162,6 +3162,50 @@ fn test_universal_seeded_determinism() {
     assert_eq!(format!("{first:?}"), format!("{second:?}"));
 }
 
+/// Cold-cache reseed (the primary lockfile flow): a seeded solve on a FRESH
+/// solver, whose provider cache has never been fetched from, must converge
+/// in a SINGLE enumeration pass and reproduce the seeding solution
+/// byte-identically. A cold first pass that reproduces its seeds already is
+/// the promised fixed point — the caller's replay is another fresh process
+/// starting from the same empty cache, which replays the pass verbatim —
+/// so the saturated-cache confirmation pass (which would double the cost of
+/// every lockfile re-resolve) must not run. (Identical provider
+/// construction drives identical lazy interning, so the seed ids and the
+/// `Debug` output are comparable across the two instances.)
+#[test]
+fn test_universal_cold_cache_reseed_single_pass() {
+    let (_, result) = universal_solve_with_seeds(cross_product_provider(), &["a"], &[], vec![]);
+    let first = result.expect("solvable");
+
+    // The reseeding side mirrors a fresh process re-resolving a lockfile:
+    // its interner necessarily knows the ids the lockfile conditions
+    // reference (a real caller constructs the seed literals through it), so
+    // pre-intern them in the order the original run created them, keeping
+    // the two instances id-compatible and their `Debug` output comparable.
+    // The provider CACHE however has never been fetched from, which is the
+    // cold-entry condition under test.
+    let mut provider = cross_product_provider();
+    provider.requirements(&["a"]);
+    parse_env_literal(&mut provider, "cuda 11..100");
+    parse_env_literal(&mut provider, "rocm 5..10");
+
+    let seeds = first
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    let (solver, result) = universal_solve_with_seeds(provider, &["a"], &[], seeds);
+    let second = result.expect("solvable");
+
+    assert_eq!(
+        solver.universal_enumeration_passes(),
+        1,
+        "a cold-cache seeded solve must accept its first pass instead of re-running the \
+         enumeration over the now-saturated cache"
+    );
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+}
+
 /// A seed literal whose package is not an environment package is a caller
 /// error, surfaced as [`InvalidUniversalInput::NotAnEnvironmentPackage`] with
 /// the [`EnvInputSource::SeedPartition`] source.

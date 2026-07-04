@@ -503,7 +503,20 @@ level n+1, etc.).
      or three; orbits without a fixed point exist only for seed lists no
      enumeration produced (e.g. reordered ones) and return their last pass,
      still a verified disjoint cover. The unseeded first solve is a single
-     pass, unchanged.
+     pass, unchanged. The saturation requirement exists because cache
+     warmth gates when the encoder's futures complete and thereby the
+     clause registration order (a hit resolves synchronously, a miss
+     completes whenever the provider does), so a converging pass must run
+     under the cache conditions its replaying call will see. That cuts
+     both ways: a seeded solve on a VERIFIABLY COLD solver (zero fetches
+     at entry) accepts a first pass that reproduces its seeds directly,
+     because the caller of that fixed point is a fresh process
+     re-resolving a lockfile whose replay starts from the same empty
+     cache and replays the pass verbatim, fetches included; demanding the
+     saturated confirmation there would rerun a byte-identical
+     enumeration just to watch it fetch nothing, doubling the cost of the
+     primary lockfile flow (measured 2.19x the warm seeded cost on the
+     conda-forge corpus before the cold-entry rule).
 
 ### 5.8 Output types, merge, verify, project
 

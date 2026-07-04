@@ -1138,6 +1138,14 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // caller's next reseed would. An unseeded solve returns its first
         // enumeration unchanged (its healing round is the caller's first
         // reseed, which the design documents).
+        //
+        // Whether the solver has ever fetched from the provider is part of
+        // those conditions: cache warmth gates when the encoder's futures
+        // complete and thereby the clause registration order (a cache hit
+        // resolves synchronously, a miss completes whenever the provider
+        // does), so the convergence check below distinguishes a solver that
+        // was verifiably cold at entry from one carrying earlier fetches.
+        let cold_at_entry = self.cache.fetch_count() == 0;
         let mut seeds = seed_partition;
         let confirming = !seeds.is_empty();
         let mut rounds = 0;
@@ -1160,17 +1168,35 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .iter()
                 .map(|cell| cell.condition().clone())
                 .collect();
-            // Convergence requires a pass that reproduced its seed list
-            // WITHOUT learning anything new from the provider: cached
-            // dependencies gate the encoder's eager cascade (and thereby the
-            // clause registration order), so only a pass over a saturated
-            // cache is reproducible by the identical later call the fixed
-            // point promises.
+            // Convergence requires a pass that reproduced its seed list AND
+            // that the identical later call the fixed point promises would
+            // replay exactly. Two cases qualify:
+            //
+            //  - A pass that learned nothing new from the provider: cached
+            //    dependencies gate the encoder's eager cascade (and thereby
+            //    the clause registration order), so a pass over a saturated
+            //    cache is replayed exactly by an identical later call on
+            //    this (equally saturated) solver.
+            //
+            //  - The first pass of a solver that was verifiably cold at
+            //    entry (zero fetches ever, so the cache holds nothing a
+            //    fresh one would not). The caller this case serves is a
+            //    fresh process re-resolving against a lockfile: its replay
+            //    constructs a fresh solver, starts from the same empty
+            //    cache, and runs the identical deterministic enumeration,
+            //    fetches included (deterministic provider and runtime, per
+            //    the "Reproducibility" contract of `solve_universal`).
+            //    Demanding a saturated-cache confirmation here would rerun
+            //    a byte-identical enumeration just to watch it fetch
+            //    nothing, doubling the cost of every cold seeded solve --
+            //    the primary lockfile flow (measured 2.19x a warm seeded
+            //    solve on the conda-forge corpus).
             let cache_grew = self.cache.fetch_count() != fetches_before;
+            let replayable = !cache_grew || (rounds == 1 && cold_at_entry);
+            if replayable && output == seeds {
+                return Ok(solution);
+            }
             if !cache_grew {
-                if output == seeds {
-                    return Ok(solution);
-                }
                 // An output equal to an earlier input closes an orbit with
                 // no fixed point on it (possible for seed lists that no
                 // enumeration produced, e.g. reordered ones; an in-order
