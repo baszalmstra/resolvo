@@ -21,7 +21,7 @@ use rand::{
 use resolvo::{
     CellCondition, ConditionalRequirement, EnvClause, EnvLiteral, EnvironmentModel, NameId,
     Problem, SignedEnvLiteral, SolvableId, Solver, UniversalFailure, UniversalProblem,
-    UniversalSolution, UnsolvableOrCancelled, VersionSetId,
+    UniversalSolution, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
     snapshot::{DependencySnapshot, SnapshotProvider},
 };
 
@@ -95,6 +95,14 @@ struct Opts {
     /// to the given file.
     #[clap(long)]
     cells_dump: Option<PathBuf>,
+
+    /// After every successful universal solve, re-solve the same problem on
+    /// a FRESH provider and solver (cold cache) with the first solution's
+    /// cells as the seed partition — the lockfile re-resolve flow — and
+    /// record the reseed duration, enumeration pass count and whether the
+    /// reseeded solution is byte-identical, in extra CSV columns.
+    #[clap(long)]
+    reseed: bool,
 }
 
 /// One signed environment literal in the model file, e.g.
@@ -136,6 +144,109 @@ struct Record {
     verify: Option<String>,
     projected: Option<String>,
     error: Option<String>,
+}
+
+/// The CSV row written with `--reseed`: every [`Record`] column (in the same
+/// order, so the file stays comparable) plus the reseed measurements. Kept
+/// as a separate struct because the `csv` crate derives the header from the
+/// struct fields, and the default (`--reseed` off) output must stay
+/// byte-identical to before.
+#[derive(Debug, serde::Serialize)]
+struct ReseedRecord {
+    index: usize,
+    mode: &'static str,
+    requirements: String,
+    duration: f64,
+    outcome: &'static str,
+    records: Option<usize>,
+    cells: Option<usize>,
+    env_literals: Option<usize>,
+    verify: Option<String>,
+    projected: Option<String>,
+    error: Option<String>,
+    /// Wall time of the cold-cache seeded re-solve in seconds.
+    reseed_duration: Option<f64>,
+    /// Enumeration passes the seeded re-solve took (see
+    /// `Solver::universal_enumeration_passes`).
+    reseed_passes: Option<u32>,
+    /// Whether the reseeded solution is byte-identical to the original
+    /// (its `Debug` cell listing compares equal; ids are comparable because
+    /// the fresh provider is constructed identically from the snapshot).
+    reseed_identical: Option<bool>,
+}
+
+impl ReseedRecord {
+    fn new(record: Record, reseed: Option<ReseedMeasurement>) -> Self {
+        let Record {
+            index,
+            mode,
+            requirements,
+            duration,
+            outcome,
+            records,
+            cells,
+            env_literals,
+            verify,
+            projected,
+            error,
+        } = record;
+        ReseedRecord {
+            index,
+            mode,
+            requirements,
+            duration,
+            outcome,
+            records,
+            cells,
+            env_literals,
+            verify,
+            projected,
+            error,
+            reseed_duration: reseed.as_ref().map(|m| m.duration),
+            reseed_passes: reseed.as_ref().map(|m| m.passes),
+            reseed_identical: reseed.as_ref().map(|m| m.identical),
+        }
+    }
+}
+
+/// The outcome of one `--reseed` re-solve.
+struct ReseedMeasurement {
+    duration: f64,
+    passes: u32,
+    identical: bool,
+}
+
+/// One randomly drawn root requirement, kept as a spec (instead of a built
+/// [`ConditionalRequirement`]) so it can be replayed onto a FRESH provider:
+/// `Package` requirements intern an additional version set on the provider
+/// they are built against, and the reseed flow needs the identical ids on
+/// its own provider instance.
+#[derive(Copy, Clone)]
+enum RequirementSpec {
+    /// `add_package_requirement(name, "*")`.
+    Package(NameId),
+    /// A version set requirement straight from the snapshot.
+    VersionSet(VersionSetId),
+    /// A version set union requirement straight from the snapshot.
+    Union(VersionSetUnionId),
+}
+
+/// Builds the root requirements for `specs` against `provider`. Replaying
+/// the same specs in the same order onto identically constructed providers
+/// yields identical requirement ids (`add_package_requirement` allocates
+/// deterministically).
+fn build_requirements(
+    provider: &mut SnapshotProvider<'_>,
+    specs: &[RequirementSpec],
+) -> Vec<ConditionalRequirement> {
+    specs
+        .iter()
+        .map(|&spec| match spec {
+            RequirementSpec::Package(name) => provider.add_package_requirement(name, "*").into(),
+            RequirementSpec::VersionSet(version_set) => version_set.into(),
+            RequirementSpec::Union(union) => union.into(),
+        })
+        .collect()
 }
 
 /// Resolves the environment model file against the snapshot: package names
@@ -470,6 +581,9 @@ fn main() {
         (Mode::Concrete, Some(_)) => panic!("--env-model only applies to universal mode"),
         (Mode::Concrete, None) => None,
     };
+    if opts.reseed && opts.mode == Mode::Concrete {
+        panic!("--reseed only applies to universal mode");
+    }
     let mode_label = match opts.mode {
         Mode::Concrete => "concrete",
         Mode::Universal => "universal",
@@ -510,13 +624,12 @@ fn main() {
     ])
     .unwrap();
     for i in 0..opts.limit {
-        // Construct a fresh provider from the snapshot
-        let mut provider = snapshot
-            .provider()
-            .with_timeout(SystemTime::now().add(Duration::from_secs(opts.timeout)));
-
-        // Construct a problem with a random number of requirements.
-        let mut requirements: Vec<ConditionalRequirement> = Vec::new();
+        // Construct a problem with a random number of requirements. The
+        // requirements are kept as replayable specs (see [`RequirementSpec`])
+        // so that the `--reseed` flow can rebuild them identically on a
+        // fresh provider; the rng consumption is identical to building them
+        // directly, so the corpus is unchanged.
+        let mut specs: Vec<RequirementSpec> = Vec::new();
 
         // Determine the number of requirements to solve for.
         let num_requirements = rng.random_range(1..=10usize);
@@ -530,8 +643,7 @@ fn main() {
                         .filter(|(_, package)| package.environment.is_none())
                         .choose(&mut rng)
                         .unwrap();
-                    let package_requirement = provider.add_package_requirement(package, "*");
-                    requirements.push(package_requirement.into());
+                    specs.push(RequirementSpec::Package(package));
                 }
                 1 => {
                     // Add a version set requirement
@@ -541,7 +653,7 @@ fn main() {
                         .filter(|&(id, _)| !is_env_version_set(id))
                         .choose(&mut rng)
                         .unwrap();
-                    requirements.push(version_set_id.into());
+                    specs.push(RequirementSpec::VersionSet(version_set_id));
                 }
                 2 => {
                     // Add a version set union requirement
@@ -551,7 +663,7 @@ fn main() {
                         .filter(|(_, sets)| !sets.iter().any(|&id| is_env_version_set(id)))
                         .choose(&mut rng)
                         .unwrap();
-                    requirements.push(version_set_union_id.into());
+                    specs.push(RequirementSpec::Union(version_set_union_id));
                 }
                 _ => unreachable!(),
             }
@@ -560,6 +672,12 @@ fn main() {
         if i < opts.skip {
             continue;
         }
+
+        // Construct a fresh provider from the snapshot
+        let mut provider = snapshot
+            .provider()
+            .with_timeout(SystemTime::now().add(Duration::from_secs(opts.timeout)));
+        let requirements = build_requirements(&mut provider, &specs);
 
         eprintln!(
             "solving ({}/{})...\n{}",
@@ -596,6 +714,8 @@ fn main() {
             projected: None,
             error: None,
         };
+
+        let mut reseed_measurement: Option<ReseedMeasurement> = None;
 
         let start = Instant::now();
         match &env_model {
@@ -737,6 +857,59 @@ fn main() {
                                 }
                             });
                         }
+                        if opts.reseed {
+                            // The lockfile re-resolve flow: a FRESH provider
+                            // and solver (cold cache), seeded with the cells
+                            // just found. The provider and requirements are
+                            // rebuilt exactly like the originals, so every id
+                            // embedded in the solutions is comparable and the
+                            // reseeded output must be byte-identical.
+                            let mut reseed_provider = snapshot.provider().with_timeout(
+                                SystemTime::now().add(Duration::from_secs(opts.timeout)),
+                            );
+                            let reseed_requirements =
+                                build_requirements(&mut reseed_provider, &specs);
+                            let seeds: Vec<CellCondition<NameId>> = solution
+                                .cells()
+                                .iter()
+                                .map(|cell| cell.condition().clone())
+                                .collect();
+                            let reseed_problem = UniversalProblem::new()
+                                .requirements(reseed_requirements)
+                                .environment_model(model.clone())
+                                .seed_partition(seeds);
+                            let mut reseed_solver = Solver::new(reseed_provider);
+                            let reseed_start = Instant::now();
+                            let reseed_result = reseed_solver.solve_universal(reseed_problem);
+                            let duration = reseed_start.elapsed().as_secs_f64();
+                            let passes = reseed_solver.universal_enumeration_passes();
+                            let identical = match &reseed_result {
+                                Ok(reseeded) => {
+                                    format!("{:?}", solution.cells())
+                                        == format!("{:?}", reseeded.cells())
+                                }
+                                Err(_) => false,
+                            };
+                            let line = format!(
+                                "==> RESEED {} in {:.2}ms, {} pass(es)",
+                                if identical { "identical" } else { "DIFFERENT" },
+                                duration * 1000.0,
+                                passes,
+                            );
+                            eprintln!(
+                                "{}",
+                                if identical {
+                                    style(line).green()
+                                } else {
+                                    style(line).red()
+                                }
+                            );
+                            reseed_measurement = Some(ReseedMeasurement {
+                                duration,
+                                passes,
+                                identical,
+                            });
+                        }
                     }
                     Err(UniversalFailure::Unsolvable { cell, conflict }) => {
                         eprintln!(
@@ -800,7 +973,13 @@ fn main() {
             }
         }
 
-        writer.serialize(record).unwrap();
+        if opts.reseed {
+            writer
+                .serialize(ReseedRecord::new(record, reseed_measurement))
+                .unwrap();
+        } else {
+            writer.serialize(record).unwrap();
+        }
         writer.flush().unwrap();
     }
 

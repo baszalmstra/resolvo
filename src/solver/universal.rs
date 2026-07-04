@@ -1088,6 +1088,21 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         result
     }
 
+    /// Returns the number of enumeration passes the most recent
+    /// [`Self::solve_universal`] call performed: `1` for an unseeded solve
+    /// (a single enumeration) and, for a seeded solve, the number of reseed
+    /// fixed-point rounds it iterated before returning (design doc 5.7). A
+    /// pass whose trail-reuse attempt was abandoned and re-enumerated from
+    /// scratch still counts as one pass. Returns `0` when
+    /// [`Self::solve_universal`] was never called or rejected its input
+    /// before enumerating.
+    ///
+    /// This is a measurement observation point (benchmarks and tests assert
+    /// on the cost of the reseed flow); it carries no solver semantics.
+    pub fn universal_enumeration_passes(&self) -> u32 {
+        self.universal_passes
+    }
+
     #[allow(clippy::type_complexity)]
     fn solve_universal_impl(
         &mut self,
@@ -1105,6 +1120,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // caller errors surface as `Err(InvalidInput(..))` rather than as a
         // panic buried in the encode/seed path. A valid problem that is merely
         // unsolvable is still reported by the enumeration below.
+        self.universal_passes = 0;
         self.validate_universal_input(&environment_model, &seed_partition)
             .map_err(UniversalFailure::InvalidInput)?;
 
@@ -1128,6 +1144,8 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut inputs_tried: Vec<Vec<CellCondition<D::NameId>>> = Vec::new();
         loop {
             let fetches_before = self.cache.fetch_count();
+            rounds += 1;
+            self.universal_passes = rounds;
             let solution = self.enumerate_universal_with_fallback(
                 &requirements,
                 &constraints,
@@ -1142,7 +1160,6 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .iter()
                 .map(|cell| cell.condition().clone())
                 .collect();
-            rounds += 1;
             // Convergence requires a pass that reproduced its seed list
             // WITHOUT learning anything new from the provider: cached
             // dependencies gate the encoder's eager cascade (and thereby the

@@ -240,6 +240,12 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// [`ENV_ORDERING_WORK_FLOOR`]); overridable for experiments.
     env_ordering_work_floor: u64,
 
+    /// The number of enumeration passes the most recent
+    /// [`Solver::solve_universal`] call performed (see
+    /// [`Solver::universal_enumeration_passes`]). Lives on the solver, not
+    /// on [`SolverState`], because the state is reset per enumeration pass.
+    pub(crate) universal_passes: u32,
+
     /// Test-only override of the kept-prefix work budget (see
     /// [`SolverState::prefix_budget_deadline`]): when set, every
     /// prefix-started run is armed with exactly this budget instead of
@@ -913,6 +919,7 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             env_ordering_conflict_limit: ENV_ORDERING_CONFLICT_LIMIT,
             env_ordering_work_factor: ENV_ORDERING_WORK_FACTOR,
             env_ordering_work_floor: ENV_ORDERING_WORK_FLOOR,
+            universal_passes: 0,
             #[cfg(test)]
             test_prefix_budget_override: None,
         }
@@ -1091,6 +1098,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             env_ordering_conflict_limit: self.env_ordering_conflict_limit,
             env_ordering_work_factor: self.env_ordering_work_factor,
             env_ordering_work_floor: self.env_ordering_work_floor,
+            universal_passes: self.universal_passes,
             #[cfg(test)]
             test_prefix_budget_override: self.test_prefix_budget_override,
         }
