@@ -136,6 +136,15 @@ impl<D: DependencyProvider> SolverCache<D> {
         self.env_relation = Some(relation);
     }
 
+    /// Whether an environment-classification hook is installed (only
+    /// universal solves install one). Without a hook
+    /// [`Self::get_or_cache_candidates`] can never return
+    /// [`PackageCandidates::Environment`], so the encoding futures skip the
+    /// per-version-set classification lookup on plain concrete solves.
+    pub(crate) fn classifies_environment_packages(&self) -> bool {
+        self.env_classify.is_some()
+    }
+
     /// Answers the environment version-set relation oracle through the memo
     /// (see [`SolverCache::env_relation_memo`]): the provider is asked at
     /// most once per ordered pair, repeated queries hit the map.

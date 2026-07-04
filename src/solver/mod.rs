@@ -3287,7 +3287,15 @@ impl<D: DependencyProvider> SolverState<D> {
     /// `cell_capture_index` in sync (see the field docs), so the universal
     /// capture path can recover the parent's registration index from the
     /// trail without hashing.
+    ///
+    /// Only universal cell-edge capture ([`universal`]) ever reads these two
+    /// structures, so a plain concrete solve skips the bookkeeping entirely
+    /// (`universal_mode` is set by `solve_universal` after the state reset
+    /// and before any encoding, so no universal registration can be missed).
     pub(crate) fn push_requires_clause_entry(&mut self, parent: VariableId, entry: RequiresClause) {
+        if !self.universal_mode {
+            return;
+        }
         let map_entry = self.requires_clauses.entry(parent);
         let index = map_entry.index();
         map_entry.or_default().push(entry);

@@ -1325,6 +1325,16 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             let candidates_fut = futures::future::try_join_all(
                 requirement.requirement.version_sets(cache.provider()).map(
                     |version_set| async move {
+                        // A plain concrete solve installs no classification
+                        // hook, so no package can classify as an environment
+                        // package; skip the per-version-set lookup.
+                        if !cache.classifies_environment_packages() {
+                            return Ok(RequirementCandidates::Concrete(
+                                cache
+                                    .get_or_cache_sorted_candidates_for_version_set(version_set)
+                                    .await?,
+                            ));
+                        }
                         let package_name = cache.provider().version_set_name(version_set);
                         match cache.get_or_cache_candidates(package_name).await? {
                             PackageCandidates::Environment(_) => {
@@ -1590,6 +1600,16 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             let candidates = futures::future::try_join_all(
                 requirement.requirement.version_sets(cache.provider()).map(
                     |version_set| async move {
+                        // A plain concrete solve installs no classification
+                        // hook, so no package can classify as an environment
+                        // package; skip the per-version-set lookup.
+                        if !cache.classifies_environment_packages() {
+                            return Ok(RequirementCandidates::Concrete(
+                                cache
+                                    .get_or_cache_sorted_candidates_for_version_set(version_set)
+                                    .await?,
+                            ));
+                        }
                         let package_name = cache.provider().version_set_name(version_set);
                         match cache.get_or_cache_candidates(package_name).await? {
                             PackageCandidates::Environment(_) => {
@@ -1632,16 +1652,27 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     ) {
         let cache = self.cache;
         self.queue_future(async move {
-            let package_name = cache.provider().version_set_name(constraint);
-            let candidates = match cache.get_or_cache_candidates(package_name).await? {
-                PackageCandidates::Environment(env_pkg) => {
-                    ConstraintCandidates::Environment(*env_pkg)
-                }
-                PackageCandidates::Candidates(_) => ConstraintCandidates::Concrete(
+            // A plain concrete solve installs no classification hook, so no
+            // package can classify as an environment package; skip the
+            // classification lookup.
+            let candidates = if !cache.classifies_environment_packages() {
+                ConstraintCandidates::Concrete(
                     cache
                         .get_or_cache_non_matching_candidates(constraint)
                         .await?,
-                ),
+                )
+            } else {
+                let package_name = cache.provider().version_set_name(constraint);
+                match cache.get_or_cache_candidates(package_name).await? {
+                    PackageCandidates::Environment(env_pkg) => {
+                        ConstraintCandidates::Environment(*env_pkg)
+                    }
+                    PackageCandidates::Candidates(_) => ConstraintCandidates::Concrete(
+                        cache
+                            .get_or_cache_non_matching_candidates(constraint)
+                            .await?,
+                    ),
+                }
             };
             Ok(TaskResult::ConstraintCandidates(
                 ConstraintCandidatesAvailable {
