@@ -1771,8 +1771,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     ///
     /// An edge exists for every requires clause whose parent (a solvable or
     /// the root) is installed and whose condition holds, where "holds" means
-    /// every condition complement literal evaluates to false under the
-    /// undecided-counts-as-false completion. The edge's target is the first
+    /// every condition complement literal is ASSIGNED false (the same rule
+    /// `decide()` uses to enforce the requirement; an undecided complement
+    /// literal means the requirement was never active). The edge's target is
+    /// the first
     /// installed candidate of the requirement, or `None` when the requirement
     /// is on an environment package (its candidate is an environment literal,
     /// not a solvable).
@@ -1801,13 +1803,17 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             for (requirement, disjunction, _clause_id) in requirements {
                 // The edge is active when the clause has no condition, or
                 // when the condition holds: every complement literal of the
-                // disjunction evaluates to false under the
-                // undecided-counts-as-false completion.
+                // disjunction is ASSIGNED false. This is exactly the
+                // eligibility rule of `decide()` (see
+                // `DecideQueue::inspect`): a merely undecided complement
+                // literal (e.g. all candidates of an untouched concrete
+                // condition package) means the requirement was never
+                // enforced, so no edge exists.
                 if let Some(disjunction) = *disjunction {
                     let condition_holds = state.disjunctions[disjunction]
                         .literals
                         .iter()
-                        .all(|literal| !literal.eval(decision_map).unwrap_or(literal.negate()));
+                        .all(|literal| literal.eval(decision_map) == Some(false));
                     if !condition_holds {
                         continue;
                     }
@@ -2118,9 +2124,13 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         // by a from-scratch re-solve of the cell.
                         if let Some(disjunction) = disjunction {
                             let literals = &state.disjunctions[disjunction].literals;
-                            let condition_holds = literals.iter().all(|literal| {
-                                !literal.eval(decision_map).unwrap_or(literal.negate())
-                            });
+                            // "Holds" means every complement literal is
+                            // ASSIGNED false, matching `decide()`; an
+                            // undecided complement literal means the clause
+                            // never enforced anything.
+                            let condition_holds = literals
+                                .iter()
+                                .all(|literal| literal.eval(decision_map) == Some(false));
                             if condition_holds {
                                 for literal in literals {
                                     if is_env_variable(state, literal.variable())
@@ -2149,12 +2159,17 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     };
                     let literals = &state.disjunctions[disjunction].literals;
 
-                    // If a concrete complement literal holds under the
-                    // undecided-counts-as-false completion, the clause is
-                    // satisfied in every environment of the cell.
+                    // If a concrete complement literal is not assigned false
+                    // (it is assigned true, or merely undecided: e.g. all
+                    // candidates of an untouched condition package), the
+                    // condition can never fire in this solution regardless
+                    // of the environment (`decide()` requires every
+                    // complement literal to be ASSIGNED false), so the
+                    // clause is inactive in every environment of the cell
+                    // and needs no environment support.
                     let satisfied_by_concrete = literals.iter().any(|literal| {
                         !is_env_variable(state, literal.variable())
-                            && literal.eval(decision_map).unwrap_or(literal.negate())
+                            && literal.eval(decision_map) != Some(false)
                     });
                     if satisfied_by_concrete {
                         prop_hit!(EXTRACT_SATISFIED_BY_CONCRETE);
@@ -2289,10 +2304,12 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     // clause satisfied by its condition complement never
                     // reached decide().
                     if let Some(disjunction) = *disjunction {
+                        // Same "assigned false" rule as `decide()`; see
+                        // `capture_cell_edges`.
                         let condition_holds = state.disjunctions[disjunction]
                             .literals
                             .iter()
-                            .all(|literal| !literal.eval(decision_map).unwrap_or(literal.negate()));
+                            .all(|literal| literal.eval(decision_map) == Some(false));
                         if !condition_holds {
                             continue;
                         }

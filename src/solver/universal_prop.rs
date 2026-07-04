@@ -47,28 +47,28 @@ use crate::{
     solver::env_test_provider::EnvTestProvider,
 };
 
-/// SOLVER BUG (exposed by this stage, excluded from generation): a
-/// conditional requirement whose condition references a concrete package
-/// that stays entirely UNDECIDED in a solution trips
-/// `capture_cell_edges`/`extract_cell`, which evaluate condition
-/// complement literals under the undecided-counts-as-false completion:
-/// an undecided complement solvable counts as false, so the condition
-/// counts as "holds", but `decide()` only enforces a conditional
-/// requirement when every complement literal is *assigned* false, so no
-/// candidate of the requirement was ever installed. The capture then hits
-/// `debug_assert!(false, "bug: an active requirement of an installed
-/// parent has no installed candidate")` (universal.rs) in debug builds.
-/// See `test_universal_concrete_condition_untouched_package_bug` for the
-/// minimized reproduction.
+/// SOLVER BUG (exposed by this stage, FIXED): a conditional requirement
+/// whose condition references a concrete package that stays entirely
+/// UNDECIDED in a solution used to trip `capture_cell_edges`/`extract_cell`,
+/// which evaluated condition complement literals under the
+/// undecided-counts-as-false completion: an undecided complement solvable
+/// counted as false, so the condition counted as "holds", but `decide()`
+/// only enforces a conditional requirement when every complement literal is
+/// *assigned* false, so no candidate of the requirement was ever installed.
+/// The capture then hit `debug_assert!(false, "bug: an active requirement
+/// of an installed parent has no installed candidate")` (universal.rs) in
+/// debug builds. The capture now evaluates condition complements by
+/// ASSIGNMENT, exactly like `decide()`. See
+/// `test_universal_concrete_condition_untouched_package` for the minimized
+/// regression test.
 ///
-/// While `false` (the default), the generator draws the packages of
-/// concrete condition leaves only from the ROOT-REQUIRED packages: those
-/// are installed in every recorded cell, so all their candidates are
-/// decided (installed one true, the rest false through the at-most-one
-/// clauses) and the completion agrees with `decide()`. Flipping this to
-/// `true` lifts the restriction and makes the 1000-seed gate fail on the
-/// debug assert above.
-const GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES: bool = false;
+/// While `false`, the generator draws the packages of concrete condition
+/// leaves only from the ROOT-REQUIRED packages: those are installed in
+/// every recorded cell, so all their candidates are decided (installed one
+/// true, the rest false through the at-most-one clauses) and the completion
+/// agrees with `decide()`. `true` (the default since the fix) lifts the
+/// restriction.
+const GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES: bool = true;
 
 /// SOLVER BUG (exposed by this stage, excluded from generation): in
 /// universal mode the encoder resolves conditional requirements eagerly
@@ -255,17 +255,17 @@ enum GenCondition {
     /// The oracle evaluates this against the install set with the public
     /// documented semantics ("the condition is only true if the requirement
     /// is true", i.e. a matching candidate is installed). The encoder's
-    /// complement encoding gives a *different* answer when the package is
-    /// entirely uninstalled (see `conditions.rs`: a non-empty complement
-    /// counts an uninstalled package as "condition holds", the empty
-    /// complement as "condition does not hold"). The two semantics coincide
-    /// whenever the package is installed, and the generator only emits
-    /// concrete condition leaves for root-required packages (see
-    /// [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]), which are
-    /// installed in every solution and in every install set that passes the
-    /// root-requirement check of `is_valid_solution` — so the oracle can use
-    /// the documented semantics throughout, including in the unsolvable
-    /// brute force.
+    /// complement encoding can over-enforce relative to this: when every
+    /// complement candidate of the package is ASSIGNED false without a
+    /// matching install (e.g. through forbid propagation or learnt clauses),
+    /// `decide()` fires the requirement even though the documented condition
+    /// does not hold. Over-enforcement only ADDS installs, which
+    /// `is_valid_solution` accepts; a package left entirely UNDECIDED leaves
+    /// the requirement unenforced, agreeing with the documented semantics
+    /// (cell capture uses the same assigned-false rule as `decide()`, see
+    /// [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]). So the oracle
+    /// can use the documented semantics throughout, including in the
+    /// unsolvable brute force.
     Concrete {
         pkg: usize,
         lo: u32,
@@ -1086,21 +1086,19 @@ fn gen_condition_dnf(condition: &GenCondition) -> Vec<Vec<&GenCondition>> {
 /// Whether the edge capture is GUARANTEED to consider `condition` held for
 /// the cell described by `cell_condition` with install set `installed`.
 ///
-/// The capture evaluates condition complements under the trail's
-/// undecided-counts-as-false completion, i.e. cell-canonically, NOT per
-/// environment: a guard that holds only in part of a cell while the
-/// requirement's target is installed for other reasons is legitimately
-/// dropped (the cell partition is refined by install sets, not by edge
-/// activity; generator seed 10 is a concrete example, where a conditional
-/// requirement on an unconditionally installed target records no edge even
-/// in the sub-region where its guard holds). The metadata-level derivation
-/// must therefore be the sound under-approximation of the completion
-/// semantics:
+/// The capture evaluates condition complements by trail ASSIGNMENT (the
+/// same rule as `decide()`), i.e. cell-canonically, NOT per environment: a
+/// guard that holds only in part of a cell while the requirement's target
+/// is installed for other reasons is legitimately dropped (the cell
+/// partition is refined by install sets, not by edge activity; generator
+/// seed 10 is a concrete example, where a conditional requirement on an
+/// unconditionally installed target records no edge even in the sub-region
+/// where its guard holds). The metadata-level derivation must therefore be
+/// the sound under-approximation of the assignment semantics:
 ///
-/// - a concrete leaf evaluates exactly like the completion (a matching
-///   version of the -- root-required, hence installed -- package is
-///   installed; the complement candidates are then assigned false through
-///   the at-most-one clauses);
+/// - a concrete leaf is guaranteed-true when a matching version of the
+///   package is installed (the complement candidates are then assigned
+///   false through the at-most-one clauses);
 /// - an environment leaf is guaranteed-true only when the cell condition
 ///   pins its literal positively (it is then assigned true on the trail
 ///   throughout the cell). An env literal that merely happens to hold in
@@ -1964,18 +1962,18 @@ fn test_universal_locked_behind_conditional_requirement_bug() {
     }
 }
 
-/// SOLVER BUG reproduction (see
-/// [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]): a conditional
-/// requirement whose concrete condition package stays entirely UNDECIDED
-/// (`c` is required by nothing) trips the undecided-counts-as-false
-/// completion of `capture_cell_edges`: the condition counts as "holds" while
-/// `decide()` (which requires the complement literals to be assigned false)
-/// never enforced the requirement, so the capture panics on
-/// `debug_assert!(false, "bug: an active requirement of an installed parent
-/// has no installed candidate")` in debug builds. Un-ignore once fixed.
+/// Regression test (see [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]):
+/// a conditional requirement whose concrete condition package stays entirely
+/// UNDECIDED (`c` is required by nothing) must not be treated as active by
+/// cell capture. `decide()` enforces a conditional requirement only when
+/// every complement literal is ASSIGNED false, and
+/// `capture_cell_edges`/`extract_cell` now use the same rule, so the
+/// untouched condition package leaves the requirement inactive: one cell,
+/// no `b`, no edge for the gated requirement (and no debug panic on
+/// "an active requirement of an installed parent has no installed
+/// candidate").
 #[test]
-#[ignore = "solver bug: cell-edge capture treats an undecided concrete condition as held"]
-fn test_universal_concrete_condition_untouched_package_bug() {
+fn test_universal_concrete_condition_untouched_package() {
     let mut provider = EnvTestProvider::default();
     provider.add_env_package("env0", false);
     let e_any = provider.version_set("env0", 0, 11);
@@ -2004,9 +2002,23 @@ fn test_universal_concrete_condition_untouched_package_bug() {
         .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
             SignedEnvLiteral::new(EnvLiteral::Matches(e_any), true),
         ])]));
-    // Panics in debug builds (the debug_assert quoted above).
     let solution = solver.solve_universal(problem).expect("solvable");
     assert_eq!(solution.cells().len(), 1);
+    let cell = &solution.cells()[0];
+    // The condition (c in 2..3) never fired: c is untouched, so the
+    // requirement on b is inactive. Only a is installed and the gated
+    // requirement contributes no edge.
+    assert_eq!(cell.solvables(), &[a1]);
+    assert!(
+        !cell.solvables().contains(&_b1),
+        "the gated requirement must not be enforced for an untouched condition package"
+    );
+    assert!(
+        cell.edges()
+            .iter()
+            .all(|edge| edge.requirement != b_any.into()),
+        "an inactive conditional requirement must not produce an edge"
+    );
 }
 
 /// The empty-complement (at-least-one tracker) encoding of a concrete
