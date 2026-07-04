@@ -290,6 +290,105 @@ struct CellCaptureInputs {
     support_clauses: Vec<ClauseId>,
 }
 
+/// Cross-cell cache of [`Solver::capture_cell_edges`]: the active dependency
+/// edge of every `SolverState::requires_clauses` entry, kept valid across
+/// the cells of one enumeration pass by invalidating exactly the entries
+/// whose inputs changed.
+///
+/// Edge capture visits the entries of every installed parent once per
+/// recorded cell. Recomputing an entry means evaluating its condition
+/// disjunction and scanning its requirement's candidate list for the
+/// installed candidate; with many env-independent requirements (large
+/// solutions) and wide candidate lists this recompute dominates the capture.
+/// Between consecutive cells the trail changes only by a small suffix
+/// (trail-prefix preservation), leaving the inputs of almost every entry —
+/// its condition literal assignments and its requirement's candidate
+/// assignments — untouched. The cache exploits this with a reverse index
+/// from variable to dependent entries, a trail snapshot per capture, and
+/// dirty marks for the dependents of every variable in the snapshot diff.
+///
+/// Byte-identity: emission still iterates the installed parents in
+/// registration order and each parent's entries in insertion order, exactly
+/// like the uncached scan did, and a clean cached edge is bit-identical to
+/// what a recompute would produce because every assignment it reads is
+/// unchanged (which is precisely what its dirty mark being clear
+/// guarantees).
+///
+/// Lives in [`SolverState`], so the per-pass `SolverState::default()` reset
+/// discards it together with the clauses, decisions and variable ids it was
+/// computed from; within a pass all its inputs (`requires_clauses` entries,
+/// condition disjunctions, sorted candidate lists) are append-only.
+pub(crate) struct EdgeCaptureCache<Id> {
+    /// Per `requires_clauses` registration index: the parent's entry caches.
+    parents: Vec<ParentEdgeCache<Id>>,
+    /// Per variable index: the `(parent registration index, entry position)`
+    /// pairs whose cached edge depends on the variable's assignment (the
+    /// variables of the entry's condition disjunction and the candidates of
+    /// its requirement).
+    reverse: Vec<Vec<(u32, u32)>>,
+    /// The `(variable, value)` assignments of the trail at the previous
+    /// capture, in stack order.
+    prev_trail: Vec<(VariableId, bool)>,
+    /// Total `requires_clauses` entries registered so far, bumped by
+    /// `SolverState::push_requires_clause_entry`. Comparing it against
+    /// `indexed_entries` tells a capture whether the growth scan can be
+    /// skipped (the steady state once the formula stops growing).
+    pub(crate) registered_entries: usize,
+    /// Total entries already indexed into `parents`/`reverse`.
+    indexed_entries: usize,
+}
+
+// Manual impl: `derive(Default)` would needlessly require `Id: Default`.
+impl<Id> Default for EdgeCaptureCache<Id> {
+    fn default() -> Self {
+        Self {
+            parents: Vec::new(),
+            reverse: Vec::new(),
+            prev_trail: Vec::new(),
+            registered_entries: 0,
+            indexed_entries: 0,
+        }
+    }
+}
+
+/// The per-parent slice of an [`EdgeCaptureCache`].
+struct ParentEdgeCache<Id> {
+    /// Whether two entries of this parent share a requirement (a requirement
+    /// with an OR condition encodes one clause per DNF disjunct). Only such
+    /// entries can produce duplicate edges — distinct requirements produce
+    /// distinct edges, as do distinct parents — so only then does emission
+    /// pay for the first-occurrence dedup set.
+    has_duplicate_requirements: bool,
+    /// Parallel to the parent's `requires_clauses` entry list.
+    entries: Vec<EdgeEntryCache<Id>>,
+}
+
+/// The cached capture result of one requires-clause entry.
+struct EdgeEntryCache<Id> {
+    /// Whether a variable the entry depends on changed since `edge` was
+    /// computed. Starts true; cleared on recompute, which only happens while
+    /// the entry's parent is installed (entries of uninstalled parents keep
+    /// their mark until the parent is next emitted).
+    dirty: bool,
+    /// The entry's active edge: `None` when the entry's condition does not
+    /// hold or its requirement has no installed candidate.
+    edge: Option<CellEdge<Id>>,
+}
+
+/// Records into `reverse` (the [`EdgeCaptureCache`] reverse index) that the
+/// entry `dependent` depends on the assignment of `variable`.
+fn push_edge_dependency(
+    reverse: &mut Vec<Vec<(u32, u32)>>,
+    variable: VariableId,
+    dependent: (u32, u32),
+) {
+    let index = variable.to_index();
+    if reverse.len() <= index {
+        reverse.resize_with(index + 1, Vec::new);
+    }
+    reverse[index].push(dependent);
+}
+
 /// One diagnostics observation of a free-phase cell's trail retraction during
 /// a universal enumeration (see `Solver::universal_cell_retracts`).
 ///
@@ -1778,20 +1877,119 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// installed candidate of the requirement, or `None` when the requirement
     /// is on an environment package (its candidate is an environment literal,
     /// not a solvable).
-    fn capture_cell_edges(&self, inputs: &CellCaptureInputs) -> Vec<CellEdge<D::SolvableId>> {
-        let state = &self.state;
-        let decision_map = state.decision_tracker.map();
+    ///
+    /// The per-entry results are cached across cells in
+    /// [`EdgeCaptureCache`] (see there for the invalidation scheme and the
+    /// byte-identity argument): only the entries whose condition or
+    /// candidate assignments changed since the previous capture are
+    /// recomputed; everything else is re-emitted from the cache in the same
+    /// canonical order.
+    fn capture_cell_edges(&mut self, inputs: &CellCaptureInputs) -> Vec<CellEdge<D::SolvableId>> {
+        let state = &mut self.state;
+        // Split borrows: the cache is updated in place while every other
+        // field is only read.
+        let cache = &mut state.edge_capture_cache;
+        let requires_clauses = &state.requires_clauses;
+        let disjunctions = &state.disjunctions;
+        let requirement_to_sorted_candidates = &state.requirement_to_sorted_candidates;
+        let decision_tracker = &state.decision_tracker;
+        let variable_map = &state.variable_map;
+        let decision_map = decision_tracker.map();
+
+        // Grow the cache for the parents and entries registered since the
+        // previous capture (both structures are append-only within a pass)
+        // and index each new entry's dependencies; new entries start dirty.
+        // The scan is skipped entirely once the formula stops growing.
+        if cache.indexed_entries != cache.registered_entries {
+            while cache.parents.len() < requires_clauses.len() {
+                cache.parents.push(ParentEdgeCache {
+                    has_duplicate_requirements: false,
+                    entries: Vec::new(),
+                });
+            }
+            for (parent_index, (_, requirements)) in requires_clauses.iter().enumerate() {
+                let parent_cache = &mut cache.parents[parent_index];
+                for entry_index in parent_cache.entries.len()..requirements.len() {
+                    let (requirement, disjunction, _clause_id) = &requirements[entry_index];
+                    if !parent_cache.has_duplicate_requirements {
+                        parent_cache.has_duplicate_requirements = requirements[..entry_index]
+                            .iter()
+                            .any(|(existing, _, _)| existing == requirement);
+                    }
+                    let dependent = (parent_index as u32, entry_index as u32);
+                    if let Some(disjunction) = disjunction {
+                        for literal in &disjunctions[*disjunction].literals {
+                            push_edge_dependency(&mut cache.reverse, literal.variable(), dependent);
+                        }
+                    }
+                    for &candidate in requirement_to_sorted_candidates[*requirement]
+                        .iter()
+                        .flatten()
+                    {
+                        push_edge_dependency(&mut cache.reverse, candidate, dependent);
+                    }
+                    parent_cache.entries.push(EdgeEntryCache {
+                        dirty: true,
+                        edge: None,
+                    });
+                    cache.indexed_entries += 1;
+                }
+            }
+            debug_assert_eq!(
+                cache.indexed_entries, cache.registered_entries,
+                "every registered requires entry is indexed by the growth scan"
+            );
+        }
+
+        // Invalidate the entries whose inputs changed since the previous
+        // capture: everything after the common prefix of the previous and
+        // the current trail was popped, newly assigned, or both, so mark the
+        // dependents of each such variable through the reverse index.
+        {
+            let common = cache
+                .prev_trail
+                .iter()
+                .zip(decision_tracker.stack())
+                .take_while(|&(&(variable, value), decision)| {
+                    decision.variable == variable && decision.value == value
+                })
+                .count();
+            let parents = &mut cache.parents;
+            let reverse = &cache.reverse;
+            let mut mark = |variable: VariableId| {
+                if let Some(dependents) = reverse.get(variable.to_index()) {
+                    for &(parent_index, entry_index) in dependents {
+                        parents[parent_index as usize].entries[entry_index as usize].dirty = true;
+                    }
+                }
+            };
+            for &(variable, _) in &cache.prev_trail[common..] {
+                mark(variable);
+            }
+            for decision in decision_tracker.stack().skip(common) {
+                mark(decision.variable);
+            }
+        }
+        cache.prev_trail.clear();
+        cache.prev_trail.extend(
+            decision_tracker
+                .stack()
+                .map(|decision| (decision.variable, decision.value)),
+        );
+
         let mut edges: Vec<CellEdge<D::SolvableId>> = Vec::new();
         // First-occurrence order, with an O(1) membership guard so the
-        // per-cell dedup stays linear rather than O(edges^2).
+        // per-cell dedup stays linear rather than O(edges^2). Only consulted
+        // for parents that can actually produce duplicates (see
+        // `ParentEdgeCache::has_duplicate_requirements`); cross-parent
+        // duplicates are impossible because the edge embeds its parent.
         let mut seen: ahash::HashSet<CellEdge<D::SolvableId>> = ahash::HashSet::default();
 
         for &parent_index in &inputs.requires_parents {
-            let (&parent_var, requirements) = state
-                .requires_clauses
+            let (&parent_var, requirements) = requires_clauses
                 .get_index(parent_index as usize)
                 .expect("collect_cell_capture_inputs yields valid registration indices");
-            let parent = match state.variable_map.origin(parent_var) {
+            let parent = match variable_map.origin(parent_var) {
                 VariableOrigin::Root => None,
                 VariableOrigin::Solvable(solvable) => Some(solvable),
                 // Auxiliary variables (at-least-one trackers) re-encode
@@ -1800,63 +1998,77 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 _ => continue,
             };
 
-            for (requirement, disjunction, _clause_id) in requirements {
-                // The edge is active when the clause has no condition, or
-                // when the condition holds: every complement literal of the
-                // disjunction is ASSIGNED false. This is exactly the
-                // eligibility rule of `decide()` (see
-                // `DecideQueue::inspect`): a merely undecided complement
-                // literal (e.g. all candidates of an untouched concrete
-                // condition package) means the requirement was never
-                // enforced, so no edge exists.
-                if let Some(disjunction) = *disjunction {
-                    let condition_holds = state.disjunctions[disjunction]
-                        .literals
-                        .iter()
-                        .all(|literal| literal.eval(decision_map) == Some(false));
-                    if !condition_holds {
-                        continue;
-                    }
-                }
-
-                // The target is the first candidate of the requirement that
-                // is installed. An active requirement always has one: for a
-                // concrete requirement propagation forces a candidate, and
-                // for a requirement on an environment package the candidate
-                // is the (propagated true) environment literal.
-                let installed_candidate = state.requirement_to_sorted_candidates[*requirement]
-                    .iter()
-                    .flatten()
-                    .find(|&&candidate| {
-                        state.decision_tracker.assigned_value(candidate) == Some(true)
+            let parent_cache = &mut cache.parents[parent_index as usize];
+            for (entry, (requirement, disjunction, _clause_id)) in
+                parent_cache.entries.iter_mut().zip(requirements)
+            {
+                if entry.dirty {
+                    entry.dirty = false;
+                    // The edge is active when the clause has no condition,
+                    // or when the condition holds: every complement literal
+                    // of the disjunction is ASSIGNED false. This is exactly
+                    // the eligibility rule of `decide()` (see
+                    // `DecideQueue::inspect`): a merely undecided complement
+                    // literal (e.g. all candidates of an untouched concrete
+                    // condition package) means the requirement was never
+                    // enforced, so no edge exists.
+                    let condition_holds = disjunction.is_none_or(|disjunction| {
+                        disjunctions[disjunction]
+                            .literals
+                            .iter()
+                            .all(|literal| literal.eval(decision_map) == Some(false))
                     });
-                let target = match installed_candidate {
-                    Some(&candidate) => match state.variable_map.origin(candidate) {
-                        VariableOrigin::Solvable(solvable) => Some(solvable),
-                        VariableOrigin::EnvMatches(_) => None,
-                        origin => unreachable!(
-                            "requirement candidates are solvables or environment literals, \
-                             not {origin:?}"
-                        ),
-                    },
-                    None => {
-                        debug_assert!(
-                            false,
-                            "bug: an active requirement of an installed parent has no \
-                             installed candidate"
-                        );
-                        continue;
-                    }
-                };
+
+                    // The target is the first candidate of the requirement
+                    // that is installed. An active requirement always has
+                    // one: for a concrete requirement propagation forces a
+                    // candidate, and for a requirement on an environment
+                    // package the candidate is the (propagated true)
+                    // environment literal.
+                    let installed_candidate = if condition_holds {
+                        requirement_to_sorted_candidates[*requirement]
+                            .iter()
+                            .flatten()
+                            .find(|&&candidate| {
+                                decision_tracker.assigned_value(candidate) == Some(true)
+                            })
+                    } else {
+                        None
+                    };
+                    entry.edge = match installed_candidate {
+                        Some(&candidate) => match variable_map.origin(candidate) {
+                            VariableOrigin::Solvable(solvable) => Some(CellEdge {
+                                parent,
+                                requirement: *requirement,
+                                target: Some(solvable),
+                            }),
+                            VariableOrigin::EnvMatches(_) => Some(CellEdge {
+                                parent,
+                                requirement: *requirement,
+                                target: None,
+                            }),
+                            origin => unreachable!(
+                                "requirement candidates are solvables or environment literals, \
+                                 not {origin:?}"
+                            ),
+                        },
+                        None => {
+                            debug_assert!(
+                                !condition_holds,
+                                "bug: an active requirement of an installed parent has no \
+                                 installed candidate"
+                            );
+                            None
+                        }
+                    };
+                }
 
                 // A requirement with an OR condition produces one clause per
                 // DNF disjunct; deduplicate so the edge is recorded once.
-                let edge = CellEdge {
-                    parent,
-                    requirement: *requirement,
-                    target,
+                let Some(edge) = entry.edge else {
+                    continue;
                 };
-                if seen.insert(edge) {
+                if !parent_cache.has_duplicate_requirements || seen.insert(edge) {
                     edges.push(edge);
                 }
             }
