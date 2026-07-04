@@ -9,25 +9,33 @@
 //! Each universe is solved with [`Solver::solve_universal`] and the result is
 //! checked against the generated metadata directly:
 //!
-//! - On success: `verify()` passes, and for a sample of concrete environments
-//!   drawn from the model, `project()` returns the unique matching cell whose
-//!   solvable set is a valid solution (every active requirement satisfied, no
-//!   constraint violated, at most one solvable per package name). The merged
-//!   presence view and the conditional edges are cross-checked against the
-//!   projection.
+//! - On success: `verify()` passes, and for EVERY concrete environment the
+//!   model admits (the space is small enough to enumerate exhaustively),
+//!   `project()` returns the unique matching cell whose solvable set is a
+//!   valid solution (every active requirement satisfied, no constraint
+//!   violated, at most one solvable per package name, every version
+//!   installable). The merged presence view is cross-checked against the
+//!   projection; the conditional edges are checked in both directions
+//!   (soundness per environment, completeness per cell against the edges the
+//!   metadata guarantees — see `expected_edges_for_cell`). Per cell, a
+//!   maximality oracle additionally proves that no installed package could
+//!   be substituted by a HIGHER version while staying valid throughout the
+//!   cell (see `maximality_skip` for the packages whose preference order is
+//!   legitimately not highest-first).
 //! - On success, additionally (milestone M4): re-solving the same universe
 //!   with the solution's cells as the seed partition yields a verified
-//!   disjoint cover with valid projections, usually byte-identical to the
-//!   original (a minority of partitions instead HEALS: see the inline
-//!   comment); reseeding the reseeded partition is a byte-identical fixed
-//!   point; and re-solving with the seeds in REVERSE order still yields a
-//!   verified disjoint cover (the content may legitimately differ, because
-//!   generalization and disjointness repair depend on which cells were
-//!   recorded earlier).
-//! - On failure ([`UniversalFailure::Unsolvable`]): for a sample of concrete
-//!   environments inside the witness cell, brute-force enumeration over all
-//!   install sets (at most one solvable per package) confirms that no valid
-//!   solution exists.
+//!   disjoint cover whose projections are validated on the same exhaustive
+//!   environment grid, usually byte-identical to the original (a minority of
+//!   partitions instead HEALS: see the inline comment); reseeding the
+//!   reseeded partition is a byte-identical fixed point; and re-solving with
+//!   the seeds in REVERSE order still yields a verified disjoint cover with
+//!   exhaustively validated projections (the content may legitimately
+//!   differ, because generalization and disjointness repair depend on which
+//!   cells were recorded earlier).
+//! - On failure ([`UniversalFailure::Unsolvable`]): for every concrete
+//!   environment inside (model AND witness cell), brute-force enumeration
+//!   over all install sets (at most one solvable per package) confirms that
+//!   no valid solution exists.
 //!
 //! This test lives in-crate (not in `tests/`) because it drives
 //! [`EnvTestProvider`], which is deliberately `cfg(test)`-private.
@@ -120,10 +128,6 @@ const GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS: bool = false;
 /// Number of seeds to run. Tuned so that the whole test finishes within a few
 /// seconds in debug builds.
 const SEED_COUNT: u64 = 1000;
-
-/// Number of sampling attempts per seed; attempts whose sample does not
-/// satisfy the environment model are discarded.
-const SAMPLE_ATTEMPTS: usize = 200;
 
 /// Environment package values are sampled from `0..ENV_VALUE_SPACE`.
 const ENV_VALUE_SPACE: u32 = 11;
@@ -238,6 +242,7 @@ enum GenTarget {
     Env(usize),
 }
 
+#[derive(Debug)]
 enum GenCondition {
     /// The environment package `pkg` is present with a value in `[lo, hi)`.
     Env {
@@ -650,7 +655,22 @@ fn gen_universe(rng: &mut Rng) -> Universe {
 // Building the provider and the problem from a universe.
 // ===========================================================================
 
-fn build_provider(universe: &Universe) -> EnvTestProvider {
+/// The provider built from a [`Universe`], together with the id-level
+/// artifacts the oracle needs to cross-check solver output: the solvable id
+/// of every `(package, version)` and the built [`ConditionalRequirement`] of
+/// every generated version requirement (unions are interned per build and
+/// not deduplicated, so the exact built objects are required to compare
+/// [`CellEdge::requirement`]s).
+struct BuiltUniverse {
+    provider: EnvTestProvider,
+    /// `solvable_ids[p][v - 1]` is the solvable id of `pkg{p}` version `v`.
+    solvable_ids: Vec<Vec<crate::SolvableId>>,
+    /// `version_requirements[p][v - 1][i]` is the built requirement `i` of
+    /// `pkg{p}` version `v`, parallel to the generated metadata.
+    version_requirements: Vec<Vec<Vec<ConditionalRequirement>>>,
+}
+
+fn build_provider(universe: &Universe) -> BuiltUniverse {
     let mut provider = EnvTestProvider::default();
     for (e, env) in universe.env_packages.iter().enumerate() {
         provider.add_env_package(&env_name(e), env.can_be_absent);
@@ -677,9 +697,11 @@ fn build_provider(universe: &Universe) -> EnvTestProvider {
         }
         solvable_ids.push(ids);
     }
+    let mut version_requirements: Vec<Vec<Vec<ConditionalRequirement>>> = Vec::new();
     for (p, pkg) in universe.packages.iter().enumerate() {
+        let mut per_version = Vec::new();
         for (vi, version) in pkg.versions.iter().enumerate() {
-            let requirements = version
+            let requirements: Vec<ConditionalRequirement> = version
                 .requirements
                 .iter()
                 .map(|requirement| build_requirement(&provider, requirement))
@@ -696,10 +718,16 @@ fn build_provider(universe: &Universe) -> EnvTestProvider {
                     }
                 })
                 .collect();
-            provider.set_dependencies(solvable_ids[p][vi], requirements, constrains);
+            provider.set_dependencies(solvable_ids[p][vi], requirements.clone(), constrains);
+            per_version.push(requirements);
         }
+        version_requirements.push(per_version);
     }
-    provider
+    BuiltUniverse {
+        provider,
+        solvable_ids,
+        version_requirements,
+    }
 }
 
 fn build_requirement(
@@ -988,18 +1016,235 @@ fn model_satisfied(universe: &Universe, env: &EnvSample) -> bool {
     })
 }
 
-fn sample_env(rng: &mut Rng, universe: &Universe) -> EnvSample {
-    universe
-        .env_packages
+/// The packages the per-cell maximality oracle must skip because the solver
+/// legitimately does not prefer their highest valid version:
+///
+/// - a FAVORED version is deliberately tried before the version sort order;
+/// - a package targeted by any `Requirement::Union` is decided per union
+///   member in member order (`decide()` walks the sorted candidates of the
+///   first version set before the second), so a lower version matching the
+///   first member legitimately wins over a higher version matching only the
+///   second.
+///
+/// For every other package the solver's greedy highest-first candidate order
+/// guarantees per-cell maximality: a higher version was skipped only when
+/// some trail reason falsified it, and cell extraction pins the environment
+/// assignments of exactly those reasons (the steering pins), so the higher
+/// version stays invalid throughout the cell.
+fn maximality_skip(universe: &Universe) -> Vec<bool> {
+    let mut skip: Vec<bool> = universe
+        .packages
         .iter()
-        .map(|env| {
-            if env.can_be_absent && rng.chance(1, 4) {
-                None
-            } else {
-                Some(rng.below(ENV_VALUE_SPACE))
+        .map(|pkg| pkg.favored.is_some())
+        .collect();
+    let mark = |requirement: &GenRequirement, skip: &mut Vec<bool>| {
+        if requirement.union2.is_some() {
+            if let GenTarget::Concrete(target) = requirement.target {
+                skip[target] = true;
+            }
+        }
+    };
+    for requirement in &universe.root_requirements {
+        mark(requirement, &mut skip);
+    }
+    for pkg in &universe.packages {
+        for version in &pkg.versions {
+            for requirement in &version.requirements {
+                mark(requirement, &mut skip);
+            }
+        }
+    }
+    skip
+}
+
+/// The DNF of a generated condition tree: a disjunction of conjunctions of
+/// leaf conditions (mirroring `convert_conditions_to_dnf`).
+fn gen_condition_dnf(condition: &GenCondition) -> Vec<Vec<&GenCondition>> {
+    match condition {
+        GenCondition::Env { .. } | GenCondition::Concrete { .. } => vec![vec![condition]],
+        GenCondition::Or(lhs, rhs) => {
+            let mut dnf = gen_condition_dnf(lhs);
+            dnf.append(&mut gen_condition_dnf(rhs));
+            dnf
+        }
+        GenCondition::And(lhs, rhs) => {
+            let left = gen_condition_dnf(lhs);
+            let right = gen_condition_dnf(rhs);
+            let mut dnf = Vec::with_capacity(left.len() * right.len());
+            for l in &left {
+                for r in &right {
+                    let mut merged = l.clone();
+                    merged.extend(r.iter().copied());
+                    dnf.push(merged);
+                }
+            }
+            dnf
+        }
+    }
+}
+
+/// Whether the edge capture is GUARANTEED to consider `condition` held for
+/// the cell described by `cell_condition` with install set `installed`.
+///
+/// The capture evaluates condition complements under the trail's
+/// undecided-counts-as-false completion, i.e. cell-canonically, NOT per
+/// environment: a guard that holds only in part of a cell while the
+/// requirement's target is installed for other reasons is legitimately
+/// dropped (the cell partition is refined by install sets, not by edge
+/// activity; generator seed 10 is a concrete example, where a conditional
+/// requirement on an unconditionally installed target records no edge even
+/// in the sub-region where its guard holds). The metadata-level derivation
+/// must therefore be the sound under-approximation of the completion
+/// semantics:
+///
+/// - a concrete leaf evaluates exactly like the completion (a matching
+///   version of the -- root-required, hence installed -- package is
+///   installed; the complement candidates are then assigned false through
+///   the at-most-one clauses);
+/// - an environment leaf is guaranteed-true only when the cell condition
+///   pins its literal positively (it is then assigned true on the trail
+///   throughout the cell). An env literal that merely happens to hold in
+///   part of the cell without being pinned may be undecided on the trail,
+///   where the completion counts it false.
+///
+/// A condition is guaranteed held when some DNF disjunct has every leaf
+/// guaranteed-true.
+fn condition_edge_guaranteed(
+    condition: &GenCondition,
+    installed: &InstallSet,
+    cell_condition: &CellCondition<NameId>,
+    provider: &EnvTestProvider,
+) -> bool {
+    gen_condition_dnf(condition).iter().any(|disjunct| {
+        disjunct.iter().all(|leaf| match leaf {
+            GenCondition::Concrete { pkg, lo, hi } => {
+                installed[*pkg].is_some_and(|v| in_range(v, *lo, *hi))
+            }
+            GenCondition::Env { pkg, lo, hi } => {
+                let version_set = provider.version_set(&env_name(*pkg), *lo, *hi);
+                cell_condition.literals().any(|signed| {
+                    signed.positive && signed.literal == EnvLiteral::Matches(version_set)
+                })
+            }
+            GenCondition::And(..) | GenCondition::Or(..) => {
+                unreachable!("DNF disjuncts contain only leaves")
             }
         })
-        .collect()
+    })
+}
+
+/// Derives the dependency edges the generated metadata requires a cell to
+/// carry: one edge per root requirement and per guaranteed-active
+/// requirement of every installed version (see [`condition_edge_guaranteed`]
+/// for the deliberate, documented under-approximation of conditional
+/// activity), with the parent solvable, the BUILT requirement (the exact
+/// object handed to the solver, needed because union ids are not
+/// deduplicated) and the installed target (`None` for a requirement on an
+/// environment package, which the environment itself satisfies).
+///
+/// `sample_env` is any modeled environment of the cell, used to resolve
+/// requirement satisfaction (guaranteed-active requirements are satisfied
+/// uniformly across the cell: their guards are pinned or install-set-bound).
+#[allow(clippy::too_many_arguments)]
+fn expected_edges_for_cell(
+    universe: &Universe,
+    root_built: &[ConditionalRequirement],
+    solvable_ids: &[Vec<crate::SolvableId>],
+    version_requirements: &[Vec<Vec<ConditionalRequirement>>],
+    installed: &InstallSet,
+    cell_condition: &CellCondition<NameId>,
+    provider: &EnvTestProvider,
+    sample_env: &EnvSample,
+) -> Vec<crate::CellEdge<crate::SolvableId>> {
+    let mut expected = Vec::new();
+    let mut push = |generated: &GenRequirement,
+                    built: &ConditionalRequirement,
+                    parent: Option<crate::SolvableId>| {
+        // The caller has already asserted validity, so an active requirement
+        // is satisfied; the guard only protects the unwrap below.
+        if !requirement_satisfied(generated, installed, sample_env) {
+            return;
+        }
+        let target = match generated.target {
+            GenTarget::Concrete(t) => {
+                let version = installed[t].expect("a satisfied concrete requirement is installed");
+                Some(solvable_ids[t][(version - 1) as usize])
+            }
+            GenTarget::Env(_) => None,
+        };
+        expected.push(crate::CellEdge {
+            parent,
+            requirement: built.requirement,
+            target,
+        });
+    };
+
+    for (generated, built) in universe.root_requirements.iter().zip(root_built) {
+        debug_assert!(
+            generated.condition.is_none(),
+            "root requirements are unconditional"
+        );
+        push(generated, built, None);
+    }
+    for (p, version) in installed.iter().enumerate() {
+        let Some(version) = version else { continue };
+        let metadata = &universe.packages[p].versions[(*version - 1) as usize];
+        let built_requirements = &version_requirements[p][(*version - 1) as usize];
+        let parent = Some(solvable_ids[p][(*version - 1) as usize]);
+        for (generated, built) in metadata.requirements.iter().zip(built_requirements) {
+            let guaranteed = generated.condition.as_ref().is_none_or(|condition| {
+                condition_edge_guaranteed(condition, installed, cell_condition, provider)
+            });
+            if guaranteed {
+                push(generated, built, parent);
+            }
+        }
+    }
+    expected
+}
+
+/// Exhaustively projects `solution` onto every modeled environment and
+/// asserts each projection is a valid solution of the generated metadata.
+/// Returns the number of environments checked. Used for the reseeded and
+/// reordered partitions, whose projections must hold on the SAME exhaustive
+/// grid as the original solution's.
+#[allow(clippy::too_many_arguments)]
+fn assert_projections_valid(
+    seed: u64,
+    label: &str,
+    universe: &Universe,
+    provider: &EnvTestProvider,
+    env_name_ids: &[NameId],
+    pkg_name_ids: &[NameId],
+    solution: &crate::UniversalSolution,
+) -> usize {
+    let mut checked = 0;
+    for env in enumerate_envs(universe) {
+        if !model_satisfied(universe, &env) {
+            continue;
+        }
+        checked += 1;
+        let projected = solution
+            .project(|literal| eval_env_literal(provider, env_name_ids, literal, &env))
+            .unwrap_or_else(|| {
+                panic!("seed {seed}: {label} project() returned None for environment {env:?}")
+            });
+        let mut installed: InstallSet = vec![None; universe.packages.len()];
+        for &solvable in projected {
+            let resolved = provider.pool.resolve_solvable(solvable);
+            let index = pkg_name_ids
+                .iter()
+                .position(|&name| name == resolved.name)
+                .expect("solvable belongs to a generated package");
+            installed[index] = Some(resolved.record);
+        }
+        assert!(
+            is_valid_solution(universe, &installed, &env),
+            "seed {seed}: {label} projection {installed:?} is not a valid solution for \
+             environment {env:?}"
+        );
+    }
+    checked
 }
 
 /// Every concrete environment the universe's packages can take: each package
@@ -1040,6 +1285,11 @@ struct Stats {
     unsolvable_samples_checked: usize,
     unsolvable_nonvacuous: usize,
     cells_total: usize,
+    multi_cell_solved: usize,
+    maximality_checks: usize,
+    expected_edges_checked: usize,
+    reseeded_samples_checked: usize,
+    reordered_samples_checked: usize,
     reseeded_identical: usize,
     fixed_point_identical: usize,
     reordered_verified: usize,
@@ -1048,7 +1298,11 @@ struct Stats {
 fn run_seed(seed: u64, stats: &mut Stats) {
     let mut rng = Rng::new(seed);
     let universe = gen_universe(&mut rng);
-    let provider = build_provider(&universe);
+    let BuiltUniverse {
+        provider,
+        solvable_ids,
+        version_requirements,
+    } = build_provider(&universe);
 
     let env_name_ids = (0..universe.env_packages.len())
         .map(|e| provider.pool.intern_package_name(env_name(e)))
@@ -1082,6 +1336,9 @@ fn run_seed(seed: u64, stats: &mut Stats) {
         Ok(solution) => {
             stats.solved += 1;
             stats.cells_total += solution.cells().len();
+            if solution.cells().len() > 1 {
+                stats.multi_cell_solved += 1;
+            }
             let provider = solver.provider();
 
             // (a) The independent verifier accepts the solution. The test
@@ -1095,6 +1352,12 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             // The merged view and the edges, evaluated per sample below.
             let merged = solution.merged();
             let edges = solution.edges();
+
+            // The modeled environments of each cell and the cell's install
+            // set, grouped during the exhaustive walk below and consumed by
+            // the per-cell maximality oracle afterwards.
+            let mut cell_envs: Vec<Vec<EnvSample>> = vec![Vec::new(); solution.cells().len()];
+            let mut cell_installed: Vec<Option<InstallSet>> = vec![None; solution.cells().len()];
 
             // (b) Exhaustively check every concrete environment the model
             // admits. The modeled space is tiny (at most ~12^3), so this
@@ -1158,6 +1421,8 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                     "seed {seed}: projected set {installed:?} is not a valid solution for \
                      environment {env:?}"
                 );
+                cell_envs[matching[0]].push(env.clone());
+                cell_installed[matching[0]].get_or_insert_with(|| installed.clone());
 
                 // Cross-check merged(): a solvable's presence holds in this
                 // environment if and only if the solvable is in the
@@ -1202,6 +1467,88 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                 }
             }
 
+            // Edge COMPLETENESS: every edge the generated metadata
+            // guarantees for a cell (root requirements plus guaranteed-active
+            // requirements of installed versions, with their installed
+            // targets; see expected_edges_for_cell for the documented
+            // under-approximation of conditional activity) must appear in
+            // edges() with a presence that holds at every modeled
+            // environment of the cell. Together with the per-environment
+            // soundness direction above this bounds edges() from both sides.
+            for (cell_index, envs) in cell_envs.iter().enumerate() {
+                if envs.is_empty() {
+                    continue;
+                }
+                let installed = cell_installed[cell_index]
+                    .as_ref()
+                    .expect("a cell with modeled environments recorded its install set");
+                for expected in expected_edges_for_cell(
+                    &universe,
+                    &root_requirements,
+                    &solvable_ids,
+                    &version_requirements,
+                    installed,
+                    solution.cells()[cell_index].condition(),
+                    provider,
+                    &envs[0],
+                ) {
+                    stats.expected_edges_checked += 1;
+                    for env in envs {
+                        let active = edges.iter().any(|(edge, presence)| {
+                            *edge == expected
+                                && presence.disjuncts().any(|disjunct| {
+                                    cell_condition_holds(provider, &env_name_ids, disjunct, env)
+                                })
+                        });
+                        assert!(
+                            active,
+                            "seed {seed}: expected edge {expected:?} of cell {cell_index} is \
+                             missing or inactive for environment {env:?}"
+                        );
+                    }
+                }
+            }
+
+            // Per-cell maximality: for every installed package, no HIGHER
+            // version can be substituted while keeping the install set valid
+            // throughout the cell (checked against every modeled environment
+            // of the cell; a substitution valid at only SOME of its
+            // environments is legitimate, since the solver must pick one set
+            // for the whole cell). Packages whose preference order is
+            // legitimately not highest-first are skipped (see
+            // [`maximality_skip`]). This catches version-preference
+            // regressions that pure validity cannot.
+            let skip = maximality_skip(&universe);
+            for (cell_index, envs) in cell_envs.iter().enumerate() {
+                if envs.is_empty() {
+                    continue;
+                }
+                let installed = cell_installed[cell_index]
+                    .as_ref()
+                    .expect("a cell with modeled environments recorded its install set");
+                for (p, pkg) in universe.packages.iter().enumerate() {
+                    let Some(version) = installed[p] else {
+                        continue;
+                    };
+                    if skip[p] {
+                        continue;
+                    }
+                    for higher in (version + 1)..=(pkg.versions.len() as u32) {
+                        let mut substituted = installed.clone();
+                        substituted[p] = Some(higher);
+                        stats.maximality_checks += 1;
+                        assert!(
+                            !envs
+                                .iter()
+                                .all(|env| is_valid_solution(&universe, &substituted, env)),
+                            "seed {seed}: cell {cell_index} installs pkg{p}={version} but \
+                             pkg{p}={higher} stays valid throughout the cell (version \
+                             preference regression)"
+                        );
+                    }
+                }
+            }
+
             // (c) Seed stability (M4): re-solve the same universe with this
             // solution's cells as the seed partition, on the same solver
             // (the real flow: the provider and all interned ids persist;
@@ -1221,7 +1568,8 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             // pinned by the scenario tests in tests/solver. What must hold
             // here unconditionally:
             //   - the reseeded partition is a verified disjoint cover, and
-            //     its projections are valid solutions (checked on samples);
+            //     its projections are valid solutions (checked on the full
+            //     modeled environment grid);
             //   - one more reseed round is a fixed point: a seeded
             //     `solve_universal` internally iterates the enumeration on
             //     its own output until a pass (over a saturated provider
@@ -1249,40 +1597,17 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                 let violations: Vec<Violation<NameId>> = violations;
                 panic!("seed {seed}: reseeded solve failed verify(): {violations:?}");
             }
-            let mut reseeded_samples = 0;
-            for _ in 0..SAMPLE_ATTEMPTS {
-                if reseeded_samples >= 5 {
-                    break;
-                }
-                let env = sample_env(&mut rng, &universe);
-                if !model_satisfied(&universe, &env) {
-                    continue;
-                }
-                reseeded_samples += 1;
-                let provider = solver.provider();
-                let projected = reseeded
-                    .project(|literal| eval_env_literal(provider, &env_name_ids, literal, &env))
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "seed {seed}: reseeded project() returned None for environment \
-                             {env:?}"
-                        )
-                    });
-                let mut installed: InstallSet = vec![None; universe.packages.len()];
-                for &solvable in projected {
-                    let resolved = provider.pool.resolve_solvable(solvable);
-                    let index = pkg_name_ids
-                        .iter()
-                        .position(|&name| name == resolved.name)
-                        .expect("solvable belongs to a generated package");
-                    installed[index] = Some(resolved.record);
-                }
-                assert!(
-                    is_valid_solution(&universe, &installed, &env),
-                    "seed {seed}: reseeded projection {installed:?} is not a valid solution \
-                     for environment {env:?}"
-                );
-            }
+            // Validate the reseeded projections on the SAME exhaustive
+            // environment grid as the original solution's.
+            stats.reseeded_samples_checked += assert_projections_valid(
+                seed,
+                "reseeded",
+                &universe,
+                solver.provider(),
+                &env_name_ids,
+                &pkg_name_ids,
+                &reseeded,
+            );
             // A cell bundles its condition, solvables and edges, so comparing
             // the cell slices covers both the conditions and the edges.
             if format!("{:?}", solution.cells()) == format!("{:?}", reseeded.cells()) {
@@ -1349,6 +1674,18 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                     let violations: Vec<Violation<NameId>> = violations;
                     panic!("seed {seed}: reversed-seed solve failed verify(): {violations:?}");
                 }
+                // The reordered partition may legitimately differ in content,
+                // but its projections must be valid on the same exhaustive
+                // environment grid as the original solution's.
+                stats.reordered_samples_checked += assert_projections_valid(
+                    seed,
+                    "reordered",
+                    &universe,
+                    solver.provider(),
+                    &env_name_ids,
+                    &pkg_name_ids,
+                    &reordered,
+                );
                 stats.reordered_verified += 1;
             }
         }
@@ -1430,16 +1767,24 @@ fn test_universal_solve_property() {
         run_seed(seed, &mut stats);
     }
     eprintln!(
-        "universal property test: {} seeds ({} solved with {} cells total, {} unsolvable), \
-         {} solution samples checked, {} unsolvable samples brute-forced, \
+        "universal property test: {} seeds ({} solved with {} cells total, {} multi-cell, \
+         {} unsolvable of which {} non-vacuous), {} solution samples checked, \
+         {} unsolvable samples brute-forced, {} maximality substitutions refuted, \
+         {} expected edges matched, {} reseeded + {} reordered samples checked, \
          {}/{} seeded re-solves byte-identical, {} fixed-point rounds identical, \
          {} reversed-seed solves verified",
         SEED_COUNT,
         stats.solved,
         stats.cells_total,
+        stats.multi_cell_solved,
         stats.unsolvable,
+        stats.unsolvable_nonvacuous,
         stats.samples_checked,
         stats.unsolvable_samples_checked,
+        stats.maximality_checks,
+        stats.expected_edges_checked,
+        stats.reseeded_samples_checked,
+        stats.reordered_samples_checked,
         stats.reseeded_identical,
         stats.solved,
         stats.fixed_point_identical,
@@ -1460,16 +1805,39 @@ fn test_universal_solve_property() {
         stats.samples_checked > 0,
         "at least some environment samples must have been checked"
     );
-    // Most unsolvable verdicts must be checked against a non-empty
-    // (model AND witness) region; otherwise the brute-force soundness check
-    // proves nothing for them. A purely vacuous witness is legitimate (an
-    // artifact of Unknown oracle answers), but if the bulk of unsolvable
-    // verdicts were vacuous the unsolvable path would be hollow.
+    // Corpus-shape floor: the multi-cell solved seeds are what exercise cell
+    // transitions, disjointness repair and seeding; generator drift must not
+    // hollow them out.
     assert!(
-        stats.unsolvable_nonvacuous * 2 >= stats.unsolvable,
-        "most unsolvable verdicts should be brute-forced against a non-empty region (got {}/{})",
+        stats.multi_cell_solved >= 150,
+        "corpus floor: at least 150 solved seeds must enumerate multiple cells (got {})",
+        stats.multi_cell_solved,
+    );
+    // Corpus-shape floor: at least three quarters of the unsolvable verdicts
+    // must be checked against a non-empty (model AND witness) region;
+    // otherwise the brute-force soundness check proves nothing for them. A
+    // purely vacuous witness is legitimate (an artifact of Unknown oracle
+    // answers), but a corpus dominated by vacuous witnesses would make the
+    // unsolvable path hollow.
+    assert!(
+        stats.unsolvable_nonvacuous * 4 >= stats.unsolvable * 3,
+        "corpus floor: at least 75% of unsolvable verdicts should be brute-forced against a \
+         non-empty region (got {}/{})",
         stats.unsolvable_nonvacuous,
         stats.unsolvable,
+    );
+    // The strengthened per-cell assertions must not be vacuous.
+    assert!(
+        stats.maximality_checks > 0,
+        "at least some higher-version substitutions must have been refuted"
+    );
+    assert!(
+        stats.expected_edges_checked > 0,
+        "at least some expected edges must have been derived and matched"
+    );
+    assert!(
+        stats.reseeded_samples_checked > 0 && stats.reordered_samples_checked > 0,
+        "the reseeded and reordered partitions must have been projected exhaustively"
     );
     // Regression floor for the stabilizing effect of seeding. The generator
     // is deliberately conflict-heavy, so a sizable share of partitions heals
@@ -2164,7 +2532,7 @@ fn test_universal_reseed_orbit_pinned() {
         ],
     };
 
-    let provider = build_provider(&universe);
+    let provider = build_provider(&universe).provider;
     let root_requirements: Vec<ConditionalRequirement> = universe
         .root_requirements
         .iter()
