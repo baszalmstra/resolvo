@@ -140,6 +140,7 @@ use crate::{
     solver::{
         conditions::{DeferredConjunct, DeferredRequirement, Disjunction},
         decision::Decision,
+        prop_counters::prop_hit,
     },
     solver_id::{IdMap, IdSet},
     utils::IndexedSet,
@@ -449,6 +450,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             Dependencies::Unknown(reason) => {
                 // If the dependencies are unknown, we add an exclusion clause and stop
                 // processing.
+                prop_hit!(ENCODE_UNKNOWN_DEPS);
                 self.add_exclusion_clause(solvable_id, *reason);
                 return;
             }
@@ -493,6 +495,9 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // For each constraint, request the candidates that are non-matching
         // the version spec.
         for &constraint in constraints {
+            if matches!(solvable_id, SolvableIdOrRoot::Root) {
+                prop_hit!(ENCODE_ROOT_CONSTRAINT);
+            }
             self.queue_constraint(solvable_id, constraint);
         }
     }
@@ -531,11 +536,13 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
 
         // If there is a locked solvable, forbid all other candidates
         if let Some(locked_solvable_id) = candidates.locked {
+            prop_hit!(ENCODE_LOCKED);
             self.add_locked_package_clauses(locked_solvable_id, &candidates.candidates);
         }
 
         // Add clauses for externally excluded candidates.
         for &(solvable, reason) in &candidates.excluded {
+            prop_hit!(ENCODE_EXCLUDED);
             let variable = self.add_exclusion_clause(solvable.into(), reason);
             debug_assert!(
                 self.state.decision_tracker.assigned_value(variable) != Some(true),
@@ -573,6 +580,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                  supported in v1 (requirement: {})",
                 requirement.requirement.display(self.cache.provider())
             );
+        }
+        #[cfg(test)]
+        if matches!(requirement.requirement, Requirement::Union(_)) {
+            if has_env {
+                prop_hit!(ENCODE_UNION_ENV);
+            } else {
+                prop_hit!(ENCODE_UNION_CONCRETE);
+            }
         }
 
         let variable = self.state.variable_map.intern_solvable_or_root(solvable_id);
@@ -661,6 +676,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 for disjunction_complement in disjunctions {
                     match disjunction_complement {
                         DisjunctionComplement::Solvables(version_set, solvables) => {
+                            prop_hit!(ENCODE_CONDITION_COMPLEMENT_SOLVABLES);
                             let name_id = self.cache.provider().version_set_name(version_set);
                             disjunction_literals.reserve(solvables.len());
                             for &solvable in solvables {
@@ -670,6 +686,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                             }
                         }
                         DisjunctionComplement::Empty(version_set) => {
+                            prop_hit!(ENCODE_CONDITION_COMPLEMENT_EMPTY);
                             let name_id = self.cache.provider().version_set_name(version_set);
                             let at_least_one_of_var =
                                 match self.state.at_least_one_tracker.get(name_id).or_else(|| {
@@ -688,6 +705,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                             disjunction_literals.push(at_least_one_of_var.negative());
                         }
                         DisjunctionComplement::EnvLiteral(version_set) => {
+                            prop_hit!(ENCODE_CONDITION_COMPLEMENT_ENV);
                             // The complement of an env literal L_S is `not L_S`.
                             let package_name = self.cache.provider().version_set_name(version_set);
                             let variable = self.state.intern_env_matches_with_oracle_clauses(

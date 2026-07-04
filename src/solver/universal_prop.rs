@@ -2,9 +2,12 @@
 //!
 //! A deterministic seeded generator produces small random universes with
 //! environment packages, concrete packages, plain and conditional
-//! dependencies, constrains and a random environment model. Each universe is
-//! solved with [`Solver::solve_universal`] and the result is checked against
-//! the generated metadata directly:
+//! dependencies (conditions mix environment and concrete-package leaves
+//! under And/Or), two-member [`Requirement::Union`] requirements, constrains,
+//! root-level constraints, per-package provider knobs (locked, favored,
+//! excluded and unknown-dependency versions) and a random environment model.
+//! Each universe is solved with [`Solver::solve_universal`] and the result is
+//! checked against the generated metadata directly:
 //!
 //! - On success: `verify()` passes, and for a sample of concrete environments
 //!   drawn from the model, `project()` returns the unique matching cell whose
@@ -31,9 +34,88 @@
 
 use crate::{
     CellCondition, Condition, ConditionId, ConditionalRequirement, EnvClause, EnvLiteral,
-    EnvironmentModel, LogicalOperator, NameId, SignedEnvLiteral, Solver, UniversalFailure,
-    UniversalProblem, Violation, solver::env_test_provider::EnvTestProvider,
+    EnvironmentModel, LogicalOperator, NameId, Requirement, SignedEnvLiteral, Solver,
+    UniversalFailure, UniversalProblem, VersionSetId, Violation,
+    solver::env_test_provider::EnvTestProvider,
 };
+
+/// SOLVER BUG (exposed by this stage, excluded from generation): a
+/// conditional requirement whose condition references a concrete package
+/// that stays entirely UNDECIDED in a solution trips
+/// `capture_cell_edges`/`extract_cell`, which evaluate condition
+/// complement literals under the undecided-counts-as-false completion:
+/// an undecided complement solvable counts as false, so the condition
+/// counts as "holds", but `decide()` only enforces a conditional
+/// requirement when every complement literal is *assigned* false, so no
+/// candidate of the requirement was ever installed. The capture then hits
+/// `debug_assert!(false, "bug: an active requirement of an installed
+/// parent has no installed candidate")` (universal.rs) in debug builds.
+/// See `test_universal_concrete_condition_untouched_package_bug` for the
+/// minimized reproduction.
+///
+/// While `false` (the default), the generator draws the packages of
+/// concrete condition leaves only from the ROOT-REQUIRED packages: those
+/// are installed in every recorded cell, so all their candidates are
+/// decided (installed one true, the rest false through the at-most-one
+/// clauses) and the completion agrees with `decide()`. Flipping this to
+/// `true` lifts the restriction and makes the 1000-seed gate fail on the
+/// debug assert above.
+const GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES: bool = false;
+
+/// SOLVER BUG (exposed by this stage, excluded from generation): in
+/// universal mode the encoder resolves conditional requirements eagerly
+/// (`queue_conditional_requirement` short-circuits to
+/// `queue_requirement_candidates`), and that path never runs
+/// `queue_package` for the requirement's target packages. The lazy
+/// conditional path does exactly that "so that locked / excluded clauses
+/// are emitted as on the eager path" (`on_condition_data_available`). As a
+/// result, `Candidates::locked` and `Candidates::excluded` of a package
+/// reachable ONLY through conditional requirements are silently ignored by
+/// `solve_universal`: the solver installs a non-locked or excluded version.
+/// Plain `solve` is unaffected. See
+/// `test_universal_locked_behind_conditional_requirement_bug` for the
+/// minimized reproduction (generator seed 150 was the original finding).
+///
+/// While `false` (the default), the generator only marks ROOT-REQUIRED
+/// packages as locked/excluded: root requirements are unconditional, so
+/// `on_dependencies_available` queues their packages and the lock/exclusion
+/// clauses are emitted. Flipping this to `true` lifts the restriction and
+/// makes the 1000-seed gate fail (projections install locked-out versions).
+/// Favored (a pure preference) and unknown-deps (whose exclusion is emitted
+/// when the solvable's dependencies are fetched, which happens before any
+/// install survives) are not affected and stay unrestricted.
+const GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES: bool = false;
+
+/// SOLVER BUG (exposed by this stage, excluded from generation): a concrete
+/// condition version set with an EMPTY complement (every version of the
+/// package matches) encodes as `not C_selected`, where the at-least-one
+/// tracker variable `C_selected` is forced true by `AnyOf` clauses when a
+/// candidate of the package is installed. That linkage breaks across
+/// backtracking: when the tracker variable is created while the candidate is
+/// already installed, the retroactive `C_selected := true` decision is made
+/// at the CURRENT (encode-time) level, so a later backjump can pop it while
+/// the candidate itself (assigned at a shallower level) survives -- and
+/// nothing ever re-derives it (the `AnyOf` watch only fires on new
+/// assignments of the candidate, and the assertion scans do not cover it).
+/// A requirement whose condition disjunct is gated on `not C_selected` is
+/// then silently skipped by `decide()` for the rest of the enumeration:
+/// `solve_universal` returns cells whose solvables violate an active
+/// conditional requirement (the condition package IS installed, the
+/// requirement's target is NOT). See
+/// `test_universal_empty_complement_condition_lost_tracker_bug` for the
+/// minimized reproduction (generator seed 309 was the original finding).
+/// The same loss seems latently possible in a plain `solve` (the deferred
+/// path encodes the same `not C_selected` literal), but plain solves stop at
+/// the first solution, where the encode-time assertion is still in force.
+///
+/// While `false` (the default), the generator keeps every concrete condition
+/// leaf's version range strictly narrower than the package's version count,
+/// so the complement is never empty and the at-least-one tracker is never
+/// used by generated conditions. (The empty-complement encoding itself stays
+/// covered by a targeted scenario test with a favorable encode order.)
+/// Flipping this to `true` lifts the restriction and makes the 1000-seed
+/// gate fail (projections miss conditionally required packages).
+const GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS: bool = false;
 
 /// Number of seeds to run. Tuned so that the whole test finishes within a few
 /// seconds in debug builds.
@@ -95,6 +177,8 @@ struct Universe {
     env_packages: Vec<EnvPkg>,
     packages: Vec<ConcretePkg>,
     root_requirements: Vec<GenRequirement>,
+    /// Root-level constraints ([`UniversalProblem::constraints`]).
+    root_constrains: Vec<GenConstrain>,
     /// CNF over environment literals; each inner vec is a disjunction.
     model: Vec<Vec<GenModelLiteral>>,
 }
@@ -103,9 +187,31 @@ struct EnvPkg {
     can_be_absent: bool,
 }
 
+#[derive(Default)]
 struct ConcretePkg {
     /// Index `i` holds version `i + 1`.
     versions: Vec<PkgVersion>,
+    /// The only selectable version ([`crate::Candidates::locked`]), if any.
+    locked: Option<u32>,
+    /// The version tried before the sort order
+    /// ([`crate::Candidates::favored`]), if any. A preference only: it never
+    /// changes which install sets are valid.
+    favored: Option<u32>,
+    /// An externally excluded version ([`crate::Candidates::excluded`]).
+    excluded: Option<u32>,
+    /// A version whose dependencies are [`crate::Dependencies::Unknown`],
+    /// which the solver excludes exactly like an external exclusion.
+    unknown_deps: Option<u32>,
+}
+
+impl ConcretePkg {
+    /// Whether `version` can appear in any solution: not excluded, not
+    /// unknown-deps, and not locked out by a different locked version.
+    fn installable(&self, version: u32) -> bool {
+        self.excluded != Some(version)
+            && self.unknown_deps != Some(version)
+            && self.locked.is_none_or(|locked| locked == version)
+    }
 }
 
 struct PkgVersion {
@@ -118,6 +224,11 @@ struct GenRequirement {
     /// Half-open version range `[lo, hi)`.
     lo: u32,
     hi: u32,
+    /// When set, the requirement is a [`Requirement::Union`] of `[lo, hi)`
+    /// and this second range, both on the same target package. (Unions
+    /// mixing environment and concrete packages deliberately panic in the
+    /// encoder and are never generated.)
+    union2: Option<(u32, u32)>,
     condition: Option<GenCondition>,
 }
 
@@ -130,6 +241,27 @@ enum GenTarget {
 enum GenCondition {
     /// The environment package `pkg` is present with a value in `[lo, hi)`.
     Env {
+        pkg: usize,
+        lo: u32,
+        hi: u32,
+    },
+    /// A version of the concrete package `pkg` in `[lo, hi)` is installed.
+    ///
+    /// The oracle evaluates this against the install set with the public
+    /// documented semantics ("the condition is only true if the requirement
+    /// is true", i.e. a matching candidate is installed). The encoder's
+    /// complement encoding gives a *different* answer when the package is
+    /// entirely uninstalled (see `conditions.rs`: a non-empty complement
+    /// counts an uninstalled package as "condition holds", the empty
+    /// complement as "condition does not hold"). The two semantics coincide
+    /// whenever the package is installed, and the generator only emits
+    /// concrete condition leaves for root-required packages (see
+    /// [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]), which are
+    /// installed in every solution and in every install set that passes the
+    /// root-requirement check of `is_valid_solution` — so the oracle can use
+    /// the documented semantics throughout, including in the unsolvable
+    /// brute force.
+    Concrete {
         pkg: usize,
         lo: u32,
         hi: u32,
@@ -176,17 +308,77 @@ fn gen_env_range(rng: &mut Rng) -> (u32, u32) {
     (lo, hi)
 }
 
-fn gen_condition(rng: &mut Rng, env_count: usize, depth: u32) -> GenCondition {
+/// A half-open range over the concrete version space `1..=5`, biased so that
+/// a third of the ranges cover every version.
+fn gen_pkg_range(rng: &mut Rng) -> (u32, u32) {
+    let lo = if rng.chance(1, 3) { 1 } else { rng.range(1, 4) };
+    let hi = if rng.chance(1, 3) {
+        6
+    } else {
+        rng.range(lo + 1, 6)
+    };
+    (lo, hi)
+}
+
+/// `condition_pkgs` are the concrete packages a `Concrete` condition leaf may
+/// reference: the root-required packages, unless
+/// [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`] lifts the restriction
+/// (see there for the solver bug this avoids). `version_counts` holds every
+/// package's version count so the leaf range can be kept strictly narrower
+/// than the package (a non-empty complement; see
+/// [`GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS`] for the solver bug that
+/// restriction avoids).
+fn gen_condition(
+    rng: &mut Rng,
+    env_count: usize,
+    condition_pkgs: &[usize],
+    version_counts: &[u32],
+    depth: u32,
+) -> GenCondition {
     if depth == 0 || rng.chance(3, 5) {
-        let (lo, hi) = gen_env_range(rng);
-        GenCondition::Env {
-            pkg: rng.below(env_count as u32) as usize,
-            lo,
-            hi,
+        // A quarter of the leaves are concrete-package conditions; they mix
+        // freely with environment leaves under And/Or.
+        if rng.chance(1, 4) {
+            let pkg = condition_pkgs[rng.below(condition_pkgs.len() as u32) as usize];
+            let (mut lo, mut hi) = gen_pkg_range(rng);
+            if !GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS {
+                // Keep at least one version of the package outside the
+                // range. A one-version package leaves only constant-false
+                // ranges (still a valid non-empty complement).
+                let version_count = version_counts[pkg];
+                if lo == 1 && hi > version_count {
+                    if version_count >= 2 {
+                        hi = version_count;
+                    } else {
+                        lo = 2;
+                        hi = hi.max(3);
+                    }
+                }
+            }
+            GenCondition::Concrete { pkg, lo, hi }
+        } else {
+            let (lo, hi) = gen_env_range(rng);
+            GenCondition::Env {
+                pkg: rng.below(env_count as u32) as usize,
+                lo,
+                hi,
+            }
         }
     } else {
-        let lhs = Box::new(gen_condition(rng, env_count, depth - 1));
-        let rhs = Box::new(gen_condition(rng, env_count, depth - 1));
+        let lhs = Box::new(gen_condition(
+            rng,
+            env_count,
+            condition_pkgs,
+            version_counts,
+            depth - 1,
+        ));
+        let rhs = Box::new(gen_condition(
+            rng,
+            env_count,
+            condition_pkgs,
+            version_counts,
+            depth - 1,
+        ));
         if rng.chance(1, 2) {
             GenCondition::And(lhs, rhs)
         } else {
@@ -204,25 +396,51 @@ fn gen_universe(rng: &mut Rng) -> Universe {
         .collect::<Vec<_>>();
 
     let pkg_count = rng.range(2, 6) as usize;
+
+    // Choose the root-required packages up front: concrete condition leaves
+    // may only reference them (see
+    // [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]), so the set must
+    // exist before any version metadata is generated.
+    let mut root_required = (0..pkg_count).map(|_| rng.chance(2, 3)).collect::<Vec<_>>();
+    if !root_required.contains(&true) {
+        root_required[0] = true;
+    }
+    let condition_pkgs = if GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES {
+        (0..pkg_count).collect::<Vec<_>>()
+    } else {
+        (0..pkg_count)
+            .filter(|&p| root_required[p])
+            .collect::<Vec<_>>()
+    };
+
+    // Version counts are also fixed up front: concrete condition leaves need
+    // them to keep their ranges strictly narrower than the package (see
+    // [`GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS`]). A quarter of the
+    // packages is "fat" (4-5 versions) so that wide requirements on them
+    // cross `REQUIRES_AUX_ENCODING_THRESHOLD` and the property gate exercises
+    // the shared-requires gate encoding in universal mode.
+    let version_counts = (0..pkg_count)
+        .map(|_| {
+            if rng.chance(1, 4) {
+                rng.range(4, 6)
+            } else {
+                rng.range(1, 4)
+            }
+        })
+        .collect::<Vec<u32>>();
+
     let mut packages = Vec::new();
     for p in 0..pkg_count {
-        // A quarter of the packages are "fat" (4-5 versions) so that wide
-        // requirements on them cross `REQUIRES_AUX_ENCODING_THRESHOLD` and
-        // the property gate exercises the shared-requires gate encoding in
-        // universal mode.
-        let version_count = if rng.chance(1, 4) {
-            rng.range(4, 6) as usize
-        } else {
-            rng.range(1, 4) as usize
-        };
+        let version_count = version_counts[p] as usize;
         let mut versions = Vec::new();
         for _ in 0..version_count {
             let mut requirements = Vec::new();
             let mut constrains = Vec::new();
 
-            // Concrete dependencies, some guarded by environment conditions.
-            // Ranges are biased wide so that a decent share of the universes
-            // is solvable; narrow ranges (often empty against one-version
+            // Concrete dependencies, some guarded by environment/concrete
+            // conditions and a few of them unions of two ranges. Ranges are
+            // biased wide so that a decent share of the universes is
+            // solvable; narrow ranges (often empty against one-version
             // packages) still occur and exercise the unsolvable path.
             for _ in 0..rng.below(3) {
                 let mut target = rng.below(pkg_count as u32) as usize;
@@ -239,9 +457,25 @@ fn gen_universe(rng: &mut Rng) -> Universe {
                 } else {
                     rng.range(lo + 1, 5)
                 };
+                // A small share of the requirements is a union of two ranges
+                // of the same package (`Requirement::Union`). Skipped when
+                // the second range collides with the first: the pool interns
+                // version sets, so equal ranges would alias to one id.
+                let union2 = if rng.chance(1, 8) {
+                    let second = gen_pkg_range(rng);
+                    (second != (lo, hi)).then_some(second)
+                } else {
+                    None
+                };
                 let condition = if rng.chance(1, 2) {
                     let depth = rng.range(1, 3);
-                    Some(gen_condition(rng, env_count, depth))
+                    Some(gen_condition(
+                        rng,
+                        env_count,
+                        &condition_pkgs,
+                        &version_counts,
+                        depth,
+                    ))
                 } else {
                     None
                 };
@@ -249,15 +483,29 @@ fn gen_universe(rng: &mut Rng) -> Universe {
                     target: GenTarget::Concrete(target),
                     lo,
                     hi,
+                    union2,
                     condition,
                 });
             }
 
-            // A direct requirement on an environment package.
+            // A direct requirement on an environment package, occasionally a
+            // union of two ranges of the same environment package.
             if rng.chance(1, 5) {
                 let (lo, hi) = gen_env_range(rng);
+                let union2 = if rng.chance(1, 6) {
+                    let second = gen_env_range(rng);
+                    (second != (lo, hi)).then_some(second)
+                } else {
+                    None
+                };
                 let condition = if rng.chance(1, 4) {
-                    Some(gen_condition(rng, env_count, 1))
+                    Some(gen_condition(
+                        rng,
+                        env_count,
+                        &condition_pkgs,
+                        &version_counts,
+                        1,
+                    ))
                 } else {
                     None
                 };
@@ -265,6 +513,7 @@ fn gen_universe(rng: &mut Rng) -> Universe {
                     target: GenTarget::Env(rng.below(env_count as u32) as usize),
                     lo,
                     hi,
+                    union2,
                     condition,
                 });
             }
@@ -295,28 +544,73 @@ fn gen_universe(rng: &mut Rng) -> Universe {
                 constrains,
             });
         }
-        packages.push(ConcretePkg { versions });
+
+        // Provider knobs, all low probability so most packages stay plain:
+        // locked (only that version selectable), favored (a pure preference),
+        // excluded and unknown-deps (both make the version unselectable).
+        // Locked/excluded are restricted to root-required packages (see
+        // [`GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES`] for the solver
+        // bug the restriction avoids).
+        let version_count = versions.len() as u32;
+        let mut pkg = ConcretePkg {
+            versions,
+            ..ConcretePkg::default()
+        };
+        let may_lock_exclude = root_required[p] || GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES;
+        if rng.chance(1, 12) {
+            let locked = rng.range(1, version_count + 1);
+            if may_lock_exclude {
+                pkg.locked = Some(locked);
+            }
+        }
+        if rng.chance(1, 5) {
+            pkg.favored = Some(rng.range(1, version_count + 1));
+        }
+        if rng.chance(1, 12) {
+            let excluded = rng.range(1, version_count + 1);
+            if may_lock_exclude {
+                pkg.excluded = Some(excluded);
+            }
+        }
+        if rng.chance(1, 20) {
+            pkg.unknown_deps = Some(rng.range(1, version_count + 1));
+        }
+        packages.push(pkg);
     }
 
-    // Root requirements: a non-empty subset of the concrete packages, each
-    // with the full version range.
-    let mut root_requirements = Vec::new();
-    for p in 0..pkg_count {
-        if rng.chance(2, 3) {
-            root_requirements.push(GenRequirement {
-                target: GenTarget::Concrete(p),
-                lo: 1,
-                hi: 6,
-                condition: None,
-            });
-        }
-    }
-    if root_requirements.is_empty() {
-        root_requirements.push(GenRequirement {
-            target: GenTarget::Concrete(0),
+    // Root requirements: the pre-chosen non-empty subset of the concrete
+    // packages, each with the full version range.
+    let root_requirements = (0..pkg_count)
+        .filter(|&p| root_required[p])
+        .map(|p| GenRequirement {
+            target: GenTarget::Concrete(p),
             lo: 1,
-            hi: 4,
+            hi: 6,
+            union2: None,
             condition: None,
+        })
+        .collect::<Vec<_>>();
+
+    // Root constraints ([`UniversalProblem::constraints`]), low probability:
+    // a concrete constraint narrows one package everywhere, an environment
+    // constraint bounds the environment space itself (and fails the whole
+    // solve when the model reaches outside it, so it is rarer).
+    let mut root_constrains = Vec::new();
+    if rng.chance(1, 8) {
+        let lo = rng.range(1, 4);
+        let hi = rng.range(lo + 1, 6);
+        root_constrains.push(GenConstrain::Concrete {
+            pkg: rng.below(pkg_count as u32) as usize,
+            lo,
+            hi,
+        });
+    }
+    if rng.chance(1, 14) {
+        let (lo, hi) = gen_env_range(rng);
+        root_constrains.push(GenConstrain::Env {
+            pkg: rng.below(env_count as u32) as usize,
+            lo,
+            hi,
         });
     }
 
@@ -347,6 +641,7 @@ fn gen_universe(rng: &mut Rng) -> Universe {
         env_packages,
         packages,
         root_requirements,
+        root_constrains,
         model,
     }
 }
@@ -368,6 +663,18 @@ fn build_provider(universe: &Universe) -> EnvTestProvider {
         let ids = (1..=pkg.versions.len() as u32)
             .map(|v| provider.add_package(&pkg_name(p), v))
             .collect::<Vec<_>>();
+        if let Some(locked) = pkg.locked {
+            provider.set_locked(ids[(locked - 1) as usize]);
+        }
+        if let Some(favored) = pkg.favored {
+            provider.set_favored(ids[(favored - 1) as usize]);
+        }
+        if let Some(excluded) = pkg.excluded {
+            provider.set_excluded(ids[(excluded - 1) as usize], "generated exclusion");
+        }
+        if let Some(unknown) = pkg.unknown_deps {
+            provider.set_unknown_deps(ids[(unknown - 1) as usize], "generated unknown deps");
+        }
         solvable_ids.push(ids);
     }
     for (p, pkg) in universe.packages.iter().enumerate() {
@@ -399,18 +706,30 @@ fn build_requirement(
     provider: &EnvTestProvider,
     requirement: &GenRequirement,
 ) -> ConditionalRequirement {
-    let version_set = match requirement.target {
-        GenTarget::Concrete(p) => {
-            provider.version_set(&pkg_name(p), requirement.lo, requirement.hi)
+    let target_name = match requirement.target {
+        GenTarget::Concrete(p) => pkg_name(p),
+        GenTarget::Env(e) => env_name(e),
+    };
+    let version_set = provider.version_set(&target_name, requirement.lo, requirement.hi);
+    let built: Requirement = match requirement.union2 {
+        None => version_set.into(),
+        Some((lo2, hi2)) => {
+            // A union of two version sets of the SAME package (the generator
+            // never mixes environment and concrete members; that combination
+            // deliberately panics in the encoder).
+            let second = provider.version_set(&target_name, lo2, hi2);
+            provider
+                .pool
+                .intern_version_set_union(version_set, std::iter::once(second))
+                .into()
         }
-        GenTarget::Env(e) => provider.version_set(&env_name(e), requirement.lo, requirement.hi),
     };
     ConditionalRequirement {
         condition: requirement
             .condition
             .as_ref()
             .map(|condition| intern_condition(provider, condition)),
-        requirement: version_set.into(),
+        requirement: built,
     }
 }
 
@@ -418,6 +737,12 @@ fn intern_condition(provider: &EnvTestProvider, condition: &GenCondition) -> Con
     match condition {
         GenCondition::Env { pkg, lo, hi } => {
             let version_set = provider.version_set(&env_name(*pkg), *lo, *hi);
+            provider
+                .pool
+                .intern_condition(Condition::Requirement(version_set))
+        }
+        GenCondition::Concrete { pkg, lo, hi } => {
+            let version_set = provider.version_set(&pkg_name(*pkg), *lo, *hi);
             provider
                 .pool
                 .intern_condition(Condition::Requirement(version_set))
@@ -484,11 +809,24 @@ fn in_range(value: u32, lo: u32, hi: u32) -> bool {
     value >= lo && value < hi
 }
 
-fn eval_condition(condition: &GenCondition, env: &EnvSample) -> bool {
+/// Evaluates a condition against a concrete environment and an install set,
+/// with the documented condition semantics: a leaf holds iff a matching
+/// candidate is installed (concrete leaf) / the environment package is
+/// present with a matching value (environment leaf). For concrete leaves this
+/// matches the solver only because the generator restricts them to
+/// root-required packages; see the [`GenCondition::Concrete`] docs.
+fn eval_condition(condition: &GenCondition, env: &EnvSample, installed: &InstallSet) -> bool {
     match condition {
         GenCondition::Env { pkg, lo, hi } => env[*pkg].is_some_and(|v| in_range(v, *lo, *hi)),
-        GenCondition::And(lhs, rhs) => eval_condition(lhs, env) && eval_condition(rhs, env),
-        GenCondition::Or(lhs, rhs) => eval_condition(lhs, env) || eval_condition(rhs, env),
+        GenCondition::Concrete { pkg, lo, hi } => {
+            installed[*pkg].is_some_and(|v| in_range(v, *lo, *hi))
+        }
+        GenCondition::And(lhs, rhs) => {
+            eval_condition(lhs, env, installed) && eval_condition(rhs, env, installed)
+        }
+        GenCondition::Or(lhs, rhs) => {
+            eval_condition(lhs, env, installed) || eval_condition(rhs, env, installed)
+        }
     }
 }
 
@@ -497,21 +835,50 @@ fn requirement_satisfied(
     installed: &InstallSet,
     env: &EnvSample,
 ) -> bool {
-    match requirement.target {
-        GenTarget::Concrete(p) => {
-            installed[p].is_some_and(|v| in_range(v, requirement.lo, requirement.hi))
+    let value = match requirement.target {
+        GenTarget::Concrete(p) => installed[p],
+        GenTarget::Env(e) => env[e],
+    };
+    // A union requirement is satisfied when any member matches.
+    value.is_some_and(|v| {
+        in_range(v, requirement.lo, requirement.hi)
+            || requirement
+                .union2
+                .is_some_and(|(lo2, hi2)| in_range(v, lo2, hi2))
+    })
+}
+
+/// Checks a constraint of an installed parent (or of the root, which is
+/// always installed).
+fn constrain_respected(constrain: &GenConstrain, installed: &InstallSet, env: &EnvSample) -> bool {
+    match *constrain {
+        GenConstrain::Env { pkg, lo, hi } => env[pkg].is_none_or(|v| in_range(v, lo, hi)),
+        GenConstrain::Concrete { pkg, lo, hi } => {
+            installed[pkg].is_none_or(|v| in_range(v, lo, hi))
         }
-        GenTarget::Env(e) => env[e].is_some_and(|v| in_range(v, requirement.lo, requirement.hi)),
     }
 }
 
 /// Checks whether `installed` is a valid solution of `universe` in the
-/// concrete environment `env`: all root requirements satisfied, every active
-/// requirement of every installed solvable satisfied, and no constraint of
-/// any installed solvable violated.
+/// concrete environment `env`: every installed version is installable (not
+/// excluded, not unknown-deps, not locked out), all root requirements
+/// satisfied, no root constraint violated, every active requirement of every
+/// installed solvable satisfied, and no constraint of any installed solvable
+/// violated. (A favored version is a pure preference and does not affect
+/// validity.)
 fn is_valid_solution(universe: &Universe, installed: &InstallSet, env: &EnvSample) -> bool {
+    for (p, version) in installed.iter().enumerate() {
+        if version.is_some_and(|v| !universe.packages[p].installable(v)) {
+            return false;
+        }
+    }
     for requirement in &universe.root_requirements {
         if !requirement_satisfied(requirement, installed, env) {
+            return false;
+        }
+    }
+    for constrain in &universe.root_constrains {
+        if !constrain_respected(constrain, installed, env) {
             return false;
         }
     }
@@ -522,23 +889,14 @@ fn is_valid_solution(universe: &Universe, installed: &InstallSet, env: &EnvSampl
             let active = requirement
                 .condition
                 .as_ref()
-                .is_none_or(|condition| eval_condition(condition, env));
+                .is_none_or(|condition| eval_condition(condition, env, installed));
             if active && !requirement_satisfied(requirement, installed, env) {
                 return false;
             }
         }
         for constrain in &metadata.constrains {
-            match *constrain {
-                GenConstrain::Env { pkg, lo, hi } => {
-                    if env[pkg].is_some_and(|v| !in_range(v, lo, hi)) {
-                        return false;
-                    }
-                }
-                GenConstrain::Concrete { pkg, lo, hi } => {
-                    if installed[pkg].is_some_and(|v| !in_range(v, lo, hi)) {
-                        return false;
-                    }
-                }
+            if !constrain_respected(constrain, installed, env) {
+                return false;
             }
         }
     }
@@ -704,11 +1062,20 @@ fn run_seed(seed: u64, stats: &mut Stats) {
         .iter()
         .map(|requirement| build_requirement(&provider, requirement))
         .collect::<Vec<_>>();
+    let root_constraints: Vec<VersionSetId> = universe
+        .root_constrains
+        .iter()
+        .map(|constrain| match *constrain {
+            GenConstrain::Env { pkg, lo, hi } => provider.version_set(&env_name(pkg), lo, hi),
+            GenConstrain::Concrete { pkg, lo, hi } => provider.version_set(&pkg_name(pkg), lo, hi),
+        })
+        .collect();
     let environment_model = build_environment_model(&provider, &universe);
 
     let mut solver = Solver::new(provider);
     let problem = UniversalProblem::new()
         .requirements(root_requirements.clone())
+        .constraints(root_constraints.clone())
         .environment_model(environment_model.clone());
 
     match solver.solve_universal(problem) {
@@ -868,6 +1235,7 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             let reseeded = match solver.solve_universal(
                 UniversalProblem::new()
                     .requirements(root_requirements.clone())
+                    .constraints(root_constraints.clone())
                     .environment_model(environment_model.clone())
                     .seed_partition(seeds.clone()),
             ) {
@@ -931,6 +1299,7 @@ fn run_seed(seed: u64, stats: &mut Stats) {
             let fixed_point = match solver.solve_universal(
                 UniversalProblem::new()
                     .requirements(root_requirements.clone())
+                    .constraints(root_constraints.clone())
                     .environment_model(environment_model.clone())
                     .seed_partition(reseeded_seeds),
             ) {
@@ -966,6 +1335,7 @@ fn run_seed(seed: u64, stats: &mut Stats) {
                 let reordered = match solver.solve_universal(
                     UniversalProblem::new()
                         .requirements(root_requirements.clone())
+                        .constraints(root_constraints.clone())
                         .environment_model(environment_model.clone())
                         .seed_partition(reversed),
                 ) {
@@ -1025,6 +1395,36 @@ fn run_seed(seed: u64, stats: &mut Stats) {
 
 #[test]
 fn test_universal_solve_property() {
+    use crate::solver::prop_counters::hits;
+
+    // Coverage floors: every solver path this generator is responsible for
+    // must be hit at least once over the corpus, so generator drift cannot
+    // silently zero out coverage. Counters are process-global (other tests
+    // may add hits concurrently), so the floors are asserted on the deltas
+    // over this test's run, which is monotone-sound.
+    let floor_counters: [(&str, &std::sync::atomic::AtomicU64); 10] = [
+        (
+            "EXTRACT_SATISFIED_BY_CONCRETE",
+            &hits::EXTRACT_SATISFIED_BY_CONCRETE,
+        ),
+        (
+            "ENCODE_CONDITION_COMPLEMENT_SOLVABLES",
+            &hits::ENCODE_CONDITION_COMPLEMENT_SOLVABLES,
+        ),
+        (
+            "ENCODE_CONDITION_COMPLEMENT_ENV",
+            &hits::ENCODE_CONDITION_COMPLEMENT_ENV,
+        ),
+        ("ENCODE_UNION_CONCRETE", &hits::ENCODE_UNION_CONCRETE),
+        ("ENCODE_UNION_ENV", &hits::ENCODE_UNION_ENV),
+        ("ENCODE_ROOT_CONSTRAINT", &hits::ENCODE_ROOT_CONSTRAINT),
+        ("ENCODE_LOCKED", &hits::ENCODE_LOCKED),
+        ("ENCODE_EXCLUDED", &hits::ENCODE_EXCLUDED),
+        ("ENCODE_UNKNOWN_DEPS", &hits::ENCODE_UNKNOWN_DEPS),
+        ("CACHE_FAVORED_SORTED", &hits::CACHE_FAVORED_SORTED),
+    ];
+    let counters_before = floor_counters.map(|(_, counter)| hits::get(counter));
+
     let mut stats = Stats::default();
     for seed in 0..SEED_COUNT {
         run_seed(seed, &mut stats);
@@ -1044,6 +1444,13 @@ fn test_universal_solve_property() {
         stats.solved,
         stats.fixed_point_identical,
         stats.reordered_verified,
+    );
+    // The standing coverage dashboard (see `solver::prop_counters`). Counter
+    // values include hits from concurrently running tests, so per-path floors
+    // asserted below are monotone deltas over the values at test start.
+    eprintln!(
+        "universal property coverage counters:\n{}",
+        crate::solver::prop_counters::hits::dump(),
     );
     assert!(
         stats.solved > 0 && stats.unsolvable > 0,
@@ -1080,4 +1487,281 @@ fn test_universal_solve_property() {
         stats.reordered_verified > 0,
         "at least some multi-cell partitions must have been re-solved in reverse seed order"
     );
+    for ((name, counter), before) in floor_counters.into_iter().zip(counters_before) {
+        assert!(
+            hits::get(counter) > before,
+            "coverage floor: the corpus no longer exercises {name} (see prop_counters)"
+        );
+    }
+}
+
+// ===========================================================================
+// Targeted scenarios for the generator features of this module: the working
+// counterparts of the excluded generator features, and the minimized
+// #[ignore] reproductions of the solver bugs the exclusions avoid (see the
+// GEN_* flags at the top of the module).
+// ===========================================================================
+
+/// Formats a solution's cells as `condition -> [solvables]` lines.
+fn cells_to_string(
+    solver: &Solver<EnvTestProvider>,
+    solution: &crate::UniversalSolution,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for cell in solution.cells() {
+        let solvables = cell
+            .solvables()
+            .iter()
+            .map(|&s| crate::Interner::display_solvable(solver.provider(), s).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            out,
+            "{} -> [{}]",
+            cell.condition().display(solver.provider()),
+            solvables
+        )
+        .unwrap();
+    }
+    out
+}
+
+/// A locked package behind an UNCONDITIONAL requirement is respected by
+/// `solve_universal`: only the locked version is installed even though a
+/// higher version exists.
+#[test]
+fn test_universal_locked_unconditional_requirement() {
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let e_any = provider.version_set("env0", 0, 11);
+    let a1 = provider.add_package("a", 1);
+    let b1 = provider.add_package("b", 1);
+    let _b2 = provider.add_package("b", 2);
+    provider.set_locked(b1);
+    let b_any = provider.version_set("b", 1, 3);
+    provider.set_dependencies(a1, vec![b_any.into()], vec![]);
+    let a_any = provider.version_set("a", 1, 2);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(vec![a_any.into()])
+        .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+            SignedEnvLiteral::new(EnvLiteral::Matches(e_any), true),
+        ])]));
+    let solution = solver.solve_universal(problem).expect("solvable");
+    insta::assert_snapshot!(cells_to_string(&solver, &solution), @"<all environments> -> [a=1, b=1]");
+}
+
+/// SOLVER BUG reproduction (see
+/// [`GEN_LOCKED_EXCLUDED_ON_CONDITIONAL_ONLY_PACKAGES`]): a locked package
+/// reachable ONLY through a conditional requirement is not respected by
+/// `solve_universal` -- the eager universal condition path never queues the
+/// requirement's target package, so `on_candidates_available` (which emits
+/// the lock and exclusion clauses) never runs for it. The second cell below
+/// installs `b=2` although `b` is locked to `b=1`. Un-ignore once fixed.
+#[test]
+#[ignore = "solver bug: universal eager conditional path drops locked/excluded clauses"]
+fn test_universal_locked_behind_conditional_requirement_bug() {
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let e_57 = provider.version_set("env0", 5, 7);
+    let a1 = provider.add_package("a", 1);
+    let b1 = provider.add_package("b", 1);
+    let _b2 = provider.add_package("b", 2);
+    provider.set_locked(b1);
+    let b_any = provider.version_set("b", 1, 3);
+    let cond = provider.pool.intern_condition(Condition::Requirement(e_57));
+    provider.set_dependencies(
+        a1,
+        vec![ConditionalRequirement {
+            condition: Some(cond),
+            requirement: b_any.into(),
+        }],
+        vec![],
+    );
+    let a_any = provider.version_set("a", 1, 2);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(vec![a_any.into()])
+        .environment_model(EnvironmentModel::default());
+    let solution = solver.solve_universal(problem).expect("solvable");
+    for cell in solution.cells() {
+        assert!(
+            !cell.solvables().contains(&_b2),
+            "b is locked to b=1, but cell {} installs b=2",
+            cell.condition().display(solver.provider()),
+        );
+    }
+}
+
+/// SOLVER BUG reproduction (see
+/// [`GEN_CONCRETE_CONDITIONS_ON_UNREQUIRED_PACKAGES`]): a conditional
+/// requirement whose concrete condition package stays entirely UNDECIDED
+/// (`c` is required by nothing) trips the undecided-counts-as-false
+/// completion of `capture_cell_edges`: the condition counts as "holds" while
+/// `decide()` (which requires the complement literals to be assigned false)
+/// never enforced the requirement, so the capture panics on
+/// `debug_assert!(false, "bug: an active requirement of an installed parent
+/// has no installed candidate")` in debug builds. Un-ignore once fixed.
+#[test]
+#[ignore = "solver bug: cell-edge capture treats an undecided concrete condition as held"]
+fn test_universal_concrete_condition_untouched_package_bug() {
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let e_any = provider.version_set("env0", 0, 11);
+    let a1 = provider.add_package("a", 1);
+    let _b1 = provider.add_package("b", 1);
+    let _c1 = provider.add_package("c", 1);
+    let _c2 = provider.add_package("c", 2);
+    // a requires b if (c in 2..3); the complement {c=1} is non-empty but c is
+    // never touched by the solve.
+    let b_any = provider.version_set("b", 1, 2);
+    let c_23 = provider.version_set("c", 2, 3);
+    let cond = provider.pool.intern_condition(Condition::Requirement(c_23));
+    provider.set_dependencies(
+        a1,
+        vec![ConditionalRequirement {
+            condition: Some(cond),
+            requirement: b_any.into(),
+        }],
+        vec![],
+    );
+    let a_any = provider.version_set("a", 1, 2);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(vec![a_any.into()])
+        .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+            SignedEnvLiteral::new(EnvLiteral::Matches(e_any), true),
+        ])]));
+    // Panics in debug builds (the debug_assert quoted above).
+    let solution = solver.solve_universal(problem).expect("solvable");
+    assert_eq!(solution.cells().len(), 1);
+}
+
+/// The empty-complement (at-least-one tracker) encoding of a concrete
+/// condition works when the encode order is favorable: `a`'s dependencies
+/// (and with them the tracker) are encoded before the condition package `d`
+/// is installed, so the tracker assignment is derived by a live watch. This
+/// is the standing coverage for `DisjunctionComplement::Empty`, which the
+/// generator deliberately avoids (see
+/// [`GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS`]); the hit counter proves the
+/// arm fired.
+#[test]
+fn test_universal_empty_complement_concrete_condition() {
+    use crate::solver::prop_counters::hits;
+    let empty_before = hits::get(&hits::ENCODE_CONDITION_COMPLEMENT_EMPTY);
+
+    // a requires b if ((env0 in 5..7) OR (d in 1..2)); d has one version and
+    // is root-required, so the second disjunct always holds and b must be
+    // installed in every cell.
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let e_57 = provider.version_set("env0", 5, 7);
+    let a1 = provider.add_package("a", 1);
+    let b1 = provider.add_package("b", 1);
+    let _d1 = provider.add_package("d", 1);
+    let b_any = provider.version_set("b", 1, 2);
+    let d_12 = provider.version_set("d", 1, 2);
+    let c_env = provider.pool.intern_condition(Condition::Requirement(e_57));
+    let c_d = provider.pool.intern_condition(Condition::Requirement(d_12));
+    let cond = provider
+        .pool
+        .intern_condition(Condition::Binary(LogicalOperator::Or, c_env, c_d));
+    provider.set_dependencies(
+        a1,
+        vec![ConditionalRequirement {
+            condition: Some(cond),
+            requirement: b_any.into(),
+        }],
+        vec![],
+    );
+    let a_any = provider.version_set("a", 1, 2);
+    let d_any = provider.version_set("d", 1, 2);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(vec![a_any.into(), d_any.into()])
+        .environment_model(EnvironmentModel::default());
+    let solution = solver.solve_universal(problem).expect("solvable");
+    insta::assert_snapshot!(cells_to_string(&solver, &solution), @"<all environments> -> [a=1, d=1, b=1]");
+    for cell in solution.cells() {
+        assert!(cell.solvables().contains(&b1));
+    }
+
+    assert!(
+        hits::get(&hits::ENCODE_CONDITION_COMPLEMENT_EMPTY) > empty_before,
+        "the empty-complement encoding arm must have fired"
+    );
+}
+
+/// SOLVER BUG reproduction (see
+/// [`GEN_EMPTY_COMPLEMENT_CONCRETE_CONDITIONS`], minimized from generator
+/// seed 309): the at-least-one tracker assignment (`C_selected(d) := true`,
+/// made retroactively at encode level when `a=2`'s dependencies are encoded
+/// with `d=1` already installed) is popped by the backjump out of the
+/// `env0 in 5..7` conflict, while `d=1` (root level) survives. When `a=1` is
+/// installed afterwards, its `c if (d in 1..2)` clause reuses the existing
+/// tracker variable with no re-derivation, `decide()` skips the clause
+/// (condition literal undecided), and the second cell violates the active
+/// conditional requirement: `d` is installed but `c` is not. Un-ignore once
+/// fixed.
+#[test]
+#[ignore = "solver bug: at-least-one tracker assignment lost across backjump"]
+fn test_universal_empty_complement_condition_lost_tracker_bug() {
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let e_57 = provider.version_set("env0", 5, 7);
+    let a2 = provider.add_package("a", 2);
+    let a1 = provider.add_package("a", 1);
+    let c1 = provider.add_package("c", 1);
+    let _d1 = provider.add_package("d", 1);
+    let c_any = provider.version_set("c", 1, 2);
+    let d_12 = provider.version_set("d", 1, 2);
+    // x has no candidates: a=2 is unsolvable wherever env0 in 5..7 holds.
+    let x_any = provider.version_set("x", 1, 2);
+    let cond_env = provider.pool.intern_condition(Condition::Requirement(e_57));
+    let cond_d = provider.pool.intern_condition(Condition::Requirement(d_12));
+    provider.set_dependencies(
+        a2,
+        vec![
+            ConditionalRequirement {
+                condition: Some(cond_env),
+                requirement: x_any.into(),
+            },
+            ConditionalRequirement {
+                condition: Some(cond_d),
+                requirement: c_any.into(),
+            },
+        ],
+        vec![],
+    );
+    provider.set_dependencies(
+        a1,
+        vec![ConditionalRequirement {
+            condition: Some(cond_d),
+            requirement: c_any.into(),
+        }],
+        vec![],
+    );
+    let a_any = provider.version_set("a", 1, 3);
+    let d_any = provider.version_set("d", 1, 2);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(vec![a_any.into(), d_any.into()])
+        .environment_model(EnvironmentModel::default());
+    let solution = solver.solve_universal(problem).expect("solvable");
+    for cell in solution.cells() {
+        // d is installed in every cell, so the condition (d in 1..2) holds
+        // and c must be installed in every cell. Today the second cell
+        // (env0 in 5..7 -> [a=1, d=1]) misses it.
+        assert!(
+            cell.solvables().contains(&c1),
+            "cell {} misses conditionally required c",
+            cell.condition().display(solver.provider()),
+        );
+    }
 }

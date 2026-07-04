@@ -11,6 +11,7 @@ use decision_tracker::DecisionTracker;
 use encoding::Encoder;
 use indexmap::IndexMap;
 use itertools::Itertools;
+use prop_counters::prop_hit;
 use variable_map::VariableMap;
 
 use watch_map::WatchMap;
@@ -46,6 +47,7 @@ mod diagnostics;
 mod encoding;
 #[cfg(test)]
 pub(crate) mod env_test_provider;
+pub(crate) mod prop_counters;
 mod universal;
 #[cfg(test)]
 mod universal_prop;
@@ -2488,6 +2490,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 if self.state.propagated_total > deadline
                     || self.state.prefix_spent > self.state.prefix_cumulative_budget
                 {
+                    prop_hit!(PREFIX_BUDGET_ABORT);
                     tracing::debug!(
                         "The kept trail prefix exceeded its work budget; abandoning the \
                          trail-reuse attempt"
@@ -3534,6 +3537,7 @@ impl<D: DependencyProvider> SolverState<D> {
                     self.add_clause(wl, kind);
                 }
                 VersionSetRelation::Equal => {
+                    prop_hit!(ORACLE_EQUAL_CLAUSES);
                     // Both implications:
                     // (not L_new or L_prior) and (not L_prior or L_new)
                     let (wl, kind) = WatchedLiterals::oracle_consistency::<D::NameId>(

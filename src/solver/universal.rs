@@ -150,6 +150,7 @@ use crate::{
         PrefixBudgetExhausted, Solver, SolverState, UnsolvableOrCancelled,
         clause::{Clause, EnvClauseKind, Literal, WatchedLiterals},
         decision::Decision,
+        prop_counters::prop_hit,
         variable_map::VariableOrigin,
     },
     solver_id::IdMap,
@@ -1160,6 +1161,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 // would only walk the cycle; return the last pass, which is
                 // still a verified disjoint cover.
                 if inputs_tried.contains(&output) {
+                    prop_hit!(RESEED_ORBIT_CLOSED);
                     tracing::debug!(
                         "reseed iteration closed a cycle after {rounds} passes without \
                          finding a fixed point; returning the last enumeration"
@@ -1203,6 +1205,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         )? {
             EnumerationOutcome::Done(solution) => Ok(solution),
             EnumerationOutcome::ReuseAbandoned => {
+                prop_hit!(UNIVERSAL_REUSE_ABANDONED);
                 tracing::debug!(
                     "trail reuse exceeded its work budget; re-enumerating from scratch \
                      without it"
@@ -1484,6 +1487,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         if self.state.env_ordering_active
                             && self.ordinary_levels_above(target) > TRAIL_RESHAPE_ORDINARY_LEVELS
                         {
+                            prop_hit!(TRAIL_RESHAPE_FULL_RETRACT);
                             0
                         } else {
                             target
@@ -2153,6 +2157,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             && literal.eval(decision_map).unwrap_or(literal.negate())
                     });
                     if satisfied_by_concrete {
+                        prop_hit!(EXTRACT_SATISFIED_BY_CONCRETE);
                         continue;
                     }
 

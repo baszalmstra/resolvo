@@ -48,6 +48,18 @@ pub(crate) struct EnvTestProvider {
     pub pool: Pool<Range>,
     env_packages: HashMap<NameId, EnvironmentPackage>,
     dependencies: HashMap<SolvableId, KnownDependencies>,
+    /// Per package name, the only candidate that may be selected
+    /// ([`Candidates::locked`]).
+    locked: HashMap<NameId, SolvableId>,
+    /// Per package name, the candidate preferred over the sort order
+    /// ([`Candidates::favored`]).
+    favored: HashMap<NameId, SolvableId>,
+    /// Per package name, the externally excluded candidates
+    /// ([`Candidates::excluded`]).
+    excluded: HashMap<NameId, Vec<(SolvableId, StringId)>>,
+    /// Solvables whose [`Self::get_dependencies`] answer is
+    /// [`Dependencies::Unknown`].
+    unknown_deps: HashMap<SolvableId, StringId>,
 }
 
 impl EnvTestProvider {
@@ -81,6 +93,38 @@ impl EnvTestProvider {
                 constrains,
             },
         );
+    }
+
+    /// Marks `solvable` as the locked candidate of its package: no other
+    /// candidate of the package may be selected.
+    pub fn set_locked(&mut self, solvable: SolvableId) {
+        let name = self.pool.resolve_solvable(solvable).name;
+        self.locked.insert(name, solvable);
+    }
+
+    /// Marks `solvable` as the favored candidate of its package: it is tried
+    /// before the (higher-version-first) sort order.
+    pub fn set_favored(&mut self, solvable: SolvableId) {
+        let name = self.pool.resolve_solvable(solvable).name;
+        self.favored.insert(name, solvable);
+    }
+
+    /// Externally excludes `solvable` from selection, with `reason` used in
+    /// error messages.
+    pub fn set_excluded(&mut self, solvable: SolvableId, reason: &str) {
+        let name = self.pool.resolve_solvable(solvable).name;
+        let reason = self.pool.intern_string(reason);
+        self.excluded
+            .entry(name)
+            .or_default()
+            .push((solvable, reason));
+    }
+
+    /// Makes [`Self::get_dependencies`] answer [`Dependencies::Unknown`] for
+    /// `solvable`, which the solver turns into an exclusion.
+    pub fn set_unknown_deps(&mut self, solvable: SolvableId, reason: &str) {
+        let reason = self.pool.intern_string(reason);
+        self.unknown_deps.insert(solvable, reason);
     }
 }
 
@@ -153,6 +197,9 @@ impl DependencyProvider for EnvTestProvider {
             .collect();
         Some(Candidates {
             candidates,
+            locked: self.locked.get(&name).copied(),
+            favored: self.favored.get(&name).copied(),
+            excluded: self.excluded.get(&name).cloned().unwrap_or_default(),
             ..Candidates::default()
         })
     }
@@ -166,6 +213,9 @@ impl DependencyProvider for EnvTestProvider {
     }
 
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
+        if let Some(&reason) = self.unknown_deps.get(&solvable) {
+            return Dependencies::Unknown(reason);
+        }
         Dependencies::Known(
             self.dependencies
                 .get(&solvable)

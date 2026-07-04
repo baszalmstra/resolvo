@@ -456,6 +456,7 @@ impl<D: DependencyProvider> SolverCache<D> {
         // that the version that is favored is picked first.
         if let Some(favored_id) = candidates.favored {
             if let Some(pos) = sorted_candidates.iter().position(|&s| s == favored_id) {
+                crate::solver::prop_counters::prop_hit!(CACHE_FAVORED_SORTED);
                 // Move the element at `pos` to the front of the array
                 sorted_candidates[0..=pos].rotate_right(1);
             }
