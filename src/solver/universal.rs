@@ -147,7 +147,7 @@ use crate::{
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     runtime::AsyncRuntime,
     solver::{
-        PrefixBudgetExhausted, Solver, SolverState, UnsolvableOrCancelled,
+        PrefixBudgetExhausted, Solver, SolverState, UnsolvableOrCancelled, WitnessProbeTripped,
         clause::{Clause, EnvClauseKind, Literal, WatchedLiterals},
         decision::Decision,
         prop_counters::prop_hit,
@@ -177,6 +177,25 @@ enum EnumerationOutcome<Id, N> {
 /// subtree that installing a deferred variant parent drags above the env
 /// tail.
 const TRAIL_RESHAPE_ORDINARY_LEVELS: u32 = 8;
+
+/// Work budget, in propagated decisions, of one FREE-phase `run_sat`
+/// episode of a universal enumeration before the episode is abandoned in
+/// favor of the environment-witness search (witness-guided escalation; see
+/// the `WitnessProbeTripped` handling in `Solver::enumerate_universal`).
+///
+/// The budget is FLAT rather than relative to the recorded fresh-solve cost
+/// on purpose: the monster episodes this probe exists for (8-21M propagated
+/// decisions between cells on the unsolvable tail of the conda-forge
+/// corpus) can be the FIRST run of an enumeration, where no fresh-solve
+/// cost has been recorded yet, so a fresh-solve-relative budget has nothing
+/// to calibrate against exactly where it is needed most (measured: the
+/// worst tail problem's fresh solve alone costs 2.7M propagations, past any
+/// reasonable multiple of an unknown baseline). Two million propagated
+/// decisions is comfortably above every healthy free episode observed
+/// across the benchmark corpus and two-plus orders of magnitude below the
+/// pathological ones; a tripped episode costs one bounded wasted search
+/// plus a <15ms witness check.
+const WITNESS_PROBE_BUDGET: u64 = 2_000_000;
 
 /// The maximum number of enumeration passes a SEEDED `solve_universal` may
 /// take to reach the reseed fixed point (see `solve_universal_impl`). Each
@@ -1407,6 +1426,14 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // the seeds run out the loop continues as free enumeration.
         let mut pending_seeds = seed_partition.into_iter();
 
+        // The uncovered environment region the witness probe most recently
+        // escalated to (see the `WitnessProbeTripped` arm below): the next
+        // iteration solves it under assumption decisions like a seeded
+        // cell, except that `Ok(false)` is then an unsolvability verdict
+        // rather than a droppable stale seed. `None` during normal seed
+        // processing and free enumeration.
+        let mut pending_witness: Option<Vec<(VariableId, bool)>> = None;
+
         // Snapshot of the propagated-decision counter at the previous cell
         // recording, used to attribute propagation work to individual cells.
         #[cfg(feature = "diagnostics")]
@@ -1418,12 +1445,32 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut fresh_cost_recorded = false;
 
         loop {
-            // Set up the assumptions of the next viable seed, if any remain.
-            // Seeds that contribute no assumptions are skipped: an empty
+            // Set up the assumptions of the witness region the probe most
+            // recently escalated to, if any (see the `WitnessProbeTripped`
+            // arm below), or of the next viable seed, if any remain. Seeds
+            // that contribute no assumptions are skipped: an empty
             // condition describes the whole environment space (which free
             // enumeration covers anyway) and a self-contradictory condition
             // describes no environment at all.
             let mut seeded = false;
+            let mut probe_suppressed = false;
+            let active_witness = pending_witness.take();
+            if let Some(witness) = &active_witness {
+                // The witness is a consistent assignment over already
+                // interned environment variables, so pushing it through the
+                // seeded-cell machinery can only fail when it is EMPTY:
+                // nothing constrains the environment space yet (no model
+                // clauses, no recorded cells) and the uncovered "region" is
+                // the whole space. Solving that region under assumptions IS
+                // the free episode that just tripped, so let the free
+                // episode run to its natural end this once instead of
+                // re-arming the probe, which would only reproduce the same
+                // empty witness.
+                let condition = self.cell_to_condition(witness);
+                seeded = self.push_seed_assumptions(&condition)?;
+                probe_suppressed = !seeded;
+            }
+            let witness_directed = seeded;
             while !seeded {
                 let Some(seed) = pending_seeds.next() else {
                     break;
@@ -1431,15 +1478,38 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 seeded = self.push_seed_assumptions(&seed)?;
             }
 
+            // Arm the witness probe for a free episode (see
+            // `WITNESS_PROBE_BUDGET`). Seeded and witness-directed episodes
+            // never arm it: they are the probe's own escape hatch and must
+            // run to their Ok(true)/Ok(false) conclusion (a witness-directed
+            // episode interrupted by its own probe could make no progress),
+            // and the budget applying only to the free phase is what keeps
+            // seeded replays -- the reseed fixed-point contract of design
+            // doc 5.7 -- untouched. The deadline is a deterministic
+            // function of the (deterministic) propagation count, so
+            // partitions stay deterministic.
+            self.state.arm_witness_probe(if seeded || probe_suppressed {
+                None
+            } else {
+                self.witness_probe_budget()
+            });
+
             // Assumption decisions of a seeded cell are preserved prior
             // state (unsolvable surfaces as `Ok(false)`); a trail prefix
             // kept by the free phase is restartable scratch state above
             // `starting_level = 0`.
-            match self.run_sat(
+            let sat_result = self.run_sat(
                 SolvableIdOrRoot::root(),
                 &root_dependencies,
                 self.state.assumption_levels,
-            ) {
+            );
+            // Disarm unconditionally: no later `run_sat` call (the
+            // witness-directed solve of the next iteration, the
+            // scoped-conflict re-solve, a concrete solve on this solver)
+            // may observe a stale deadline.
+            self.state.arm_witness_probe(None);
+
+            match sat_result {
                 Ok(true) => {
                     // Extract the load-bearing environment literal
                     // assignments and restore provable disjointness against
@@ -1571,6 +1641,34 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         .collect();
                     self.state.add_env_clause(blocking, EnvClauseKind::Blocking);
                 }
+                Ok(false) if witness_directed => {
+                    // The probe-escalated witness region is unsolvable: the
+                    // whole universal solve fails NOW, reported exactly as
+                    // the terminal path below reports it after exhaustive
+                    // coverage.
+                    //
+                    // SOUNDNESS: the witness satisfies the environment
+                    // model, every oracle consistency clause and every
+                    // blocking clause (it is a model of exactly that clause
+                    // set, see `find_environment_witness`), so any solution
+                    // whose environment extends the witness would have
+                    // survived all of them and been found by this
+                    // assumption-pinned solve. `Ok(false)` under exactly
+                    // the witness assumptions therefore proves that no
+                    // solution exists anywhere in the witness region, and
+                    // the environment model is total (every modeled
+                    // environment must be covered), so an uncoverable
+                    // region fails the whole solve.
+                    let witness = active_witness
+                        .expect("bug: a witness-directed solve holds the active witness");
+                    prop_hit!(WITNESS_PROBE_VERDICT);
+                    let scoped_conflict =
+                        self.run_scoped_conflict(&witness, None, &root_dependencies)?;
+                    return Err(UniversalFailure::Unsolvable {
+                        cell: self.cell_to_condition(&witness),
+                        conflict: scoped_conflict,
+                    });
+                }
                 Ok(false) => {
                     // The seeded cell is unsolvable AS SEEDED (`run_sat`
                     // surfaces every unsolvable outcome as `Ok(false)` while
@@ -1599,6 +1697,48 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             "bug: the prefix budget is never armed without trail reuse"
                         );
                         return Ok(EnumerationOutcome::ReuseAbandoned);
+                    }
+                    // A free episode that exceeded the witness-probe budget
+                    // (see `WITNESS_PROBE_BUDGET`) escalates to the
+                    // coverage witness search -- the same model + oracle +
+                    // blocking clause set that decides coverage termination
+                    // -- instead of wandering on. Each trip makes bounded
+                    // progress: the witness-directed solve of the next
+                    // iteration either records a cell (whose blocking
+                    // clause strictly shrinks the witness space) or proves
+                    // the region uncoverable and ends the whole solve, so
+                    // trips cannot livelock.
+                    if value.downcast_ref::<WitnessProbeTripped>().is_some() {
+                        debug_assert!(
+                            !seeded,
+                            "bug: the witness probe is never armed under assumptions"
+                        );
+                        // Retract the abandoned episode entirely; the next
+                        // iteration starts from a clean stack (the witness
+                        // assumptions require one, and a fully retracted
+                        // trail never falsifies the next blocking clause).
+                        self.state.assumption_levels = 0;
+                        self.state.decision_tracker.undo_until(0);
+                        match self.find_environment_witness() {
+                            None => {
+                                // No environment assignment satisfies the
+                                // model, oracle and blocking clauses: the
+                                // recorded cells already cover the entire
+                                // model and the abandoned episode was the
+                                // (expensive) final refutation. Terminate
+                                // exactly like the terminal path below.
+                                prop_hit!(WITNESS_PROBE_COVERAGE_BREAK);
+                                break;
+                            }
+                            Some(witness) => {
+                                // An uncovered region exists: solve it
+                                // directly under assumptions on the next
+                                // iteration.
+                                prop_hit!(WITNESS_PROBE_ESCALATED);
+                                pending_witness = Some(witness);
+                                continue;
+                            }
+                        }
                     }
                     return Err(UniversalFailure::Cancelled(value));
                 }
@@ -1629,8 +1769,11 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             // must also be UNSAT (the region is unsolvable),
                             // and its conflict is scoped to exactly the clauses
                             // that fire in that region.
-                            let scoped_conflict =
-                                self.run_scoped_conflict(&witness, conflict, &root_dependencies);
+                            let scoped_conflict = self.run_scoped_conflict(
+                                &witness,
+                                Some(conflict),
+                                &root_dependencies,
+                            )?;
                             return Err(UniversalFailure::Unsolvable {
                                 cell: self.cell_to_condition(&witness),
                                 conflict: scoped_conflict,
@@ -1689,21 +1832,30 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// Performs a scoped re-solve to produce a conflict that is tightly
     /// bound to the witness region identified by `witness`.
     ///
-    /// The formula is already UNSAT (the `fallback` conflict was just
-    /// produced). Adding unit [`EnvClauseKind::Model`] clauses that pin each
-    /// witness literal to its witnessed value keeps it UNSAT while scoping
-    /// the CDCL to the specific region. The resulting conflict graph will
-    /// only reference clauses that matter in that region.
+    /// The witness region is known to be unsolvable: either the whole
+    /// formula just went UNSAT (the exhaustion path, which passes the
+    /// unscoped conflict as `fallback`), or a witness-directed solve just
+    /// returned `Ok(false)` under exactly the witness assumptions (the
+    /// witness-probe path, which has no unscoped conflict and passes
+    /// `None`). Adding unit [`EnvClauseKind::Model`] clauses that pin each
+    /// witness literal to its witnessed value keeps the formula UNSAT while
+    /// scoping the CDCL to the specific region. The resulting conflict
+    /// graph will only reference clauses that matter in that region.
     ///
     /// If for any reason the re-solve produces `Ok` (which should not happen
     /// for a well-formed witness), the `fallback` conflict is returned
-    /// unchanged.
+    /// unchanged; without a fallback that outcome would contradict the
+    /// `Ok(false)` the same pinned assignment just produced, so it is a
+    /// solver bug. A provider cancellation during the re-solve falls back
+    /// to the unscoped conflict when one exists (preserving the historical
+    /// behavior of the exhaustion path) and surfaces as
+    /// [`UniversalFailure::Cancelled`] otherwise.
     fn run_scoped_conflict(
         &mut self,
         witness: &[(VariableId, bool)],
-        fallback: Conflict,
+        fallback: Option<Conflict>,
         root_dependencies: &Dependencies,
-    ) -> Conflict {
+    ) -> Result<Conflict, UniversalFailure<D::NameId>> {
         // Undo all decisions so that add_env_clause can initialize its
         // watch lists on a clean decision stack.
         self.state.assumption_levels = 0;
@@ -1725,9 +1877,19 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // Re-solve. The formula is UNSAT in this region, so we expect an
         // Unsolvable result.
         match self.run_sat(SolvableIdOrRoot::root(), root_dependencies, 0) {
-            Err(UnsolvableOrCancelled::Unsolvable(scoped)) => scoped,
+            Err(UnsolvableOrCancelled::Unsolvable(scoped)) => Ok(scoped),
+            Err(UnsolvableOrCancelled::Cancelled(value)) => match fallback {
+                Some(conflict) => Ok(conflict),
+                None => Err(UniversalFailure::Cancelled(value)),
+            },
             // Unexpected: fall back to the unscoped conflict.
-            _ => fallback,
+            Ok(_) => Ok(fallback.unwrap_or_else(|| {
+                unreachable!(
+                    "bug: the scoped re-solve found a solution in a region a \
+                     witness-directed solve just proved unsolvable under the same pinned \
+                     assignment"
+                )
+            })),
         }
     }
 
@@ -2668,6 +2830,17 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         });
 
         CellCondition::from_literals_unchecked(literals)
+    }
+
+    /// The effective witness-probe budget for one free enumeration episode:
+    /// the flat [`WITNESS_PROBE_BUDGET`], or the test override (see
+    /// `Solver::test_witness_probe_override`). `None` disables the probe.
+    fn witness_probe_budget(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(override_budget) = self.test_witness_probe_override {
+            return override_budget;
+        }
+        Some(WITNESS_PROBE_BUDGET)
     }
 
     /// Searches for an assignment of the environment literal variables that

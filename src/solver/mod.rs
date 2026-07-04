@@ -255,6 +255,23 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// the trail-reuse abandonment fallback of `solve_universal`.
     #[cfg(test)]
     test_prefix_budget_override: Option<u64>,
+
+    /// Test-only override of the free-phase witness-probe budget (see
+    /// [`universal::WITNESS_PROBE_BUDGET`] and
+    /// [`SolverState::witness_probe_deadline`]): `Some(Some(n))` arms every
+    /// free enumeration episode with exactly `n` propagated decisions
+    /// (forcing `0` trips the probe on the episode's first propagation,
+    /// which is how tests drive the witness-guided escalation
+    /// deterministically on tiny universes), `Some(None)` disables the
+    /// probe entirely, `None` (the default) keeps the production budget.
+    #[cfg(test)]
+    test_witness_probe_override: Option<Option<u64>>,
+
+    /// The number of times the witness probe escalated a free universal
+    /// enumeration episode to the environment-witness search (see
+    /// [`Solver::witness_probe_trips`]). Lives on the solver, not on
+    /// [`SolverState`], because the state is reset per enumeration pass.
+    witness_probe_trips: u64,
 }
 
 type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
@@ -607,6 +624,20 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// so far. `None` when no prefix budget is armed.
     prefix_budget_deadline: Option<u64>,
 
+    /// While the current `run_sat` is a FREE universal enumeration episode
+    /// (no seed or witness assumptions, see `enumerate_universal`), the
+    /// value of [`Self::propagated_total`] at which the episode is
+    /// abandoned in favor of the environment-witness search: a free episode
+    /// that has burnt this much propagation without completing is wandering
+    /// (on the measured tails: refuting whole solvable subtrees on its way
+    /// to a doomed region that only negative env literals reach), and the
+    /// witness search answers "where is an uncovered region" directly and
+    /// cheaply. Armed only by the free phase of the universal enumeration
+    /// (see `universal::WITNESS_PROBE_BUDGET`); concrete solves, seeded
+    /// (assumption) episodes and the scoped-conflict re-solve never arm it.
+    /// `None` when disarmed.
+    witness_probe_deadline: Option<u64>,
+
     /// The propagation cost of the most recent from-scratch solve of the
     /// current universal enumeration (the first cell), used to calibrate
     /// [`Self::prefix_budget_deadline`]. Zero until the first cell is
@@ -724,6 +755,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             assumption_levels: 0,
             propagated_total: 0,
             prefix_budget_deadline: None,
+            witness_probe_deadline: None,
             fresh_solve_cost: 0,
             prefix_spent: 0,
             prefix_cumulative_budget: 0,
@@ -802,6 +834,14 @@ const ENV_ORDERING_COOLDOWN_FACTOR: u64 = 4;
 /// [`PREFIX_BUDGET_FACTOR`] and [`PREFIX_BUDGET_FLOOR`]). `solve_universal`
 /// intercepts it before it can escape to the caller.
 pub(crate) struct PrefixBudgetExhausted;
+
+/// Cancellation sentinel raised by [`Solver::propagate_impl`] when a free
+/// universal enumeration episode exhausts the witness-probe budget (see
+/// [`SolverState::witness_probe_deadline`] and
+/// `universal::WITNESS_PROBE_BUDGET`). `solve_universal`'s enumeration loop
+/// intercepts it before it can escape to the caller and escalates to the
+/// environment-witness search.
+pub(crate) struct WitnessProbeTripped;
 
 /// Base interval, in learnt conflicts, of the Luby restart sequence: the
 /// n-th restart of a `run_sat` call fires after `luby(n) *
@@ -928,6 +968,9 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             universal_passes: 0,
             #[cfg(test)]
             test_prefix_budget_override: None,
+            #[cfg(test)]
+            test_witness_probe_override: None,
+            witness_probe_trips: 0,
         }
     }
 }
@@ -1101,6 +1144,28 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.test_prefix_budget_override = budget;
     }
 
+    /// The number of times the witness probe escalated a free universal
+    /// enumeration episode to the environment-witness search (see
+    /// `universal::WITNESS_PROBE_BUDGET`): the episode exceeded its
+    /// propagation budget and was retracted so the witness search could
+    /// either terminate the enumeration (coverage complete) or point it at
+    /// an uncovered region directly. Zero for concrete solves and for
+    /// universal solves whose free episodes all stay under the budget.
+    pub fn witness_probe_trips(&self) -> u64 {
+        self.witness_probe_trips
+    }
+
+    /// Overrides the witness-probe budget of the free universal enumeration
+    /// phase (see [`Solver::test_witness_probe_override`]). Test-only:
+    /// `Some(Some(0))` trips the probe on the first propagated decision of
+    /// every free episode (driving the witness-guided escalation
+    /// deterministically on tiny universes); `Some(None)` disables the
+    /// probe entirely.
+    #[cfg(test)]
+    pub(crate) fn set_test_witness_probe_override(&mut self, budget: Option<Option<u64>>) {
+        self.test_witness_probe_override = budget;
+    }
+
     /// Set the runtime of the solver to `runtime`.
     #[must_use]
     pub fn with_runtime<RT2: AsyncRuntime>(self, runtime: RT2) -> Solver<D, RT2> {
@@ -1117,6 +1182,9 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             universal_passes: self.universal_passes,
             #[cfg(test)]
             test_prefix_budget_override: self.test_prefix_budget_override,
+            #[cfg(test)]
+            test_witness_probe_override: self.test_witness_probe_override,
+            witness_probe_trips: self.witness_probe_trips,
         }
     }
 
@@ -2566,6 +2634,32 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 }
             }
 
+            // The witness probe of the free universal enumeration phase
+            // (see `universal::WITNESS_PROBE_BUDGET`): a free episode that
+            // has propagated this much without completing is wandering --
+            // on the measured unsolvable tails it is refuting whole
+            // solvable subtrees on its way to a doomed region that only
+            // unit-forced negative env literals reach. Abort the episode so
+            // `enumerate_universal` can consult the coverage witness search
+            // for an uncovered region instead. Armed only by the free phase
+            // of the universal enumeration; concrete solves and seeded
+            // (assumption) episodes never arm it, so their behavior is
+            // untouched.
+            if self
+                .state
+                .witness_probe_deadline
+                .is_some_and(|deadline| self.state.propagated_total > deadline)
+            {
+                prop_hit!(WITNESS_PROBE_TRIP);
+                self.state.witness_probe_deadline = None;
+                self.witness_probe_trips += 1;
+                tracing::debug!(
+                    "The free enumeration episode exceeded the witness-probe budget; \
+                     escalating to the environment-witness search"
+                );
+                return Err(PropagationError::Cancelled(Box::new(WitnessProbeTripped)));
+            }
+
             // Stage 2 of the refutation switch (see
             // `SolverState::env_ordering_work_deadline`): a run that has
             // both conflicted and burnt a real propagation budget since
@@ -3419,6 +3513,13 @@ impl<D: DependencyProvider> SolverState<D> {
     /// budget (see [`Self::prefix_budget_deadline`]).
     pub(crate) fn record_fresh_solve_cost(&mut self) {
         self.fresh_solve_cost = self.propagated_total;
+    }
+
+    /// Arms the free-phase witness probe `budget` propagated decisions ahead
+    /// (see [`Self::witness_probe_deadline`]); `None` disarms it.
+    pub(crate) fn arm_witness_probe(&mut self, budget: Option<u64>) {
+        self.witness_probe_deadline =
+            budget.map(|budget| self.propagated_total.saturating_add(budget));
     }
 
     /// Extends the cumulative kept-prefix work budget after a cell was

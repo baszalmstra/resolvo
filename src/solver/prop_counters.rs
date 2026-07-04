@@ -87,6 +87,21 @@ pub(crate) mod hits {
         /// `propagate`: the kept-prefix work budget was exhausted and the
         /// run aborted with `PrefixBudgetExhausted`.
         PREFIX_BUDGET_ABORT,
+        /// `propagate`: a free universal enumeration episode exceeded the
+        /// witness-probe budget and aborted with `WitnessProbeTripped`.
+        WITNESS_PROBE_TRIP,
+        /// Universal enumeration: a tripped free episode found an uncovered
+        /// environment witness and escalated to a witness-directed
+        /// (assumption) solve of that region.
+        WITNESS_PROBE_ESCALATED,
+        /// Universal enumeration: a tripped free episode found NO witness
+        /// (coverage complete) and terminated the enumeration, replacing
+        /// the remainder of the final refutation.
+        WITNESS_PROBE_COVERAGE_BREAK,
+        /// Universal enumeration: a witness-directed solve proved its
+        /// region unsolvable and ended the whole solve with the verdict
+        /// cell and scoped conflict.
+        WITNESS_PROBE_VERDICT,
         /// Oracle consistency encoding: the relation oracle answered
         /// `VersionSetRelation::Equal` for two distinct version set ids and
         /// both implication clauses were emitted.

@@ -2329,6 +2329,305 @@ fn test_universal_trail_reshape_full_retract() {
     );
 }
 
+/// Builds the provider of the witness-probe scenarios: `top` (one version,
+/// root-required) always needs `a`, needs `b` where `env0 in 6..12` holds
+/// (splitting the coverable space into a with-`b` and a without-`b` cell)
+/// and needs the candidate-less package `doom` where `env0 in 12..20`
+/// holds. The model admits `env0 in 0..model_hi`: with `model_hi = 12` the
+/// oracle proves `env0 in 12..20` impossible (disjoint ranges) and the
+/// whole modeled space is coverable, while `model_hi = 20` admits the doom
+/// corner -- the miniature of the real-world "glibc >= 3.0" corner that
+/// makes tail problems env-dependent-unsat only AFTER solvable cells were
+/// recorded. Returns the provider, the root requirement version set and the
+/// model version set.
+fn build_witness_probe_provider(model_hi: u32) -> (EnvTestProvider, VersionSetId, VersionSetId) {
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let e_model = provider.version_set("env0", 0, model_hi);
+    let e_mid = provider.version_set("env0", 6, 12);
+    let e_doom = provider.version_set("env0", 12, 20);
+    let top = provider.add_package("top", 1);
+    let a1 = provider.add_package("a", 1);
+    let b1 = provider.add_package("b", 1);
+    let a_any = provider.version_set("a", 1, 2);
+    let b_any = provider.version_set("b", 1, 2);
+    // No candidate of "doom" exists; the version set is still interned.
+    let doom_any = provider.version_set("doom", 1, 2);
+    let mid_cond = provider
+        .pool
+        .intern_condition(Condition::Requirement(e_mid));
+    let doom_cond = provider
+        .pool
+        .intern_condition(Condition::Requirement(e_doom));
+    provider.set_dependencies(
+        top,
+        vec![
+            a_any.into(),
+            ConditionalRequirement {
+                condition: Some(mid_cond),
+                requirement: b_any.into(),
+            },
+            ConditionalRequirement {
+                condition: Some(doom_cond),
+                requirement: doom_any.into(),
+            },
+        ],
+        vec![],
+    );
+    provider.set_dependencies(a1, vec![], vec![]);
+    provider.set_dependencies(b1, vec![], vec![]);
+    let top_any = provider.version_set("top", 1, 2);
+    (provider, top_any, e_model)
+}
+
+/// Assembles the [`UniversalProblem`] of the witness-probe scenarios.
+fn witness_probe_problem(
+    top_any: VersionSetId,
+    e_model: VersionSetId,
+    seeds: Vec<CellCondition<NameId>>,
+) -> UniversalProblem {
+    UniversalProblem::new()
+        .requirements(vec![top_any.into()])
+        .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+            SignedEnvLiteral::new(EnvLiteral::Matches(e_model), true),
+        ])]))
+        .seed_partition(seeds)
+}
+
+/// Witness-pinned unsat: with the witness-probe budget forced to zero,
+/// every free episode aborts on its first propagated decision and the
+/// enumeration is driven entirely by witness-directed solves; the doomed
+/// `env0 in 12..20` corner is eventually pinned as assumptions, proven
+/// unsolvable, and the verdict (cell and user-facing conflict) must be
+/// byte-identical to the one exhaustive coverage reports without the probe.
+#[test]
+fn test_universal_witness_probe_pinned_unsat() {
+    use crate::solver::prop_counters::hits;
+    let trips_before = hits::get(&hits::WITNESS_PROBE_TRIP);
+    let verdicts_before = hits::get(&hits::WITNESS_PROBE_VERDICT);
+
+    // The baseline verdict, produced by exhaustive coverage (the production
+    // budget is untrippable on this tiny universe).
+    let (provider, top_any, e_model) = build_witness_probe_provider(20);
+    let mut baseline_solver = Solver::new(provider);
+    let baseline = baseline_solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect_err("the env0 in 12..20 corner requires the candidate-less doom");
+    let UniversalFailure::Unsolvable {
+        cell: baseline_cell,
+        conflict: baseline_conflict,
+    } = baseline
+    else {
+        panic!("expected an unsolvable verdict");
+    };
+    assert_eq!(baseline_solver.witness_probe_trips(), 0);
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(20);
+    let mut solver = Solver::new(provider);
+    solver.set_test_witness_probe_override(Some(Some(0)));
+    let failure = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect_err("the probe must reproduce the unsolvable verdict");
+    let UniversalFailure::Unsolvable { cell, conflict } = failure else {
+        panic!("expected an unsolvable verdict");
+    };
+
+    assert!(
+        hits::get(&hits::WITNESS_PROBE_TRIP) > trips_before,
+        "the zero budget must trip the probe"
+    );
+    assert!(
+        hits::get(&hits::WITNESS_PROBE_VERDICT) > verdicts_before,
+        "the doomed witness region must produce the verdict"
+    );
+    assert!(solver.witness_probe_trips() > 0);
+    assert_eq!(
+        format!("{:?}", cell),
+        format!("{:?}", baseline_cell),
+        "the witness-pinned verdict cell must be byte-identical to exhaustive coverage's"
+    );
+    assert_eq!(
+        conflict.display_user_friendly(&solver).to_string(),
+        baseline_conflict
+            .display_user_friendly(&baseline_solver)
+            .to_string(),
+        "the scoped conflict must be byte-identical to exhaustive coverage's"
+    );
+}
+
+/// Witness-pinned solution: with the budget forced to zero on a SOLVABLE
+/// two-cell universe, every tripped free episode escalates to a
+/// witness-directed solve that records a normal cell, and the enumeration
+/// completes with a verified partition that is a reseed fixed point and is
+/// reproduced byte-identically by an identical run (determinism).
+#[test]
+fn test_universal_witness_probe_pinned_solution() {
+    use crate::solver::prop_counters::hits;
+    let escalated_before = hits::get(&hits::WITNESS_PROBE_ESCALATED);
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut solver = Solver::new(provider);
+    solver.set_test_witness_probe_override(Some(Some(0)));
+    let solution = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("the modeled space is fully coverable");
+
+    assert!(
+        hits::get(&hits::WITNESS_PROBE_ESCALATED) > escalated_before,
+        "tripped episodes must escalate to witness-directed solves"
+    );
+    assert!(solver.witness_probe_trips() > 0);
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert!(
+        solution.cells().len() >= 2,
+        "the conditional b requirement must split the space into at least two cells"
+    );
+
+    // Reseed fixed point across probe escalations (still under the zero
+    // budget): re-solving with the partition's own conditions as seeds
+    // reproduces it byte-identically.
+    let seeds: Vec<CellCondition<NameId>> = solution
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    let reseeded = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, seeds))
+        .expect("the seeded re-solve must complete");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", reseeded.cells()),
+        "the reseed fixed point must hold across probe escalations"
+    );
+
+    // Determinism: the probe deadline is a deterministic propagation
+    // counter, so an identical fresh run reproduces the partition
+    // byte-identically.
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut second = Solver::new(provider);
+    second.set_test_witness_probe_override(Some(Some(0)));
+    let repeat = second
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("the repeated run must complete");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", repeat.cells()),
+        "identical runs under the probe must be byte-identical"
+    );
+}
+
+/// Witness-None break: on the solvable witness-probe universe the free
+/// episode after the last recorded cell is the final refutation of a
+/// successful solve; tripping it must terminate the enumeration through the
+/// witness=None coverage break with the exact partition exhaustive
+/// refutation produces.
+#[test]
+fn test_universal_witness_probe_coverage_break() {
+    use crate::solver::prop_counters::hits;
+    let breaks_before = hits::get(&hits::WITNESS_PROBE_COVERAGE_BREAK);
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut baseline_solver = Solver::new(provider);
+    let baseline = baseline_solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut solver = Solver::new(provider);
+    solver.set_test_witness_probe_override(Some(Some(0)));
+    let solution = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("the probed solve must complete");
+
+    assert!(
+        hits::get(&hits::WITNESS_PROBE_COVERAGE_BREAK) > breaks_before,
+        "the tripped final refutation must terminate through the coverage break"
+    );
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", baseline.cells()),
+        "the coverage break must not change the partition"
+    );
+}
+
+/// The probe must never arm during seeded (assumption) episodes: with the
+/// budget forced to zero, ANY armed episode trips on its first propagated
+/// decision, so a fully seeded re-solve of a two-cell partition must record
+/// exactly ONE trip -- the free episode after the seeds (the final
+/// refutation, which terminates through the witness=None break). A seeded
+/// episode arming the probe would trip additionally and change the count.
+#[test]
+fn test_universal_witness_probe_never_arms_under_assumptions() {
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+    assert_eq!(
+        solver.witness_probe_trips(),
+        0,
+        "the production budget is untrippable on this universe"
+    );
+
+    let seeds: Vec<CellCondition<NameId>> = solution
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect();
+    solver.set_test_witness_probe_override(Some(Some(0)));
+    let reseeded = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, seeds))
+        .expect("the seeded re-solve must complete");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", reseeded.cells()),
+        "the seeded re-solve must reproduce the partition"
+    );
+    assert_eq!(
+        solver.witness_probe_trips(),
+        1,
+        "exactly the one free episode after the seeds may trip"
+    );
+}
+
+/// Disabled-probe byte-identity on a pinned scenario: the armed but
+/// untripped production probe must not change any partition, so a solve
+/// under the default (untrippable here) budget and a solve with the probe
+/// disabled outright must be byte-identical.
+#[test]
+fn test_universal_witness_probe_disabled_byte_identity() {
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut default_solver = Solver::new(provider);
+    let default_solution = default_solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+    assert_eq!(default_solver.witness_probe_trips(), 0);
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut disabled_solver = Solver::new(provider);
+    disabled_solver.set_test_witness_probe_override(Some(None));
+    let disabled_solution = disabled_solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+    assert_eq!(disabled_solver.witness_probe_trips(), 0);
+
+    assert_eq!(
+        format!("{:?}", default_solution.cells()),
+        format!("{:?}", disabled_solution.cells()),
+        "an armed but untripped probe must not change the partition"
+    );
+    // Pin the partition itself so silent drift of the shared scenario is
+    // visible in this test rather than only in the comparisons above.
+    insta::assert_snapshot!(
+        cells_to_string(&default_solver, &default_solution),
+        @r"
+    not (env0 in 6..12) AND not (env0 in 12..20) -> [top=1, a=1]
+    env0 in 6..12 AND not (env0 in 12..20) -> [top=1, a=1, b=1]
+    "
+    );
+}
+
 /// The `VersionSetRelation::Equal` arm of the oracle-consistency encoding is
 /// structurally unreachable through plain ranges (the pool dedups equal
 /// ranges to one version set id), so this test interns an ALIASED copy of
