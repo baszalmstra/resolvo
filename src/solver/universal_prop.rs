@@ -2563,18 +2563,24 @@ fn test_universal_witness_probe_pinned_solution() {
     );
 }
 
-/// Witness-None break: on the solvable witness-probe universe the free
-/// episode after the last recorded cell is the final refutation of a
-/// successful solve; tripping it must terminate the enumeration through the
-/// witness=None coverage break with the exact partition exhaustive
-/// refutation produces.
+/// Coverage-precheck break: on the solvable witness-probe universe the
+/// free episode after the last recorded cell is the final refutation of a
+/// successful solve. With the coverage precheck active (the default) that
+/// episode never starts: the precheck proves the environment formula
+/// unsatisfiable first, even when the probe budget is forced to zero (the
+/// probe cannot trip an episode that never runs), and the partition is
+/// exactly the one exhaustive refutation produces.
 #[test]
 fn test_universal_witness_probe_coverage_break() {
     use crate::solver::prop_counters::hits;
-    let breaks_before = hits::get(&hits::WITNESS_PROBE_COVERAGE_BREAK);
+    let precheck_breaks_before = hits::get(&hits::COVERAGE_PRECHECK_BREAK);
 
     let (provider, top_any, e_model) = build_witness_probe_provider(12);
     let mut baseline_solver = Solver::new(provider);
+    // The baseline partition, produced with the precheck disabled: the
+    // pre-precheck termination path (the exhaustive terminal refutation of
+    // the free phase).
+    baseline_solver.set_test_coverage_precheck_disabled(true);
     let baseline = baseline_solver
         .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
         .expect("solvable");
@@ -2582,6 +2588,46 @@ fn test_universal_witness_probe_coverage_break() {
     let (provider, top_any, e_model) = build_witness_probe_provider(12);
     let mut solver = Solver::new(provider);
     solver.set_test_witness_probe_override(Some(Some(0)));
+    let solution = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("the probed solve must complete");
+
+    assert!(
+        hits::get(&hits::COVERAGE_PRECHECK_BREAK) > precheck_breaks_before,
+        "the static scenario must terminate through the coverage precheck"
+    );
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", baseline.cells()),
+        "the coverage-precheck break must not change the partition"
+    );
+}
+
+/// Witness-None break of the probe itself, preserved behind the
+/// precheck-disable test path: with the precheck off and the budget forced
+/// to zero, the tripped final refutation must terminate the enumeration
+/// through the probe's own witness=None coverage break with the exact
+/// partition exhaustive refutation produces. (With the precheck on, a
+/// static formula never reaches this branch; it stays reachable in
+/// production only when lazy encoding grows the formula between the
+/// precheck and the trip.)
+#[test]
+fn test_universal_witness_probe_coverage_break_precheck_disabled() {
+    use crate::solver::prop_counters::hits;
+    let breaks_before = hits::get(&hits::WITNESS_PROBE_COVERAGE_BREAK);
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut baseline_solver = Solver::new(provider);
+    baseline_solver.set_test_coverage_precheck_disabled(true);
+    let baseline = baseline_solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut solver = Solver::new(provider);
+    solver.set_test_witness_probe_override(Some(Some(0)));
+    solver.set_test_coverage_precheck_disabled(true);
     let solution = solver
         .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
         .expect("the probed solve must complete");
@@ -2598,16 +2644,66 @@ fn test_universal_witness_probe_coverage_break() {
     );
 }
 
+/// Coverage-precheck termination under production budgets: a plain
+/// coverage-complete solve (no overrides) must skip the terminal free
+/// `run_sat` refutation, terminating through the precheck with a partition
+/// byte-identical to the precheck-disabled run, and repeated identical runs
+/// stay deterministic.
+#[test]
+fn test_universal_coverage_precheck_break() {
+    use crate::solver::prop_counters::hits;
+    let precheck_breaks_before = hits::get(&hits::COVERAGE_PRECHECK_BREAK);
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+
+    assert!(
+        hits::get(&hits::COVERAGE_PRECHECK_BREAK) > precheck_breaks_before,
+        "a coverage-complete solve must terminate through the precheck"
+    );
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut disabled_solver = Solver::new(provider);
+    disabled_solver.set_test_coverage_precheck_disabled(true);
+    let disabled = disabled_solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", disabled.cells()),
+        "the precheck must not change the partition"
+    );
+
+    let (provider, top_any, e_model) = build_witness_probe_provider(12);
+    let mut repeat_solver = Solver::new(provider);
+    let repeat = repeat_solver
+        .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
+        .expect("solvable");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", repeat.cells()),
+        "identical precheck-terminated runs must be byte-identical"
+    );
+}
+
 /// The probe must never arm during seeded (assumption) episodes: with the
 /// budget forced to zero, ANY armed episode trips on its first propagated
 /// decision, so a fully seeded re-solve of a two-cell partition must record
 /// exactly ONE trip -- the free episode after the seeds (the final
 /// refutation, which terminates through the witness=None break). A seeded
 /// episode arming the probe would trip additionally and change the count.
+/// The coverage precheck is disabled so that the final free episode
+/// actually runs (and trips): the zero budget must still prove seeded
+/// episodes do not arm the probe.
 #[test]
 fn test_universal_witness_probe_never_arms_under_assumptions() {
     let (provider, top_any, e_model) = build_witness_probe_provider(12);
     let mut solver = Solver::new(provider);
+    solver.set_test_coverage_precheck_disabled(true);
     let solution = solver
         .solve_universal(witness_probe_problem(top_any, e_model, Vec::new()))
         .expect("solvable");

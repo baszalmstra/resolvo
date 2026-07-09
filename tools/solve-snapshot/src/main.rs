@@ -892,6 +892,28 @@ fn main() {
                 let result = solver.solve_universal(problem);
                 record.duration = start.elapsed().as_secs_f64();
                 record.fetches = Some(solver.provider_fetch_count());
+                // Coverage-precheck observability (one parseable line per
+                // problem): precheck calls/breaks (each break is one avoided
+                // final `run_sat` refutation), assembled formula sizes, and
+                // build/search cost, plus the solve's conflict count for
+                // A/B comparisons against precheck-less builds.
+                #[cfg(feature = "diagnostics")]
+                {
+                    let stats = solver.coverage_precheck_stats();
+                    eprintln!(
+                        "PRECHECK index={} calls={} breaks={} avoided_run_sat={} clauses={} \
+                         literals={} build_s={:.6} search_s={:.6} conflicts={}",
+                        i,
+                        stats.calls,
+                        stats.breaks,
+                        stats.avoided_run_sat_calls(),
+                        stats.clauses_assembled,
+                        stats.literals_assembled,
+                        stats.build_duration.as_secs_f64(),
+                        stats.search_duration.as_secs_f64(),
+                        solver.conflict_count(),
+                    );
+                }
                 match result {
                     Ok(solution) => {
                         let distinct: HashSet<_> = solution

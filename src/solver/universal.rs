@@ -1550,6 +1550,32 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 seeded = self.push_seed_assumptions(&seed)?;
             }
 
+            // Coverage precheck before a normal free episode: when the
+            // environment-only clauses (model, oracle, blocking) admit no
+            // assignment, the recorded cells already cover the entire model
+            // and the free solve below could only confirm that through a
+            // full (and potentially expensive) unsatisfiability proof over
+            // the whole formula. Growing the clause set never turns an
+            // unsatisfiable environment formula satisfiable, so a negative
+            // existence answer is final; a positive answer only says work
+            // remains (lazy encoding may not yet have interned every
+            // environment literal or oracle clause), which is why the
+            // post-`run_sat` witness checks below stay. The exclusions are
+            // load-bearing: caller seeds replay in caller order and are
+            // never prechecked away (`seeded`), a non-empty probe witness
+            // is already a seeded episode, and an empty probe witness
+            // (`active_witness` set without assumptions) must run once as
+            // the free episode the probe selected instead of immediately
+            // repeating the witness query that produced it.
+            if !seeded
+                && active_witness.is_none()
+                && self.coverage_precheck_enabled()
+                && !self.has_environment_witness()
+            {
+                prop_hit!(COVERAGE_PRECHECK_BREAK);
+                break;
+            }
+
             // Arm the witness probe for a free episode (see
             // `WITNESS_PROBE_BUDGET`). Seeded and witness-directed episodes
             // never arm it: they are the probe's own escape hatch and must
@@ -2944,27 +2970,146 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// allocation) instead of a fresh `Vec<Vec<Literal>>` per call; at a few
     /// hundred cells that construction used to dominate the check.
     fn find_environment_witness(&mut self) -> Option<Vec<(VariableId, bool)>> {
+        self.rebuild_witness_scratch();
+        self.witness_scratch.find_witness()
+    }
+
+    /// Whether any environment assignment satisfies all environment-only
+    /// clauses: the existence-only variant of
+    /// [`Self::find_environment_witness`], running just the
+    /// most-constrained-first refutation search without the canonical
+    /// second pass. The coverage precheck before each free enumeration
+    /// episode needs only this boolean; every witness-producing caller
+    /// (probe escalation, terminal failures, conflict scoping) keeps the
+    /// canonical API.
+    ///
+    /// A `false` answer proves the recorded cells cover the entire
+    /// environment model. Mutates no solver state beyond the scratch
+    /// buffers and the (diagnostics-only, purely observational) precheck
+    /// statistics; policy never depends on the recorded wall times.
+    fn has_environment_witness(&mut self) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let build_start = std::time::Instant::now();
+        self.rebuild_witness_scratch();
+        #[cfg(feature = "diagnostics")]
+        {
+            self.coverage_precheck.calls += 1;
+            self.coverage_precheck.build_duration += build_start.elapsed();
+            self.coverage_precheck.clauses_assembled += self.witness_scratch.clause_count() as u64;
+            self.coverage_precheck.literals_assembled +=
+                self.witness_scratch.literal_count() as u64;
+        }
+        #[cfg(feature = "diagnostics")]
+        let search_start = std::time::Instant::now();
+        let witness_exists = self.witness_scratch.has_witness();
+        #[cfg(feature = "diagnostics")]
+        {
+            self.coverage_precheck.search_duration += search_start.elapsed();
+            if !witness_exists {
+                self.coverage_precheck.breaks += 1;
+            }
+        }
+        witness_exists
+    }
+
+    /// Whether the coverage precheck runs before normal free enumeration
+    /// episodes. Always true in production; tests can switch it off (see
+    /// `Solver::set_test_coverage_precheck_disabled`) to exercise the
+    /// termination paths the precheck supersedes on static formulas.
+    fn coverage_precheck_enabled(&self) -> bool {
+        #[cfg(test)]
+        if self.test_coverage_precheck_disabled {
+            return false;
+        }
+        true
+    }
+
+    /// Rebuilds [`Self::witness_scratch`] with the environment-only formula:
+    /// exactly the [`Clause::EnvOracleConsistency`] (relations between env
+    /// literals) and [`Clause::EnvClause`] (model and blocking) clauses, in
+    /// clause-database order. Everything else constrains which SOLVABLES are
+    /// valid GIVEN an environment, not which environments exist, so it must
+    /// NOT enter the environment-space witness search (design 5.5):
+    /// `EnvConstrains` and env-conditioned `Requires` are gated on a
+    /// solvable being installed, so including them could make a coverable
+    /// region look uncoverable.
+    ///
+    /// The formula is assembled from the two dedicated clause-id indices
+    /// (`env_oracle_clause_ids` and `env_clause_ids`) instead of a scan over
+    /// the whole clause database, so rebuilding is cheap enough to run once
+    /// per enumeration round. Both lists are append-only and ascending by
+    /// construction, so a merge by clause id reproduces the database order
+    /// exactly; the witness search derives its dense variable numbering (and
+    /// with it unit-propagation visit order and the canonical witness) from
+    /// clause order, so the order must not change.
+    fn rebuild_witness_scratch(&mut self) {
         let scratch = &mut self.witness_scratch;
         scratch.clear();
-        for kind in &self.state.clauses.kinds {
-            match *kind {
-                // The only clauses that constrain the environment space
-                // itself: oracle consistency (relations between env literals)
-                // and the model/blocking clauses.
+        let oracle_ids = &self.state.env_oracle_clause_ids;
+        let env_ids = &self.state.env_clause_ids;
+        #[cfg(debug_assertions)]
+        let mut merged_ids: Vec<ClauseId> = Vec::with_capacity(oracle_ids.len() + env_ids.len());
+        let (mut oracle_index, mut env_index) = (0, 0);
+        while oracle_index < oracle_ids.len() || env_index < env_ids.len() {
+            let take_oracle = match (oracle_ids.get(oracle_index), env_ids.get(env_index)) {
+                (Some(oracle), Some(env)) => {
+                    debug_assert_ne!(
+                        oracle.to_index(),
+                        env.to_index(),
+                        "a clause id is either an oracle clause or an env clause, never both"
+                    );
+                    oracle.to_index() < env.to_index()
+                }
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            let clause_id = if take_oracle {
+                oracle_index += 1;
+                oracle_ids[oracle_index - 1]
+            } else {
+                env_index += 1;
+                env_ids[env_index - 1]
+            };
+            match self.state.clauses.kinds[clause_id.to_index()] {
                 Clause::EnvOracleConsistency(lit_a, lit_b) => {
                     scratch.push_clause(&[lit_a, lit_b]);
                 }
                 Clause::EnvClause(env_clause_id) => {
                     scratch.push_clause(&self.state.env_clauses[env_clause_id].literals);
                 }
-                // Everything else constrains which SOLVABLES are valid GIVEN
-                // an environment, not which environments exist, so it must NOT
-                // enter the environment-space witness search (design 5.5):
-                // `EnvConstrains` and env-conditioned `Requires` are gated on a
-                // solvable being installed, so including them could make a
-                // coverable region look uncoverable. This arm is intentionally
-                // exhaustive (no `_`): a new clause kind that genuinely bounds
-                // the environment space must be added above deliberately.
+                _ => unreachable!("the environment clause indices only hold environment clauses"),
+            }
+            #[cfg(debug_assertions)]
+            merged_ids.push(clause_id);
+        }
+        // The indexed assembly must select exactly the clauses (in exactly
+        // the order) the previous exhaustive clause-database scan selected.
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            merged_ids,
+            self.exhaustive_environment_clause_ids(),
+            "the merged environment-clause indices must reproduce the \
+             exhaustive clause-database scan"
+        );
+    }
+
+    /// The clause ids an exhaustive scan over the whole clause database
+    /// selects for the environment witness formula, in database order: the
+    /// reference sequence [`Self::rebuild_witness_scratch`] must reproduce
+    /// from the dedicated indices. Debug/test only.
+    ///
+    /// This arm is intentionally exhaustive (no `_`): a new clause kind that
+    /// genuinely bounds the environment space must be added both here and to
+    /// a dedicated index deliberately.
+    #[cfg(any(debug_assertions, test))]
+    fn exhaustive_environment_clause_ids(&self) -> Vec<ClauseId> {
+        self.state
+            .clauses
+            .kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| match kind {
+                Clause::EnvOracleConsistency(..) | Clause::EnvClause(..) => true,
                 Clause::InstallRoot
                 | Clause::Requires(..)
                 | Clause::Constrains(..)
@@ -2975,10 +3120,10 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 | Clause::Learnt(..)
                 | Clause::Excluded(..)
                 | Clause::AnyOf(..)
-                | Clause::EnvConstrains(..) => {}
-            }
-        }
-        scratch.find_witness()
+                | Clause::EnvConstrains(..) => false,
+            })
+            .map(|(index, _)| ClauseId::from_index(index))
+            .collect()
     }
 }
 
@@ -3192,6 +3337,18 @@ impl WitnessScratch {
         self.clause_ends.clear();
     }
 
+    /// The number of clauses currently pushed (diagnostics only).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn clause_count(&self) -> usize {
+        self.clause_ends.len()
+    }
+
+    /// The number of literals currently pushed (diagnostics only).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn literal_count(&self) -> usize {
+        self.literals.len()
+    }
+
     /// Appends one clause to the formula.
     fn push_clause(&mut self, literals: &[Literal]) {
         self.literals.extend(
@@ -3214,6 +3371,39 @@ impl WitnessScratch {
     /// search's variable visit order, and with it the canonical
     /// lexicographically-smallest witness, is unchanged.
     fn find_witness(&mut self) -> Option<Vec<(VariableId, bool)>> {
+        self.remap();
+        let assignment = find_witness_indexed(
+            self.variables.len(),
+            IndexedClauses {
+                literals: &self.literals,
+                clause_ends: &self.clause_ends,
+            },
+        )?;
+        Some(self.variables.iter().copied().zip(assignment).collect())
+    }
+
+    /// Whether any assignment of solver variables satisfies all pushed
+    /// clauses: the existence-only variant of [`Self::find_witness`],
+    /// running just the most-constrained-first search (see
+    /// [`witness_exists_indexed`]) without the canonical second pass.
+    fn has_witness(&mut self) -> bool {
+        self.remap();
+        witness_exists_indexed(
+            self.variables.len(),
+            IndexedClauses {
+                literals: &self.literals,
+                clause_ends: &self.clause_ends,
+            },
+        )
+    }
+
+    /// Rewrites the raw [`VariableId::to_index`] indices recorded by
+    /// [`Self::push_clause`] into dense witness indices, in place. Must run
+    /// exactly once per rebuild, between the last `push_clause` and the
+    /// search; a second remap would misread the already-dense indices as
+    /// raw ones, which is why every query rebuilds the scratch from
+    /// `clear()`.
+    fn remap(&mut self) {
         self.variable_index.clear();
         self.variables.clear();
         if let Some(max_index) = self.literals.iter().map(|&(index, _)| index).max() {
@@ -3234,15 +3424,6 @@ impl WitnessScratch {
                 literal.0 = self.variable_index[literal.0] as usize - 1;
             }
         }
-
-        let assignment = find_witness_indexed(
-            self.variables.len(),
-            IndexedClauses {
-                literals: &self.literals,
-                clause_ends: &self.clause_ends,
-            },
-        )?;
-        Some(self.variables.iter().copied().zip(assignment).collect())
     }
 }
 
@@ -3256,12 +3437,17 @@ impl WitnessScratch {
 /// search with clause-violation pruning is sufficient; the main CDCL
 /// machinery is deliberately not reused here (design doc 5.5).
 ///
-/// Variables are assigned in ascending index order and `false` is tried
-/// first, matching the split policy (environment literals default to false),
-/// so the witness stays as close to the baseline machine as possible and the
-/// search is deterministic. Returns one value per variable index, or `None`
-/// when no assignment satisfies all clauses.
-fn find_witness_indexed(variable_count: usize, clauses: IndexedClauses<'_>) -> Option<Vec<bool>> {
+/// Whether any assignment satisfies all the given clauses: the
+/// existence-only half of [`find_witness_indexed`].
+///
+/// Runs a single search with a most-constrained-first decision order (most
+/// clause occurrences first, index as tie break). The refutation result is
+/// order independent, and deciding frequently-occurring variables first
+/// prunes the hundreds of accumulated blocking clauses orders of magnitude
+/// faster than ascending index order. A `true` answer says nothing about
+/// the canonical witness; callers that report a witness must go through
+/// [`find_witness_indexed`].
+fn witness_exists_indexed(variable_count: usize, clauses: IndexedClauses<'_>) -> bool {
     debug_assert!(
         clauses
             .literals
@@ -3270,13 +3456,6 @@ fn find_witness_indexed(variable_count: usize, clauses: IndexedClauses<'_>) -> O
         "every clause literal must reference a variable below `variable_count`"
     );
 
-    // First decide satisfiability with a most-constrained-first decision
-    // order (most clause occurrences first, index as tie break). The
-    // refutation case is the common one (every successful universal solve
-    // ends with exactly one refuted witness search proving coverage), its
-    // result is order independent, and deciding frequently-occurring
-    // variables first prunes the hundreds of accumulated blocking clauses
-    // orders of magnitude faster than ascending index order.
     let mut occurrences = vec![0usize; variable_count];
     for &(index, _) in clauses.literals {
         occurrences[index] += 1;
@@ -3285,7 +3464,20 @@ fn find_witness_indexed(variable_count: usize, clauses: IndexedClauses<'_>) -> O
     order.sort_by_key(|&index| (std::cmp::Reverse(occurrences[index]), index));
 
     let mut assignment: Vec<Option<bool>> = vec![None; variable_count];
-    if !search_indexed(clauses, &mut assignment, &order) {
+    search_indexed(clauses, &mut assignment, &order)
+}
+
+/// Variables are assigned in ascending index order and `false` is tried
+/// first, matching the split policy (environment literals default to false),
+/// so the witness stays as close to the baseline machine as possible and the
+/// search is deterministic. Returns one value per variable index, or `None`
+/// when no assignment satisfies all clauses.
+fn find_witness_indexed(variable_count: usize, clauses: IndexedClauses<'_>) -> Option<Vec<bool>> {
+    // First decide satisfiability (see `witness_exists_indexed`); the
+    // refutation case is the common one (every successful universal solve
+    // ends with exactly one refuted witness search proving coverage) and
+    // its result is order independent.
+    if !witness_exists_indexed(variable_count, clauses) {
         return None;
     }
 
@@ -3990,5 +4182,136 @@ mod test {
             find_witness_indexed_nested(3, &clauses),
             Some(vec![true, false, false])
         );
+    }
+
+    /// The existence-only search agrees with the witness-producing search
+    /// on satisfiable and unsatisfiable formulas alike (the canonical
+    /// second pass may only change WHICH witness is produced, never
+    /// whether one exists).
+    #[test]
+    fn test_has_witness_matches_find_witness() {
+        let formulas: Vec<Vec<Vec<Literal>>> = vec![
+            // Satisfiable: no clauses.
+            vec![],
+            // Satisfiable: (x1 or x2) and (not x1).
+            vec![
+                vec![literal(1, false), literal(2, false)],
+                vec![literal(1, true)],
+            ],
+            // Unsatisfiable: (x1) and (not x1).
+            vec![vec![literal(1, false)], vec![literal(1, true)]],
+            // Unsatisfiable: all four sign combinations of two variables.
+            vec![
+                vec![literal(1, false), literal(2, false)],
+                vec![literal(1, true), literal(2, false)],
+                vec![literal(1, false), literal(2, true)],
+                vec![literal(1, true), literal(2, true)],
+            ],
+            // Satisfiable: unit-propagation chain (x0 or x1), (not x1 or
+            // x2), (not x2 or not x1).
+            vec![
+                vec![literal(0, false), literal(1, false)],
+                vec![literal(1, true), literal(2, false)],
+                vec![literal(2, true), literal(1, true)],
+            ],
+        ];
+        for clauses in formulas {
+            let mut find_scratch = WitnessScratch::default();
+            let mut exists_scratch = WitnessScratch::default();
+            for clause in &clauses {
+                find_scratch.push_clause(clause);
+                exists_scratch.push_clause(clause);
+            }
+            assert_eq!(
+                exists_scratch.has_witness(),
+                find_scratch.find_witness().is_some(),
+                "has_witness must agree with find_witness on {clauses:?}"
+            );
+        }
+    }
+
+    /// Repeated rebuilds of one scratch retain no stale clauses, variable
+    /// mappings or dense indices: after `clear()` the next query answers
+    /// exactly as a fresh scratch would, including flipping between
+    /// unsatisfiable and satisfiable formulas over different variables.
+    #[test]
+    fn test_witness_scratch_reuse_retains_no_stale_state() {
+        let mut scratch = WitnessScratch::default();
+        scratch.push_clause(&[literal(1, false)]);
+        scratch.push_clause(&[literal(1, true)]);
+        assert_eq!(scratch.find_witness(), None);
+
+        // A different formula over different variables on the same scratch:
+        // the dense remap must start from the raw indices again.
+        scratch.clear();
+        scratch.push_clause(&[literal(3, false), literal(5, false)]);
+        scratch.push_clause(&[literal(3, true)]);
+        assert_eq!(
+            scratch.find_witness(),
+            Some(vec![
+                (VariableId::from_index(3), false),
+                (VariableId::from_index(5), true),
+            ])
+        );
+
+        // The existence-only query also rebuilds from scratch.
+        scratch.clear();
+        scratch.push_clause(&[literal(2, false)]);
+        assert!(scratch.has_witness());
+        scratch.clear();
+        scratch.push_clause(&[literal(2, false)]);
+        scratch.push_clause(&[literal(2, true)]);
+        assert!(!scratch.has_witness());
+    }
+
+    /// The dedicated environment-clause indices must select exactly the
+    /// clauses (in exactly the order) an exhaustive scan over the whole
+    /// clause database selects, on a solve whose database interleaves
+    /// ordinary (install-root, requires, forbid), oracle-consistency, model
+    /// and blocking clauses.
+    #[test]
+    fn test_environment_clause_index_matches_exhaustive_scan() {
+        let mut provider = EnvTestProvider::default();
+        provider.add_env_package("glibc", false);
+        let glibc_217 = provider.version_set("glibc", 217, 1000);
+        let glibc_228 = provider.version_set("glibc", 228, 1000);
+        let pkg_2 = provider.add_package("pkg", 2);
+        let pkg_1 = provider.add_package("pkg", 1);
+        provider.set_dependencies(pkg_2, vec![glibc_228.into()], vec![]);
+        provider.set_dependencies(pkg_1, vec![glibc_217.into()], vec![]);
+        let pkg_any = provider.version_set("pkg", 0, 3);
+
+        let mut solver = Solver::new(provider);
+        let problem = UniversalProblem::new()
+            .requirements(vec![pkg_any.into()])
+            .environment_model(EnvironmentModel::new(vec![EnvClause::new(vec![
+                SignedEnvLiteral::new(EnvLiteral::Matches(glibc_217), true),
+            ])]));
+        solver.solve_universal(problem).expect("solvable");
+
+        let oracle_ids = &solver.state.env_oracle_clause_ids;
+        let env_ids = &solver.state.env_clause_ids;
+        assert!(
+            !oracle_ids.is_empty(),
+            "two version sets of one environment package must emit oracle clauses"
+        );
+        assert!(
+            !env_ids.is_empty(),
+            "the model and blocking clauses must be indexed"
+        );
+        let mut merged: Vec<ClauseId> = oracle_ids
+            .iter()
+            .chain(env_ids.iter())
+            .copied()
+            .collect();
+        merged.sort_by_key(|id| id.to_index());
+        assert_eq!(
+            merged,
+            solver.exhaustive_environment_clause_ids(),
+            "the merged indices must reproduce the exhaustive clause-database scan"
+        );
+        // The database interleaves environment and ordinary clauses: the
+        // selection must be a strict subset of the database.
+        assert!(merged.len() < solver.state.clauses.kinds.len());
     }
 }

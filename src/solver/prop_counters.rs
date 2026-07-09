@@ -102,6 +102,11 @@ pub(crate) mod hits {
         /// region unsolvable and ended the whole solve with the verdict
         /// cell and scoped conflict.
         WITNESS_PROBE_VERDICT,
+        /// Universal enumeration: the coverage precheck before a normal
+        /// free episode proved the environment formula unsatisfiable
+        /// (coverage complete) and terminated the enumeration without
+        /// running the final whole-formula refutation.
+        COVERAGE_PRECHECK_BREAK,
         /// Oracle consistency encoding: the relation oracle answered
         /// `VersionSetRelation::Equal` for two distinct version set ids and
         /// both implication clauses were emitted.

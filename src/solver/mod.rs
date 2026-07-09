@@ -267,6 +267,23 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     #[cfg(test)]
     test_witness_probe_override: Option<Option<u64>>,
 
+    /// Test-only switch disabling the coverage precheck of free universal
+    /// enumeration episodes (see `enumerate_universal`). The precheck is
+    /// always on in production; disabling it lets tests exercise the paths
+    /// it supersedes on static formulas — the witness probe's own
+    /// coverage-break (`find_environment_witness() == None` after a trip)
+    /// and the terminal free refutation — and prove byte-identity of the
+    /// resulting partitions.
+    #[cfg(test)]
+    test_coverage_precheck_disabled: bool,
+
+    /// Diagnostics of the coverage precheck: calls, coverage-complete
+    /// breaks, assembled formula sizes and build/search durations. Lives on
+    /// the solver, not on [`SolverState`], because the state is reset per
+    /// enumeration pass. Purely observational; policy never reads it.
+    #[cfg(feature = "diagnostics")]
+    coverage_precheck: CoveragePrecheckStats,
+
     /// The number of times the witness probe escalated a free universal
     /// enumeration episode to the environment-witness search (see
     /// [`Solver::witness_probe_trips`]). Lives on the solver, not on
@@ -353,6 +370,13 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// `unit_learnt_clause_ids`, except env clauses are few enough that the
     /// multi-literal ones are filtered during the scan).
     env_clause_ids: Vec<ClauseId>,
+
+    /// The clause ids of all `Clause::EnvOracleConsistency` clauses, in
+    /// allocation order. Used to assemble the environment witness formula
+    /// (together with `env_clause_ids`, merged by ascending clause id)
+    /// without scanning the complete clause database; see
+    /// `Solver::rebuild_witness_scratch`.
+    env_oracle_clause_ids: Vec<ClauseId>,
 
     /// The subset of `env_clauses` that are blocking clauses, iterated in
     /// `decide()` to make sure every solution's undecided-counts-as-false
@@ -719,6 +743,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_constrains: Default::default(),
             env_clauses: Default::default(),
             env_clause_ids: Default::default(),
+            env_oracle_clause_ids: Default::default(),
             blocking_clauses: Default::default(),
             env_support_clauses: Default::default(),
             cell_capture_index: Default::default(),
@@ -869,6 +894,40 @@ fn luby(mut x: u64) -> u64 {
     1u64 << seq
 }
 
+/// Diagnostics of the universal coverage precheck (see
+/// `enumerate_universal`): how often the environment witness search ran
+/// before a free episode, how often it proved coverage complete (each break
+/// avoids exactly one final whole-formula `run_sat` refutation), the sizes
+/// of the assembled environment formulas, and the time spent assembling
+/// versus searching. Accumulates across enumeration passes and reseed
+/// rounds of one solver. Purely observational; policy never reads it.
+#[cfg(feature = "diagnostics")]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct CoveragePrecheckStats {
+    /// Prechecks run (one per normal free episode).
+    pub calls: u64,
+    /// Prechecks that proved coverage complete and broke the enumeration;
+    /// equals the number of avoided final `run_sat` refutations.
+    pub breaks: u64,
+    /// Environment clauses assembled across all prechecks.
+    pub clauses_assembled: u64,
+    /// Environment literals assembled across all prechecks.
+    pub literals_assembled: u64,
+    /// Time spent rebuilding the witness scratch formula.
+    pub build_duration: std::time::Duration,
+    /// Time spent in the existence search itself.
+    pub search_duration: std::time::Duration,
+}
+
+#[cfg(feature = "diagnostics")]
+impl CoveragePrecheckStats {
+    /// The `run_sat` calls the precheck avoided: every coverage-complete
+    /// break replaces exactly one final whole-formula refutation.
+    pub fn avoided_run_sat_calls(&self) -> u64 {
+        self.breaks
+    }
+}
+
 /// Counters that track propagation loop behavior for performance analysis.
 #[cfg(feature = "diagnostics")]
 #[derive(Default)]
@@ -970,6 +1029,10 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             test_prefix_budget_override: None,
             #[cfg(test)]
             test_witness_probe_override: None,
+            #[cfg(test)]
+            test_coverage_precheck_disabled: false,
+            #[cfg(feature = "diagnostics")]
+            coverage_precheck: CoveragePrecheckStats::default(),
             witness_probe_trips: 0,
         }
     }
@@ -1166,6 +1229,24 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.test_witness_probe_override = budget;
     }
 
+    /// Disables (or re-enables) the coverage precheck of free universal
+    /// enumeration episodes (see [`Solver::test_coverage_precheck_disabled`]).
+    /// Test-only: disabling restores the pre-precheck termination paths (the
+    /// terminal free refutation and the witness probe's coverage break) so
+    /// they stay covered and comparable.
+    #[cfg(test)]
+    pub(crate) fn set_test_coverage_precheck_disabled(&mut self, disabled: bool) {
+        self.test_coverage_precheck_disabled = disabled;
+    }
+
+    /// Diagnostics of the universal coverage precheck (see
+    /// [`CoveragePrecheckStats`]). Accumulates across enumeration passes and
+    /// reseed rounds of this solver.
+    #[cfg(feature = "diagnostics")]
+    pub fn coverage_precheck_stats(&self) -> CoveragePrecheckStats {
+        self.coverage_precheck
+    }
+
     /// Set the runtime of the solver to `runtime`.
     #[must_use]
     pub fn with_runtime<RT2: AsyncRuntime>(self, runtime: RT2) -> Solver<D, RT2> {
@@ -1184,6 +1265,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             test_prefix_budget_override: self.test_prefix_budget_override,
             #[cfg(test)]
             test_witness_probe_override: self.test_witness_probe_override,
+            #[cfg(test)]
+            test_coverage_precheck_disabled: self.test_coverage_precheck_disabled,
+            #[cfg(feature = "diagnostics")]
+            coverage_precheck: self.coverage_precheck,
             witness_probe_trips: self.witness_probe_trips,
         }
     }
@@ -3498,7 +3583,15 @@ impl<D: DependencyProvider> SolverState<D> {
         watched_literals: Option<WatchedLiterals>,
         kind: Clause<D::NameId>,
     ) -> ClauseId {
+        let is_oracle_clause = matches!(kind, Clause::EnvOracleConsistency(..));
         let clause_id = self.clauses.alloc(watched_literals, kind);
+        // Index oracle consistency clauses so the environment witness search
+        // can assemble the environment-only clause set without scanning the
+        // whole clause database. Appended before the unwatched early return
+        // below so the index stays complete for assertion-only clauses.
+        if is_oracle_clause {
+            self.env_oracle_clause_ids.push(clause_id);
+        }
         let Some(wl) = self.clauses.watched_literals[clause_id.to_index()].as_mut() else {
             return clause_id;
         };

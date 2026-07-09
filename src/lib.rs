@@ -58,7 +58,7 @@ pub use solver::{
     UnsolvableOrCancelled, Violation,
 };
 #[cfg(feature = "diagnostics")]
-pub use solver::{CellPinCounts, CellRetract};
+pub use solver::{CellPinCounts, CellRetract, CoveragePrecheckStats};
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
 
