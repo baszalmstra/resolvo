@@ -113,6 +113,21 @@ pub(crate) mod hits {
         /// Seeded `solve_universal`: the reseed iteration closed an orbit (an
         /// output equal to an earlier input) without finding a fixed point.
         RESEED_ORBIT_CLOSED,
+        /// `propagate`: the fallback-replay deadline was exhausted and the
+        /// bounded internal seed replay aborted with
+        /// `FallbackReplayBudgetExhausted`.
+        FALLBACK_REPLAY_ABORT,
+        /// `solve_universal`: a bounded internal replay was abandoned by its
+        /// actual-work deadline and the enumeration restarted from the
+        /// historical baseline (attempt 3).
+        UNIVERSAL_REPLAY_ABANDONED,
+        /// `solve_universal`: the replay-prefix selection truncated the
+        /// abandoned attempt's recorded cells (either cap).
+        UNIVERSAL_REPLAY_TRUNCATED,
+        /// `solve_universal`: the replay-prefix selection selected no cell at
+        /// all and the fallback retried directly with the original caller
+        /// seed partition.
+        UNIVERSAL_REPLAY_EMPTY_SELECTION,
     }
 
     /// Formats the dashboard: one `name = value` line per counter.

@@ -82,6 +82,11 @@ pub(crate) struct EnvTestProvider {
     /// Solvables whose [`Self::get_dependencies`] answer is
     /// [`Dependencies::Unknown`].
     unknown_deps: HashMap<SolvableId, StringId>,
+    /// When set, [`DependencyProvider::should_cancel_with_value`] returns a
+    /// cancellation value after this many calls (a countdown; `Some(0)`
+    /// cancels the first check). Lets tests verify that real provider
+    /// cancellations pass through the internal budget sentinels untouched.
+    cancel_after: std::cell::Cell<Option<u64>>,
 }
 
 impl EnvTestProvider {
@@ -164,6 +169,12 @@ impl EnvTestProvider {
         let reason = self.pool.intern_string(reason);
         self.unknown_deps.insert(solvable, reason);
     }
+
+    /// Makes [`DependencyProvider::should_cancel_with_value`] cancel the
+    /// solve after `calls` checks (see [`Self::cancel_after`]).
+    pub fn set_cancel_after(&mut self, calls: u64) {
+        self.cancel_after.set(Some(calls));
+    }
 }
 
 impl Interner for EnvTestProvider {
@@ -212,6 +223,15 @@ impl Interner for EnvTestProvider {
 }
 
 impl DependencyProvider for EnvTestProvider {
+    fn should_cancel_with_value(&self) -> Option<Box<dyn std::any::Any>> {
+        let remaining = self.cancel_after.get()?;
+        if remaining == 0 {
+            return Some(Box::new("cancelled by test provider"));
+        }
+        self.cancel_after.set(Some(remaining - 1));
+        None
+    }
+
     async fn filter_candidates(
         &self,
         candidates: &[SolvableId],

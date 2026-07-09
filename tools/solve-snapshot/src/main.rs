@@ -889,6 +889,49 @@ fn main() {
                             .expect("RESOLVO_ENV_ORDERING_WORK_FLOOR must be an integer"),
                     );
                 }
+                // Sweep overrides for the bounded internal replay of the
+                // trail-reuse abandonment fallback. `CELL_CAP=0` is the
+                // historical baseline (no internal replay);
+                // `CELL_CAP=max WORK_FACTOR=max WORK_CAP=max DEADLINE=0`
+                // is the unbounded replay-all policy; the compiled-in
+                // bounded policy applies when the variables are unset.
+                #[cfg(feature = "diagnostics")]
+                {
+                    let parse_u64 = |name: &str, value: String| -> u64 {
+                        if value == "max" {
+                            u64::MAX
+                        } else {
+                            value
+                                .parse()
+                                .unwrap_or_else(|_| panic!("{name} must be an integer or 'max'"))
+                        }
+                    };
+                    if let (Ok(cell_cap), Ok(work_factor), Ok(work_cap)) = (
+                        std::env::var("RESOLVO_FALLBACK_REPLAY_CELL_CAP"),
+                        std::env::var("RESOLVO_FALLBACK_REPLAY_WORK_FACTOR"),
+                        std::env::var("RESOLVO_FALLBACK_REPLAY_WORK_CAP"),
+                    ) {
+                        let cell_cap = if cell_cap == "max" {
+                            usize::MAX
+                        } else {
+                            cell_cap.parse().expect(
+                                "RESOLVO_FALLBACK_REPLAY_CELL_CAP must be an integer or 'max'",
+                            )
+                        };
+                        solver.set_fallback_replay_policy(
+                            cell_cap,
+                            parse_u64("RESOLVO_FALLBACK_REPLAY_WORK_FACTOR", work_factor),
+                            parse_u64("RESOLVO_FALLBACK_REPLAY_WORK_CAP", work_cap),
+                        );
+                    }
+                    if let Ok(deadline) = std::env::var("RESOLVO_FALLBACK_REPLAY_DEADLINE") {
+                        solver.set_fallback_replay_deadline_enabled(match deadline.as_str() {
+                            "0" => false,
+                            "1" => true,
+                            _ => panic!("RESOLVO_FALLBACK_REPLAY_DEADLINE must be 0 or 1"),
+                        });
+                    }
+                }
                 let result = solver.solve_universal(problem);
                 record.duration = start.elapsed().as_secs_f64();
                 record.fetches = Some(solver.provider_fetch_count());
@@ -1058,6 +1101,57 @@ fn main() {
                         solver.env_ordering_restarts(),
                         solver.prefix_budget_aborts(),
                     );
+                    // Whole-solve work and per-attempt records: the
+                    // "counters" line above only covers the LAST enumeration
+                    // pass (the per-pass state reset clears its counters),
+                    // while the attempt records span every fallback attempt
+                    // and fixed-point round of the solve.
+                    let records = solver.universal_attempt_records();
+                    let total_propagated: u64 =
+                        records.iter().map(|record| record.propagations).sum();
+                    eprintln!(
+                        "    attempts: {} total ({} propagated across all): {}",
+                        records.len(),
+                        total_propagated,
+                        records
+                            .iter()
+                            .map(|record| format!(
+                                "[{:?} r{} {} {} props {} conflicts {} cells {:.0}ms]",
+                                record.kind,
+                                record.round,
+                                record.outcome,
+                                record.propagations,
+                                record.conflicts,
+                                record.cells,
+                                record.wall.as_secs_f64() * 1000.0,
+                            ))
+                            .format(" "),
+                    );
+                    let stats = solver.universal_fallback_stats();
+                    if stats.reuse_abandoned > 0 {
+                        eprintln!(
+                            "    fallback: reuse_abandoned={} abandoned_cells={} \
+                             abandoned_literals={} abandoned_work={} fresh_work={} \
+                             selected={} dropped={} stop={:?} est_work={} budget={} \
+                             replay_attempts={} actual_work={} completed={} \
+                             replay_aborted={} baseline_runs={}",
+                            stats.reuse_abandoned,
+                            stats.abandoned_cells,
+                            stats.abandoned_literals,
+                            stats.abandoned_work,
+                            stats.fresh_solve_work,
+                            stats.selected_replay_cells,
+                            stats.dropped_replay_cells,
+                            stats.selection_stop,
+                            stats.estimated_replay_work,
+                            stats.replay_work_budget,
+                            stats.replay_attempts,
+                            stats.actual_replay_work,
+                            stats.completed_replay_cells,
+                            stats.replay_aborted,
+                            stats.baseline_runs,
+                        );
+                    }
                     let mut cell_decisions = solver.universal_cell_decisions().to_vec();
                     if !cell_decisions.is_empty() {
                         cell_decisions.sort_unstable();

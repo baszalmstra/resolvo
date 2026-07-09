@@ -55,12 +55,12 @@ pub(crate) mod variable_map;
 mod watch_map;
 
 pub use universal::{
-    Cell, CellEdge, EnvInputSource, EnvironmentModel, InvalidUniversalInput, UniversalFailure,
-    UniversalProblem, UniversalSolution, Violation,
+    Cell, CellEdge, EnvInputSource, EnvironmentModel, InvalidUniversalInput, ReplaySelectionStop,
+    UniversalFailure, UniversalFallbackStats, UniversalProblem, UniversalSolution, Violation,
 };
 
 #[cfg(feature = "diagnostics")]
-pub use universal::{CellPinCounts, CellRetract};
+pub use universal::{CellPinCounts, CellRetract, UniversalAttemptKind, UniversalAttemptRecord};
 
 /// Describes the problem that is to be solved by the solver.
 ///
@@ -272,6 +272,52 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// [`Solver::witness_probe_trips`]). Lives on the solver, not on
     /// [`SolverState`], because the state is reset per enumeration pass.
     witness_probe_trips: u64,
+
+    /// Cell-count cap of the trail-reuse fallback's internal seed replay
+    /// (see `universal::FALLBACK_REPLAY_CELL_CAP`); overridable for tests
+    /// and benchmark sweeps. `0` disables internal replay entirely (the
+    /// historical baseline), `usize::MAX` disables the cap.
+    fallback_replay_cell_cap: usize,
+
+    /// Estimated-work budget multiple of the internal seed replay, in units
+    /// of the abandoned attempt's fresh-solve cost (see
+    /// `universal::FALLBACK_REPLAY_WORK_FACTOR`); overridable for tests and
+    /// benchmark sweeps. `u64::MAX` disables the work caps (replay-all).
+    fallback_replay_work_factor: u64,
+
+    /// Hard upper bound, in propagated decisions, of the internal seed
+    /// replay's work budget (see `universal::FALLBACK_REPLAY_WORK_CAP`);
+    /// overridable for tests and benchmark sweeps.
+    fallback_replay_work_cap: u64,
+
+    /// Whether the internal seed replay's ACTUAL work is bounded by the
+    /// fallback replay deadline (see
+    /// [`SolverState::fallback_replay_deadline`]). Disabled only by
+    /// benchmark sweeps that isolate the prefix-selection policy from the
+    /// actual-work abort.
+    fallback_replay_deadline_enabled: bool,
+
+    /// Test-only override of the armed fallback-replay deadline budget:
+    /// when set, the internal replay attempt is armed with exactly this
+    /// budget instead of the selection budget. Forcing `0` trips the
+    /// deadline on the replay's first propagated decision, which is how
+    /// tests deterministically drive the `ReplayAbandoned` path and the
+    /// historical-baseline attempt behind it.
+    #[cfg(test)]
+    test_fallback_replay_budget_override: Option<u64>,
+
+    /// Attempt statistics of the most recent [`Solver::solve_universal`]
+    /// call (see [`universal::UniversalFallbackStats`]): reset at
+    /// `solve_universal_impl` entry and accumulated across fallback
+    /// attempts and fixed-point rounds. Lives on the solver because the
+    /// state is reset per enumeration pass.
+    universal_fallback_stats: universal::UniversalFallbackStats,
+
+    /// Per-attempt records of the most recent [`Solver::solve_universal`]
+    /// call (timing diagnostics; see
+    /// [`universal::UniversalAttemptRecord`]).
+    #[cfg(feature = "diagnostics")]
+    universal_attempt_records: Vec<universal::UniversalAttemptRecord>,
 }
 
 type RequiresClause = (Requirement, Option<DisjunctionId>, ClauseId);
@@ -638,6 +684,21 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// `None` when disarmed.
     witness_probe_deadline: Option<u64>,
 
+    /// While the current enumeration is the reuse-free retry of an abandoned
+    /// trail-reuse attempt AND its internally generated replay seeds are
+    /// still being solved, the value of [`Self::propagated_total`] at which
+    /// the whole replay is abandoned in favor of the historical baseline
+    /// (see `universal::EnumerationOutcome::ReplayAbandoned`). The replay
+    /// prefix is selected by each cell's observed first-attempt cost, but
+    /// first-attempt work only *predicts* replay cost (a seeded replay from
+    /// a fresh state re-derives what the abandoned attempt's kept prefixes
+    /// amortized), so the actual replay carries its own deterministic
+    /// deadline. Armed only for internally generated fallback seeds; never
+    /// for caller-provided seed partitions, normal fixed-point reseeds,
+    /// witness-directed assumptions, or concrete solves. `None` when
+    /// disarmed.
+    fallback_replay_deadline: Option<u64>,
+
     /// The propagation cost of the most recent from-scratch solve of the
     /// current universal enumeration (the first cell), used to calibrate
     /// [`Self::prefix_budget_deadline`]. Zero until the first cell is
@@ -756,6 +817,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             propagated_total: 0,
             prefix_budget_deadline: None,
             witness_probe_deadline: None,
+            fallback_replay_deadline: None,
             fresh_solve_cost: 0,
             prefix_spent: 0,
             prefix_cumulative_budget: 0,
@@ -843,6 +905,15 @@ pub(crate) struct PrefixBudgetExhausted;
 /// environment-witness search.
 pub(crate) struct WitnessProbeTripped;
 
+/// Cancellation sentinel raised by [`Solver::propagate`] when the bounded
+/// internal seed replay of the trail-reuse fallback exhausts its cumulative
+/// propagation deadline (see [`SolverState::fallback_replay_deadline`] and
+/// `universal::FALLBACK_REPLAY_WORK_FACTOR`). `solve_universal`'s
+/// enumeration loop intercepts it before it can escape to the caller and
+/// re-enumerates once more from the historical baseline (the original
+/// caller seed partition, trail reuse disabled, no replay deadline).
+pub(crate) struct FallbackReplayBudgetExhausted;
+
 /// Base interval, in learnt conflicts, of the Luby restart sequence: the
 /// n-th restart of a `run_sat` call fires after `luby(n) *
 /// RESTART_BASE_INTERVAL` conflicts. Classic CDCL restarts keep all learnt
@@ -907,6 +978,9 @@ pub(crate) struct PropagationCounters {
     pub cell_pins: Vec<universal::CellPinCounts>,
     /// Times the kept-prefix conflict budget aborted a trail-reuse attempt.
     pub prefix_budget_aborts: u64,
+    /// Times the fallback-replay deadline aborted a bounded internal seed
+    /// replay (see [`SolverState::fallback_replay_deadline`]).
+    pub fallback_replay_aborts: u64,
     /// Times the per-run conflict limit suspended the env-literals-last
     /// ordering (stage 1 of the refutation switch, see
     /// docs/design/universal-refutation-ordering.md).
@@ -971,6 +1045,15 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             #[cfg(test)]
             test_witness_probe_override: None,
             witness_probe_trips: 0,
+            fallback_replay_cell_cap: universal::FALLBACK_REPLAY_CELL_CAP,
+            fallback_replay_work_factor: universal::FALLBACK_REPLAY_WORK_FACTOR,
+            fallback_replay_work_cap: universal::FALLBACK_REPLAY_WORK_CAP,
+            fallback_replay_deadline_enabled: true,
+            #[cfg(test)]
+            test_fallback_replay_budget_override: None,
+            universal_fallback_stats: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            universal_attempt_records: Vec::new(),
         }
     }
 }
@@ -1135,6 +1218,72 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.state.propagation_counters.prefix_budget_aborts
     }
 
+    /// The number of times the fallback-replay deadline aborted a bounded
+    /// internal seed replay (see
+    /// [`SolverState::fallback_replay_deadline`]). Note the counter lives
+    /// on the per-enumeration state; use
+    /// [`Solver::universal_fallback_stats`] for whole-solve accumulation.
+    #[cfg(feature = "diagnostics")]
+    pub fn fallback_replay_aborts(&self) -> u64 {
+        self.state.propagation_counters.fallback_replay_aborts
+    }
+
+    /// Attempt statistics of the most recent [`Solver::solve_universal`]
+    /// call: how often the trail-reuse attempt was abandoned, what the
+    /// abandoned attempts had recorded, how the bounded internal replay
+    /// prefix was selected, whether the actual replay work deadline
+    /// tripped, and whether the historical baseline stage ran. Reset at
+    /// every `solve_universal` entry and accumulated across fallback
+    /// attempts and reseed fixed-point rounds. All zeros for a solve whose
+    /// enumeration never abandoned trail reuse (and for concrete solves).
+    pub fn universal_fallback_stats(&self) -> &UniversalFallbackStats {
+        &self.universal_fallback_stats
+    }
+
+    /// Per-attempt records (kind, outcome, work, conflicts, cells, wall
+    /// time, fixed-point round, cache state) of the most recent
+    /// [`Solver::solve_universal`] call, in execution order. Timing
+    /// diagnostics only: tests must assert on
+    /// [`Solver::universal_fallback_stats`] instead.
+    #[cfg(feature = "diagnostics")]
+    pub fn universal_attempt_records(&self) -> &[UniversalAttemptRecord] {
+        &self.universal_attempt_records
+    }
+
+    /// Overrides the internal-replay policy of the trail-reuse abandonment
+    /// fallback (see `universal::FALLBACK_REPLAY_CELL_CAP`,
+    /// `universal::FALLBACK_REPLAY_WORK_FACTOR` and
+    /// `universal::FALLBACK_REPLAY_WORK_CAP`). `cell_cap = 0` disables
+    /// internal replay entirely (the historical baseline policy);
+    /// `usize::MAX`/`u64::MAX` for every knob restores the unbounded
+    /// replay-all policy. For tests and benchmark sweeps.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub fn set_fallback_replay_policy(&mut self, cell_cap: usize, work_factor: u64, work_cap: u64) {
+        self.fallback_replay_cell_cap = cell_cap;
+        self.fallback_replay_work_factor = work_factor;
+        self.fallback_replay_work_cap = work_cap;
+    }
+
+    /// Enables or disables the actual-work deadline of the bounded internal
+    /// replay (see [`SolverState::fallback_replay_deadline`]), leaving the
+    /// prefix-selection caps in place. For benchmark sweeps that isolate
+    /// the selection policy from the actual-work abort.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub fn set_fallback_replay_deadline_enabled(&mut self, enabled: bool) {
+        self.fallback_replay_deadline_enabled = enabled;
+    }
+
+    /// Overrides the armed fallback-replay deadline budget (see
+    /// [`Solver::test_fallback_replay_budget_override`]). Test-only:
+    /// forcing `Some(0)` trips the deadline on the internal replay's first
+    /// propagated decision, which is the only way tests can
+    /// deterministically drive the `ReplayAbandoned` path and the
+    /// historical-baseline attempt behind it.
+    #[cfg(test)]
+    pub(crate) fn set_test_fallback_replay_budget_override(&mut self, budget: Option<u64>) {
+        self.test_fallback_replay_budget_override = budget;
+    }
+
     /// Overrides the kept-prefix work budget of universal trail reuse (see
     /// [`Solver::test_prefix_budget_override`]). Test-only: forcing `Some(0)`
     /// aborts the first prefix-started run and drives the trail-reuse
@@ -1185,6 +1334,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             #[cfg(test)]
             test_witness_probe_override: self.test_witness_probe_override,
             witness_probe_trips: self.witness_probe_trips,
+            fallback_replay_cell_cap: self.fallback_replay_cell_cap,
+            fallback_replay_work_factor: self.fallback_replay_work_factor,
+            fallback_replay_work_cap: self.fallback_replay_work_cap,
+            fallback_replay_deadline_enabled: self.fallback_replay_deadline_enabled,
+            #[cfg(test)]
+            test_fallback_replay_budget_override: self.test_fallback_replay_budget_override,
+            universal_fallback_stats: self.universal_fallback_stats,
+            #[cfg(feature = "diagnostics")]
+            universal_attempt_records: self.universal_attempt_records,
         }
     }
 
@@ -2660,6 +2818,34 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 return Err(PropagationError::Cancelled(Box::new(WitnessProbeTripped)));
             }
 
+            // The bounded internal seed replay of the trail-reuse fallback
+            // (see `SolverState::fallback_replay_deadline`): observed
+            // first-attempt work only predicts replay cost, so the replay
+            // is additionally bounded by the actual propagation it burns.
+            // Armed only while internally generated fallback seeds are
+            // being replayed; caller seed partitions, fixed-point reseeds,
+            // witness-directed solves and concrete solves never arm it, so
+            // their behavior is untouched.
+            if self
+                .state
+                .fallback_replay_deadline
+                .is_some_and(|deadline| self.state.propagated_total > deadline)
+            {
+                prop_hit!(FALLBACK_REPLAY_ABORT);
+                self.state.fallback_replay_deadline = None;
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state.propagation_counters.fallback_replay_aborts += 1;
+                }
+                tracing::debug!(
+                    "The fallback seed replay exceeded its work deadline; abandoning the \
+                     replay in favor of the historical baseline enumeration"
+                );
+                return Err(PropagationError::Cancelled(Box::new(
+                    FallbackReplayBudgetExhausted,
+                )));
+            }
+
             // Stage 2 of the refutation switch (see
             // `SolverState::env_ordering_work_deadline`): a run that has
             // both conflicted and burnt a real propagation budget since
@@ -3520,6 +3706,34 @@ impl<D: DependencyProvider> SolverState<D> {
     pub(crate) fn arm_witness_probe(&mut self, budget: Option<u64>) {
         self.witness_probe_deadline =
             budget.map(|budget| self.propagated_total.saturating_add(budget));
+    }
+
+    /// Arms the fallback-replay deadline `budget` propagated decisions ahead
+    /// (see [`Self::fallback_replay_deadline`]); `None` disarms it.
+    pub(crate) fn arm_fallback_replay_deadline(&mut self, budget: Option<u64>) {
+        self.fallback_replay_deadline =
+            budget.map(|budget| self.propagated_total.saturating_add(budget));
+    }
+
+    /// Whether the fallback-replay deadline is currently armed (see
+    /// [`Self::fallback_replay_deadline`]). Test-only observation point for
+    /// the no-leak-between-attempts invariant.
+    #[cfg(test)]
+    pub(crate) fn fallback_replay_deadline_armed(&self) -> bool {
+        self.fallback_replay_deadline.is_some()
+    }
+
+    /// Total decisions ever propagated by this state: the deterministic
+    /// work measure every universal budget is denominated in. Counted
+    /// unconditionally (unlike the diagnostics counters).
+    pub(crate) fn propagated_total(&self) -> u64 {
+        self.propagated_total
+    }
+
+    /// The propagation cost of the most recent from-scratch solve of the
+    /// current universal enumeration (see [`Self::fresh_solve_cost`]).
+    pub(crate) fn fresh_solve_cost(&self) -> u64 {
+        self.fresh_solve_cost
     }
 
     /// Extends the cumulative kept-prefix work budget after a cell was

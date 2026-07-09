@@ -42,8 +42,8 @@
 
 use crate::{
     CellCondition, Condition, ConditionId, ConditionalRequirement, EnvClause, EnvLiteral,
-    EnvironmentModel, LogicalOperator, NameId, Requirement, SignedEnvLiteral, Solver,
-    UniversalFailure, UniversalProblem, VersionSetId, Violation,
+    EnvironmentModel, LogicalOperator, NameId, ReplaySelectionStop, Requirement, SignedEnvLiteral,
+    Solver, UniversalFailure, UniversalProblem, VersionSetId, Violation,
     solver::env_test_provider::EnvTestProvider,
 };
 
@@ -2254,6 +2254,35 @@ fn test_universal_trail_reuse_abandonment_fallback() {
         "the abandonment fallback must have run"
     );
 
+    // A small abandonment fits both replay caps: every recorded cell is
+    // selected (recording order, nothing dropped), the bounded replay
+    // completes all of them, its deadline never trips, and the historical
+    // baseline stage does not run.
+    let stats = solver.universal_fallback_stats();
+    assert_eq!(stats.reuse_abandoned, 1, "one abandonment: {stats:?}");
+    assert!(stats.abandoned_cells >= 1, "cells recorded: {stats:?}");
+    assert_eq!(
+        stats.selection_stop,
+        Some(ReplaySelectionStop::Complete),
+        "a small partition must fit both caps: {stats:?}"
+    );
+    assert_eq!(stats.dropped_replay_cells, 0, "{stats:?}");
+    assert_eq!(
+        stats.selected_replay_cells, stats.abandoned_cells,
+        "{stats:?}"
+    );
+    assert_eq!(stats.replay_attempts, 1, "{stats:?}");
+    assert_eq!(
+        stats.completed_replay_cells, stats.selected_replay_cells,
+        "the replay must complete every selected cell: {stats:?}"
+    );
+    assert_eq!(stats.replay_aborted, 0, "{stats:?}");
+    assert_eq!(stats.baseline_runs, 0, "{stats:?}");
+    assert!(
+        stats.fresh_solve_work > 0 && stats.abandoned_work >= stats.fresh_solve_work,
+        "{stats:?}"
+    );
+
     // (b) The partition verifies, and projects correctly onto every modeled
     // environment: exactly one cell matches each `env0` version, and that
     // cell drags the chain (`y` and the `z`s) exactly where `env0 in 5..10`
@@ -2373,6 +2402,376 @@ fn test_universal_trail_reshape_full_retract() {
         format!("{:?}", solution.cells()),
         format!("{:?}", reseeded.cells()),
         "the reseed fixed point must hold across the trail reshape"
+    );
+}
+
+/// Builds the provider of the replay-cap scenarios: `top` (one version,
+/// root-required) needs a distinct single-version package `w{i}` exactly
+/// where `env0 in [i, i+1)` holds, for `i in 0..intervals`. Each interval
+/// forces a different install set, so the partition fragments into one cell
+/// per interval plus the remainder region — enough recorded cells for the
+/// replay-prefix caps to bite.
+fn build_env_fan_provider(intervals: u32) -> (EnvTestProvider, VersionSetId) {
+    let mut provider = EnvTestProvider::default();
+    provider.add_env_package("env0", false);
+    let top = provider.add_package("top", 1);
+    let mut requirements = Vec::new();
+    for i in 0..intervals {
+        let name = format!("w{i}");
+        let w1 = provider.add_package(&name, 1);
+        provider.set_dependencies(w1, vec![], vec![]);
+        let w_any = provider.version_set(&name, 1, 2);
+        let segment = provider.version_set("env0", i, i + 1);
+        let condition = provider
+            .pool
+            .intern_condition(Condition::Requirement(segment));
+        requirements.push(ConditionalRequirement {
+            condition: Some(condition),
+            requirement: w_any.into(),
+        });
+    }
+    provider.set_dependencies(top, requirements, vec![]);
+    let top_any = provider.version_set("top", 1, 2);
+    (provider, top_any)
+}
+
+/// Solves the fan scenario unhindered and returns its cell conditions: the
+/// seed material of the replay-cap tests below.
+fn fan_partition(intervals: u32) -> Vec<CellCondition<NameId>> {
+    let (provider, top_any) = build_env_fan_provider(intervals);
+    let mut solver = Solver::new(provider);
+    let solution = solver
+        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+        .expect("the fan scenario is solvable");
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+    solution
+        .cells()
+        .iter()
+        .map(|cell| cell.condition().clone())
+        .collect()
+}
+
+/// Replay-prefix selection, cell-count cap: seeding a zero-prefix-budget
+/// solve with most of the fan partition makes the trail-reuse attempt
+/// record many cells before its abort, and a cell cap of 3 must truncate
+/// the internal replay to exactly the first three recorded cells (in
+/// recording order) while the enumeration still completes, verifies and
+/// stays deterministic.
+#[test]
+fn test_universal_fallback_replay_cell_cap_truncates() {
+    use crate::solver::prop_counters::hits;
+    let truncated_before = hits::get(&hits::UNIVERSAL_REPLAY_TRUNCATED);
+
+    let full = fan_partition(8);
+    assert!(
+        full.len() >= 6,
+        "the fan scenario must fragment (got {} cells)",
+        full.len()
+    );
+    let seeds = full[..full.len() - 2].to_vec();
+
+    let run = |seeds: Vec<CellCondition<NameId>>| {
+        let (provider, top_any) = build_env_fan_provider(8);
+        let mut solver = Solver::new(provider);
+        solver.set_test_prefix_budget_override(Some(0));
+        solver.set_fallback_replay_policy(3, u64::MAX, u64::MAX);
+        let solution = solver
+            .solve_universal(
+                UniversalProblem::new()
+                    .requirements(vec![top_any.into()])
+                    .seed_partition(seeds),
+            )
+            .expect("the capped fallback must complete");
+        (format!("{:?}", solution.cells()), solver)
+    };
+
+    let (cells, solver) = run(seeds.clone());
+    {
+        let solution_verify = {
+            let (provider, top_any) = build_env_fan_provider(8);
+            let mut verify_solver = Solver::new(provider);
+            verify_solver.set_test_prefix_budget_override(Some(0));
+            verify_solver.set_fallback_replay_policy(3, u64::MAX, u64::MAX);
+            let solution = verify_solver
+                .solve_universal(
+                    UniversalProblem::new()
+                        .requirements(vec![top_any.into()])
+                        .seed_partition(seeds.clone()),
+                )
+                .expect("the repeated capped fallback must complete");
+            assert_eq!(solution.verify(verify_solver.provider()), Ok(()));
+            format!("{:?}", solution.cells())
+        };
+        assert_eq!(
+            cells, solution_verify,
+            "identical capped fallback runs must be byte-identical"
+        );
+    }
+
+    let stats = solver.universal_fallback_stats();
+    assert_eq!(stats.reuse_abandoned, 1, "{stats:?}");
+    assert!(
+        stats.abandoned_cells > 3,
+        "the abort must happen after more cells than the cap: {stats:?}"
+    );
+    assert_eq!(
+        stats.selection_stop,
+        Some(ReplaySelectionStop::CellCap),
+        "{stats:?}"
+    );
+    assert_eq!(
+        stats.selected_replay_cells, 3,
+        "the cap must truncate at the exact prefix: {stats:?}"
+    );
+    assert_eq!(
+        stats.dropped_replay_cells,
+        stats.abandoned_cells - 3,
+        "{stats:?}"
+    );
+    assert_eq!(stats.replay_attempts, 1, "{stats:?}");
+    assert_eq!(stats.completed_replay_cells, 3, "{stats:?}");
+    assert_eq!(stats.replay_aborted, 0, "{stats:?}");
+    assert_eq!(stats.baseline_runs, 0, "{stats:?}");
+    assert!(
+        hits::get(&hits::UNIVERSAL_REPLAY_TRUNCATED) > truncated_before,
+        "the truncation counter must have fired"
+    );
+}
+
+/// Replay-prefix selection, estimated-work cap: with a work factor of 1 the
+/// budget equals the abandoned attempt's fresh-solve cost, which admits
+/// exactly the first recorded cell (whose observed cost IS the fresh-solve
+/// cost) and truncates before the (unbounded) cell cap.
+#[test]
+fn test_universal_fallback_replay_work_cap_truncates() {
+    let full = fan_partition(8);
+    let seeds = full[..full.len() - 2].to_vec();
+
+    let (provider, top_any) = build_env_fan_provider(8);
+    let mut solver = Solver::new(provider);
+    solver.set_test_prefix_budget_override(Some(0));
+    solver.set_fallback_replay_policy(usize::MAX, 1, u64::MAX);
+    let solution = solver
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(vec![top_any.into()])
+                .seed_partition(seeds),
+        )
+        .expect("the work-capped fallback must complete");
+    assert_eq!(solution.verify(solver.provider()), Ok(()));
+
+    let stats = solver.universal_fallback_stats();
+    assert_eq!(stats.reuse_abandoned, 1, "{stats:?}");
+    assert!(stats.abandoned_cells > 1, "{stats:?}");
+    assert_eq!(
+        stats.selection_stop,
+        Some(ReplaySelectionStop::WorkCap),
+        "the estimated-work cap must truncate before the count cap: {stats:?}"
+    );
+    assert_eq!(
+        stats.selected_replay_cells, 1,
+        "a 1x-fresh-solve budget admits exactly the first recorded cell \
+         (whose observed cost is the fresh-solve cost): {stats:?}"
+    );
+    assert_eq!(
+        stats.estimated_replay_work, stats.fresh_solve_work,
+        "{stats:?}"
+    );
+    assert_eq!(stats.replay_aborted, 0, "{stats:?}");
+    assert_eq!(stats.baseline_runs, 0, "{stats:?}");
+}
+
+/// Actual-work deadline: with the replay deadline forced to zero, the
+/// bounded internal replay aborts on its first propagated decision, the
+/// replay-shaped state is discarded, and one final baseline attempt
+/// (original caller seeds, reuse disabled, no deadline) completes the
+/// solve. The result verifies, projects and is deterministic.
+#[test]
+fn test_universal_fallback_replay_deadline_returns_replay_abandoned() {
+    use crate::solver::prop_counters::hits;
+    let abort_before = hits::get(&hits::FALLBACK_REPLAY_ABORT);
+    let abandoned_before = hits::get(&hits::UNIVERSAL_REPLAY_ABANDONED);
+
+    let run = || {
+        let (provider, top_any) = build_env_tail_chain_provider(3);
+        let mut solver = Solver::new(provider);
+        solver.set_test_prefix_budget_override(Some(0));
+        solver.set_test_fallback_replay_budget_override(Some(0));
+        let solution = solver
+            .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+            .expect("the baseline attempt behind the tripped replay must complete");
+        (format!("{:?}", solution.cells()), solver)
+    };
+
+    let (cells, solver) = run();
+    assert_eq!(
+        {
+            let (repeat_cells, _) = run();
+            repeat_cells
+        },
+        cells,
+        "identical deadline-tripped runs must be byte-identical"
+    );
+
+    let stats = solver.universal_fallback_stats();
+    assert_eq!(stats.reuse_abandoned, 1, "{stats:?}");
+    assert_eq!(stats.replay_attempts, 1, "{stats:?}");
+    assert_eq!(
+        stats.replay_aborted, 1,
+        "the zero deadline must abandon the replay: {stats:?}"
+    );
+    assert_eq!(
+        stats.baseline_runs, 1,
+        "the historical baseline stage must run after the abandonment: {stats:?}"
+    );
+    assert!(
+        hits::get(&hits::FALLBACK_REPLAY_ABORT) > abort_before,
+        "the propagation-side replay abort must have fired"
+    );
+    assert!(
+        hits::get(&hits::UNIVERSAL_REPLAY_ABANDONED) > abandoned_before,
+        "the enumeration-side replay abandonment must have fired"
+    );
+
+    // No assumption level or replay deadline leaks past the solve.
+    assert_eq!(solver.state.assumption_levels, 0);
+    assert!(!solver.state.fallback_replay_deadline_armed());
+}
+
+/// Attempt 3 must start from the ORIGINAL caller seed partition, not the
+/// generated replay cells: a solve whose internal replay always trips must
+/// produce the byte-identical partition to a solve whose policy skips
+/// internal replay entirely (cell cap 0, the historical baseline policy),
+/// because both run "caller seeds, reuse disabled, no deadline" as their
+/// final attempt.
+#[test]
+fn test_universal_fallback_baseline_uses_caller_seeds() {
+    use crate::solver::prop_counters::hits;
+    let empty_before = hits::get(&hits::UNIVERSAL_REPLAY_EMPTY_SELECTION);
+
+    let full = fan_partition(8);
+    let seeds = full[..full.len() - 2].to_vec();
+
+    // Replay always trips its (zero) actual-work deadline -> attempt 3.
+    let (provider, top_any) = build_env_fan_provider(8);
+    let mut tripped = Solver::new(provider);
+    tripped.set_test_prefix_budget_override(Some(0));
+    tripped.set_test_fallback_replay_budget_override(Some(0));
+    let tripped_solution = tripped
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(vec![top_any.into()])
+                .seed_partition(seeds.clone()),
+        )
+        .expect("the tripped fallback must complete");
+    assert_eq!(tripped_solution.verify(tripped.provider()), Ok(()));
+    assert!(
+        tripped.universal_fallback_stats().replay_aborted >= 1,
+        "{:?}",
+        tripped.universal_fallback_stats()
+    );
+    assert!(
+        tripped.universal_fallback_stats().baseline_runs >= 1,
+        "{:?}",
+        tripped.universal_fallback_stats()
+    );
+
+    // No internal replay at all (cell cap 0) -> baseline directly.
+    let (provider, top_any) = build_env_fan_provider(8);
+    let mut baseline = Solver::new(provider);
+    baseline.set_test_prefix_budget_override(Some(0));
+    baseline.set_fallback_replay_policy(0, 0, 0);
+    let baseline_solution = baseline
+        .solve_universal(
+            UniversalProblem::new()
+                .requirements(vec![top_any.into()])
+                .seed_partition(seeds),
+        )
+        .expect("the baseline policy must complete");
+    assert!(
+        hits::get(&hits::UNIVERSAL_REPLAY_EMPTY_SELECTION) > empty_before,
+        "cell cap 0 must select nothing and skip straight to the baseline"
+    );
+    assert!(
+        baseline.universal_fallback_stats().baseline_runs >= 1,
+        "{:?}",
+        baseline.universal_fallback_stats()
+    );
+    assert_eq!(
+        baseline.universal_fallback_stats().selected_replay_cells,
+        0,
+        "{:?}",
+        baseline.universal_fallback_stats()
+    );
+
+    assert_eq!(
+        format!("{:?}", tripped_solution.cells()),
+        format!("{:?}", baseline_solution.cells()),
+        "a tripped replay and a skipped replay must land on the identical \
+         historical-baseline partition (same caller seeds, reuse disabled)"
+    );
+}
+
+/// A successfully completed internal replay explicitly disarms its deadline
+/// before the first free episode: re-running the fallback with the armed
+/// budget forced to EXACTLY the work the replay actually needs must
+/// complete without a spurious `ReplayAbandoned` from the free phase
+/// (which propagates far past that budget after the disarm).
+#[test]
+fn test_universal_fallback_replay_deadline_disarmed_before_free_phase() {
+    // Learn the replay's actual work from an unhindered fallback run.
+    let (provider, top_any) = build_env_tail_chain_provider(3);
+    let mut probe = Solver::new(provider);
+    probe.set_test_prefix_budget_override(Some(0));
+    let probe_solution = probe
+        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+        .expect("the fallback must complete");
+    let probe_stats = probe.universal_fallback_stats();
+    assert_eq!(probe_stats.replay_aborted, 0, "{probe_stats:?}");
+    let actual_replay_work = probe_stats.actual_replay_work;
+    assert!(actual_replay_work > 0, "{probe_stats:?}");
+
+    // Re-run with the deadline armed at exactly that work: the replay
+    // completes at (not past) the budget, the disarm happens before the
+    // free phase, and the free phase's much larger propagation must not
+    // trip the (disarmed) deadline.
+    let (provider, top_any) = build_env_tail_chain_provider(3);
+    let mut solver = Solver::new(provider);
+    solver.set_test_prefix_budget_override(Some(0));
+    solver.set_test_fallback_replay_budget_override(Some(actual_replay_work));
+    let solution = solver
+        .solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]))
+        .expect("the exactly-budgeted fallback must complete");
+    let stats = solver.universal_fallback_stats();
+    assert_eq!(
+        stats.replay_aborted, 0,
+        "a free episode after a completed replay must not trip the \
+         (disarmed) replay deadline: {stats:?}"
+    );
+    assert_eq!(stats.baseline_runs, 0, "{stats:?}");
+    assert_eq!(stats.actual_replay_work, actual_replay_work, "{stats:?}");
+    assert_eq!(
+        format!("{:?}", solution.cells()),
+        format!("{:?}", probe_solution.cells()),
+        "the exactly-budgeted run must reproduce the unhindered fallback"
+    );
+}
+
+/// Real provider cancellations pass through both internal sentinels
+/// unchanged: a solve whose provider cancels while the fallback machinery
+/// is active must return `UniversalFailure::Cancelled`, not an internal
+/// abandonment outcome or a completed solve.
+#[test]
+fn test_universal_fallback_real_cancellation_passes_through() {
+    let (mut provider, top_any) = build_env_tail_chain_provider(3);
+    provider.set_cancel_after(0);
+    let mut solver = Solver::new(provider);
+    solver.set_test_prefix_budget_override(Some(0));
+    solver.set_test_fallback_replay_budget_override(Some(0));
+    let result = solver.solve_universal(UniversalProblem::new().requirements(vec![top_any.into()]));
+    assert!(
+        matches!(result, Err(UniversalFailure::Cancelled(_))),
+        "a real cancellation must surface as Cancelled"
     );
 }
 

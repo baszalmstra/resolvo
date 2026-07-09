@@ -147,7 +147,8 @@ use crate::{
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     runtime::AsyncRuntime,
     solver::{
-        PrefixBudgetExhausted, Solver, SolverState, UnsolvableOrCancelled, WitnessProbeTripped,
+        FallbackReplayBudgetExhausted, PrefixBudgetExhausted, Solver, SolverState,
+        UnsolvableOrCancelled, WitnessProbeTripped,
         clause::{Clause, EnvClauseKind, Literal, WatchedLiterals},
         decision::Decision,
         prop_counters::prop_hit,
@@ -157,22 +158,226 @@ use crate::{
 };
 
 /// The result of one enumeration pass (see `Solver::enumerate_universal`):
-/// either a complete partition, or the trail-reuse attempt was abandoned and
-/// the enumeration must re-run from scratch without it.
+/// a complete partition, or one of the two internal abandonment outcomes
+/// that make the enumeration re-run from scratch (see
+/// `Solver::enumerate_universal_with_fallback` for the bounded three-attempt
+/// control flow they drive).
 enum EnumerationOutcome<Id, N> {
     Done(UniversalSolution<Id, N>),
-    /// The trail-reuse attempt exceeded its work budget. The payload is the
-    /// seed list for the reuse-free retry: the cells the attempt recorded
-    /// before the abort (in recording order; each a verified-disjoint
-    /// region whose seeded replay is an assumption-driven solve, the cheap
-    /// path), followed by any original seeds the attempt had not yet
-    /// processed. Every seed that WAS processed is either reflected in a
-    /// recorded cell or was legitimately dropped as stale, so the
-    /// concatenation preserves the original seed partition's influence and
-    /// the stale-seed-drop semantics while saving the abandoned attempt's
-    /// coverage work (measured: idx-33-class problems used to pay 40-48%
-    /// of their cost re-deriving the discarded first attempt).
-    ReuseAbandoned(Vec<CellCondition<N>>),
+    /// The trail-reuse attempt exceeded its work budget. The payload
+    /// describes the abandoned attempt so the reuse-free retry can replay a
+    /// bounded prefix of its recorded cells (in recording order; each a
+    /// verified-disjoint region whose seeded replay is an assumption-driven
+    /// solve, the cheap path) instead of re-deriving the coverage from zero
+    /// (measured: idx-33-class problems used to pay 40-48% of their cost
+    /// re-deriving the discarded first attempt) or replaying ALL of them
+    /// (measured: replaying 330 recorded cells once exploded one transition
+    /// to 79M propagations where the unseeded baseline needed 2.5k
+    /// conflicts total). Any caller seed the attempt had not yet processed
+    /// would be lost by the truncation, which is why the abort asserts that
+    /// no caller seed is pending (the prefix budget only arms in the free
+    /// phase, after the seeds ran out); every processed seed is either
+    /// reflected in a recorded cell or was legitimately dropped as stale.
+    ReuseAbandoned(AbandonedReplay<N>),
+    /// The bounded internal seed replay (the reuse-free retry seeded with a
+    /// prefix of an abandoned attempt's recorded cells) exceeded its
+    /// actual-work deadline: first-attempt per-cell cost only *predicts*
+    /// replay cost, and this replay's prediction was wrong. The
+    /// replay-shaped `SolverState` is discarded wholesale (the trail-reuse
+    /// campaign showed watch/activity shaping from replayed transitions is
+    /// not reliably repairable in place) and the caller re-enumerates one
+    /// final time from the historical baseline: the original caller seed
+    /// partition, trail reuse disabled, no replay deadline.
+    ReplayAbandoned,
+}
+
+/// One internally recorded cell of an abandoned trail-reuse attempt, kept as
+/// a replay hint for the reuse-free retry (see
+/// [`EnumerationOutcome::ReuseAbandoned`]). Internal replay seeds are
+/// procedural hints, not semantic clauses: dropping any suffix of them
+/// changes exploration order (and possibly the valid partition) but can
+/// neither remove a solution nor hide an unsolvable region, because only
+/// completed cells add blocking clauses and the free phase plus the witness
+/// search remain the coverage authority.
+struct ReplaySeed<N> {
+    /// The recorded cell's condition, exactly as a reseed would replay it.
+    condition: CellCondition<N>,
+
+    /// Decisions propagated between the previous cell recording and this
+    /// one in the abandoned attempt: the deterministic per-cell cost
+    /// observation the prefix selection uses as its work estimate. Counted
+    /// unconditionally (`SolverState::propagated_total`), so the policy is
+    /// identical with and without the `diagnostics` feature.
+    observed_work: u64,
+}
+
+/// Everything the reuse-free retry needs to know about the abandoned
+/// trail-reuse attempt (see [`EnumerationOutcome::ReuseAbandoned`]).
+struct AbandonedReplay<N> {
+    /// The cells the abandoned attempt recorded, in recording order.
+    recorded: Vec<ReplaySeed<N>>,
+
+    /// Total decisions the abandoned attempt propagated up to the abort.
+    abandoned_work: u64,
+
+    /// The abandoned attempt's from-scratch solve cost (see
+    /// `SolverState::fresh_solve_cost`): the calibration constant of the
+    /// replay work budget.
+    fresh_solve_work: u64,
+}
+
+/// Cell-count cap of the internal seed replay after a trail-reuse
+/// abandonment: at most this many of the abandoned attempt's recorded cells
+/// are replayed (recording-order prefix, no reordering or cherry-picking).
+/// Bounds the watch/activity reshaping and full-retraction bleed that
+/// hundreds of replayed seeds inflict on the retry before its first free
+/// transition, which the free-phase witness probe cannot undo.
+/// Overridable for tests and sweeps via
+/// `Solver::set_fallback_replay_policy`; `0` disables internal replay
+/// (the historical baseline), `usize::MAX` removes the cap.
+pub(crate) const FALLBACK_REPLAY_CELL_CAP: usize = 64;
+
+/// Estimated-work budget of the internal seed replay, as a multiple of the
+/// abandoned attempt's from-scratch solve cost. The recording-order prefix
+/// is truncated once the sum of the cells' observed first-attempt costs
+/// would exceed `min(factor * fresh_solve_work, FALLBACK_REPLAY_WORK_CAP)`;
+/// the same budget is armed as the replay's ACTUAL cumulative work deadline
+/// (estimates only predict; see `SolverState::fallback_replay_deadline`).
+pub(crate) const FALLBACK_REPLAY_WORK_FACTOR: u64 = 8;
+
+/// Hard upper bound, in propagated decisions, of the internal replay work
+/// budget: problems with expensive fresh solves must not scale the replay
+/// budget past the scale the witness probe treats as pathological (the
+/// historical 330-seed replay burnt 79M propagations; this cap keeps any
+/// replay two orders of magnitude below that).
+pub(crate) const FALLBACK_REPLAY_WORK_CAP: u64 = 2_000_000;
+
+/// Why the replay-prefix selection stopped where it did (see
+/// [`select_replay_prefix`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplaySelectionStop {
+    /// Every recorded cell fit both caps: the replay is replay-all.
+    Complete,
+    /// The cell-count cap truncated the prefix.
+    CellCap,
+    /// The estimated-work budget truncated the prefix.
+    WorkCap,
+}
+
+/// Selects the longest recording-order prefix of `recorded` that satisfies
+/// both the cell-count cap and the estimated-work budget. Returns the
+/// prefix length, the estimated work of the selected prefix, and the stop
+/// reason. Deterministic: integer counts and saturating arithmetic only, no
+/// wall time, no sampling, no hash iteration order. Truncates once; never
+/// reorders or cherry-picks cheap later cells (recording order is
+/// observable seed influence and the least disruptive policy).
+fn select_replay_prefix<N>(
+    recorded: &[ReplaySeed<N>],
+    cell_cap: usize,
+    work_budget: u64,
+) -> (usize, u64, ReplaySelectionStop) {
+    let mut estimated: u64 = 0;
+    for (index, seed) in recorded.iter().enumerate() {
+        if index >= cell_cap {
+            return (index, estimated, ReplaySelectionStop::CellCap);
+        }
+        let with_seed = estimated.saturating_add(seed.observed_work);
+        if with_seed > work_budget {
+            return (index, estimated, ReplaySelectionStop::WorkCap);
+        }
+        estimated = with_seed;
+    }
+    (recorded.len(), estimated, ReplaySelectionStop::Complete)
+}
+
+/// Attempt statistics of one `Solver::solve_universal` call (see
+/// [`crate::Solver::universal_fallback_stats`]): reset at solve entry,
+/// accumulated across fallback attempts and reseed fixed-point rounds.
+/// Maintained unconditionally (plain integer counters, negligible next to
+/// the solves they describe) so tests and callers can assert the fallback
+/// policy without the `diagnostics` feature.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct UniversalFallbackStats {
+    /// Times a trail-reuse attempt was abandoned by the kept-prefix work
+    /// budget (attempt 1 aborted).
+    pub reuse_abandoned: u32,
+    /// Cells recorded by abandoned trail-reuse attempts.
+    pub abandoned_cells: u64,
+    /// Total condition literals across the abandoned attempts' cells.
+    pub abandoned_literals: u64,
+    /// Decisions propagated by abandoned trail-reuse attempts, up to their
+    /// aborts.
+    pub abandoned_work: u64,
+    /// The abandoned attempts' fresh-solve costs (the calibration constants
+    /// of their replay budgets).
+    pub fresh_solve_work: u64,
+    /// Recorded cells the replay-prefix selection selected for replay.
+    pub selected_replay_cells: u64,
+    /// Recorded cells the replay-prefix selection dropped (either cap).
+    pub dropped_replay_cells: u64,
+    /// Estimated work (sum of observed first-attempt costs) of the selected
+    /// prefixes.
+    pub estimated_replay_work: u64,
+    /// The work budget of the most recent selection (also the armed actual
+    /// deadline when the deadline is enabled).
+    pub replay_work_budget: u64,
+    /// Stop reason of the most recent selection.
+    pub selection_stop: Option<ReplaySelectionStop>,
+    /// Bounded internal replay attempts started (attempt 2).
+    pub replay_attempts: u32,
+    /// Decisions attempt 2 actually propagated while its internal seeds
+    /// were being replayed.
+    pub actual_replay_work: u64,
+    /// Replay cells attempt 2 completed (recorded before its seeds ran out
+    /// or its deadline tripped).
+    pub completed_replay_cells: u64,
+    /// Times an internal replay was abandoned by its actual-work deadline.
+    pub replay_aborted: u32,
+    /// Times the historical baseline stage ran (attempt 3, or attempt 2
+    /// skipped because no cell fit the caps).
+    pub baseline_runs: u32,
+}
+
+/// The kind of one enumeration attempt (see [`UniversalAttemptRecord`]).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniversalAttemptKind {
+    /// Attempt 1: trail reuse enabled, caller (or fixed-point) seeds.
+    TrailReuse,
+    /// Attempt 2: reuse disabled, seeded by a bounded prefix of the
+    /// abandoned attempt's recorded cells, actual-work deadline armed.
+    InternalReplay,
+    /// Attempt 3 (or a skipped attempt 2): reuse disabled, original caller
+    /// seed partition, no replay deadline — the historical baseline.
+    Baseline,
+}
+
+/// One enumeration attempt of a `solve_universal` call (timing diagnostics;
+/// see [`crate::Solver::universal_attempt_records`]).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Debug)]
+pub struct UniversalAttemptRecord {
+    /// Which of the three fallback attempts this enumeration was.
+    pub kind: UniversalAttemptKind,
+    /// The reseed fixed-point round this attempt ran in (1-based).
+    pub round: u32,
+    /// Whether the solver had never fetched from the provider when the
+    /// attempt started (cold cache).
+    pub cold: bool,
+    /// How the attempt ended.
+    pub outcome: &'static str,
+    /// Decisions the attempt propagated.
+    pub propagations: u64,
+    /// Conflicts the attempt handled.
+    pub conflicts: u64,
+    /// Cells the attempt produced (for an abandoned attempt: recorded
+    /// before the abort).
+    pub cells: usize,
+    /// Witness-probe escalations during the attempt.
+    pub witness_trips: u64,
+    /// Wall time of the attempt. Never assert on this in tests.
+    pub wall: std::time::Duration,
 }
 
 /// The number of ordinary decision levels (decisions on variables that are
@@ -1178,6 +1383,13 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // panic buried in the encode/seed path. A valid problem that is merely
         // unsolvable is still reported by the enumeration below.
         self.universal_passes = 0;
+        // Attempt statistics accumulate across fallback attempts and
+        // fixed-point rounds of THIS solve (the per-pass `SolverState`
+        // reset would lose the abandoned attempts); reset them exactly
+        // once, here.
+        self.universal_fallback_stats = Default::default();
+        #[cfg(feature = "diagnostics")]
+        self.universal_attempt_records.clear();
         self.validate_universal_input(&requirements, &environment_model, &seed_partition)
             .map_err(UniversalFailure::InvalidInput)?;
 
@@ -1280,18 +1492,27 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         }
     }
 
-    /// One full enumeration: first with trail-prefix preservation; when a
-    /// prefix-started run exceeds its work budget the attempt is abandoned
-    /// wholesale (the solver state shaped by reused transitions performs
-    /// badly under real search and is not repairable in place) and the
-    /// enumeration re-runs from a fresh state with reuse disabled, seeded
-    /// by the cells the abandoned attempt already recorded (followed by its
-    /// unprocessed original seeds, see
-    /// [`EnumerationOutcome::ReuseAbandoned`]) so the coverage work spent
-    /// before the abort is replayed as cheap assumption-driven solves
-    /// instead of being re-searched from zero. The wasted attempt is
-    /// bounded by the work budgets; the fallback never aborts, so at most
-    /// one rebuild happens.
+    /// One full enumeration, bounded to at most three attempts:
+    ///
+    /// 1. **Trail reuse** (prefix budgets armed), with the caller's seed
+    ///    partition. When a prefix-started run exceeds its work budget the
+    ///    attempt is abandoned wholesale (the solver state shaped by reused
+    ///    transitions performs badly under real search and is not repairable
+    ///    in place).
+    /// 2. **Bounded internal replay**, reuse disabled: a fresh state seeded
+    ///    by a deterministic recording-order *prefix* of the cells the
+    ///    abandoned attempt recorded (see [`select_replay_prefix`]), so the
+    ///    coverage work spent before the abort is replayed as cheap
+    ///    assumption-driven solves instead of being re-searched from zero —
+    ///    without exposing the retry to unbounded large-partition replay.
+    ///    The replay's ACTUAL work is additionally bounded by the
+    ///    fallback-replay deadline. If no recorded cell fits the caps the
+    ///    stage is skipped in favor of attempt 3.
+    /// 3. **Historical baseline**, only if the replay deadline tripped (or
+    ///    stage 2 was skipped): a fresh state, the ORIGINAL caller seed
+    ///    partition, reuse disabled, no replay deadline, the normal free
+    ///    witness probe. This attempt arms neither internal budget, so it
+    ///    cannot return either abandonment outcome.
     #[allow(clippy::type_complexity)]
     fn enumerate_universal_with_fallback(
         &mut self,
@@ -1300,35 +1521,182 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         environment_model: &EnvironmentModel<D::NameId>,
         seed_partition: &[CellCondition<D::NameId>],
     ) -> Result<UniversalSolution<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
-        match self.enumerate_universal(
+        #[cfg(feature = "diagnostics")]
+        let kind = UniversalAttemptKind::TrailReuse;
+        #[cfg(not(feature = "diagnostics"))]
+        let kind = ();
+        let replay = match self.enumerate_attempt(
+            kind,
+            requirements,
+            constraints,
+            environment_model,
+            seed_partition.to_vec(),
+            true,
+            None,
+        )? {
+            EnumerationOutcome::Done(solution) => return Ok(solution),
+            EnumerationOutcome::ReplayAbandoned => {
+                unreachable!("the replay deadline is never armed on the trail-reuse attempt")
+            }
+            EnumerationOutcome::ReuseAbandoned(replay) => replay,
+        };
+
+        prop_hit!(UNIVERSAL_REUSE_ABANDONED);
+        let work_budget = replay
+            .fresh_solve_work
+            .saturating_mul(self.fallback_replay_work_factor)
+            .min(self.fallback_replay_work_cap);
+        let (selected, estimated, stop) =
+            select_replay_prefix(&replay.recorded, self.fallback_replay_cell_cap, work_budget);
+        {
+            let stats = &mut self.universal_fallback_stats;
+            stats.reuse_abandoned += 1;
+            stats.abandoned_cells += replay.recorded.len() as u64;
+            stats.abandoned_literals += replay
+                .recorded
+                .iter()
+                .map(|seed| seed.condition.len() as u64)
+                .sum::<u64>();
+            stats.abandoned_work += replay.abandoned_work;
+            stats.fresh_solve_work += replay.fresh_solve_work;
+            stats.selected_replay_cells += selected as u64;
+            stats.dropped_replay_cells += (replay.recorded.len() - selected) as u64;
+            stats.estimated_replay_work += estimated;
+            stats.replay_work_budget = work_budget;
+            stats.selection_stop = Some(stop);
+        }
+        if stop != ReplaySelectionStop::Complete {
+            prop_hit!(UNIVERSAL_REPLAY_TRUNCATED);
+        }
+        tracing::debug!(
+            "trail reuse exceeded its work budget; re-enumerating without it, seeded by \
+             {selected} of the {} cells found so far ({stop:?}, estimated {estimated} of \
+             budget {work_budget} propagations)",
+            replay.recorded.len(),
+        );
+
+        if selected > 0 {
+            let replay_seeds: Vec<CellCondition<D::NameId>> = replay.recorded[..selected]
+                .iter()
+                .map(|seed| seed.condition.clone())
+                .collect();
+            drop(replay);
+            let deadline = if self.fallback_replay_deadline_enabled {
+                Some(work_budget)
+            } else {
+                None
+            };
+            #[cfg(test)]
+            let deadline = match self.test_fallback_replay_budget_override {
+                Some(budget) => Some(budget),
+                None => deadline,
+            };
+            self.universal_fallback_stats.replay_attempts += 1;
+            #[cfg(feature = "diagnostics")]
+            let kind = UniversalAttemptKind::InternalReplay;
+            match self.enumerate_attempt(
+                kind,
+                requirements,
+                constraints,
+                environment_model,
+                replay_seeds,
+                false,
+                deadline,
+            )? {
+                EnumerationOutcome::Done(solution) => return Ok(solution),
+                EnumerationOutcome::ReuseAbandoned(_) => {
+                    unreachable!("the prefix budget is never armed when trail reuse is disabled")
+                }
+                EnumerationOutcome::ReplayAbandoned => {
+                    // The prediction was wrong and the replay-shaped state
+                    // is discarded wholesale; fall through to the
+                    // historical baseline.
+                    prop_hit!(UNIVERSAL_REPLAY_ABANDONED);
+                    self.universal_fallback_stats.replay_aborted += 1;
+                    tracing::debug!(
+                        "the internal seed replay exceeded its actual-work deadline; \
+                         re-enumerating from the historical baseline (original caller \
+                         seeds only)"
+                    );
+                }
+            }
+        } else {
+            prop_hit!(UNIVERSAL_REPLAY_EMPTY_SELECTION);
+        }
+
+        self.universal_fallback_stats.baseline_runs += 1;
+        #[cfg(feature = "diagnostics")]
+        let kind = UniversalAttemptKind::Baseline;
+        match self.enumerate_attempt(
+            kind,
+            requirements,
+            constraints,
+            environment_model,
+            seed_partition.to_vec(),
+            false,
+            None,
+        )? {
+            EnumerationOutcome::Done(solution) => Ok(solution),
+            EnumerationOutcome::ReuseAbandoned(_) | EnumerationOutcome::ReplayAbandoned => {
+                unreachable!("neither internal budget is armed on the baseline attempt")
+            }
+        }
+    }
+
+    /// Runs one [`Self::enumerate_universal`] call and (under diagnostics)
+    /// records an [`UniversalAttemptRecord`] for it. `attempt_kind` is `()`
+    /// without the `diagnostics` feature so call sites stay identical.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn enumerate_attempt(
+        &mut self,
+        #[cfg(feature = "diagnostics")] attempt_kind: UniversalAttemptKind,
+        #[cfg(not(feature = "diagnostics"))] attempt_kind: (),
+        requirements: &[ConditionalRequirement],
+        constraints: &[VersionSetId],
+        environment_model: &EnvironmentModel<D::NameId>,
+        seed_partition: Vec<CellCondition<D::NameId>>,
+        reuse_trail: bool,
+        fallback_replay_budget: Option<u64>,
+    ) -> Result<EnumerationOutcome<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
+        #[cfg(not(feature = "diagnostics"))]
+        let () = attempt_kind;
+        #[cfg(feature = "diagnostics")]
+        let (start, cold, trips_before) = (
+            std::time::Instant::now(),
+            self.cache.fetch_count() == 0,
+            self.witness_probe_trips,
+        );
+        let result = self.enumerate_universal(
             requirements.to_vec(),
             constraints.to_vec(),
             environment_model.clone(),
-            seed_partition.to_vec(),
-            true,
-        )? {
-            EnumerationOutcome::Done(solution) => Ok(solution),
-            EnumerationOutcome::ReuseAbandoned(retry_seeds) => {
-                prop_hit!(UNIVERSAL_REUSE_ABANDONED);
-                tracing::debug!(
-                    "trail reuse exceeded its work budget; re-enumerating without it, \
-                     seeded by the {} cells found so far (plus unprocessed seeds)",
-                    retry_seeds.len(),
-                );
-                match self.enumerate_universal(
-                    requirements.to_vec(),
-                    constraints.to_vec(),
-                    environment_model.clone(),
-                    retry_seeds,
-                    false,
-                )? {
-                    EnumerationOutcome::Done(solution) => Ok(solution),
-                    EnumerationOutcome::ReuseAbandoned(_) => {
-                        unreachable!("the budget is never armed when trail reuse is disabled")
-                    }
+            seed_partition,
+            reuse_trail,
+            fallback_replay_budget,
+        );
+        #[cfg(feature = "diagnostics")]
+        {
+            let (outcome, cells) = match &result {
+                Ok(EnumerationOutcome::Done(solution)) => ("done", solution.cells().len()),
+                Ok(EnumerationOutcome::ReuseAbandoned(replay)) => {
+                    ("reuse_abandoned", replay.recorded.len())
                 }
-            }
+                Ok(EnumerationOutcome::ReplayAbandoned) => ("replay_abandoned", 0),
+                Err(_) => ("failed", 0),
+            };
+            self.universal_attempt_records.push(UniversalAttemptRecord {
+                kind: attempt_kind,
+                round: self.universal_passes,
+                cold,
+                outcome,
+                propagations: self.state.propagated_total(),
+                conflicts: self.state.propagation_counters.conflicts,
+                cells,
+                witness_trips: self.witness_probe_trips - trips_before,
+                wall: start.elapsed(),
+            });
         }
+        result
     }
 
     /// Validates the environment model and seed partition against the cheap
@@ -1445,6 +1813,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         environment_model: EnvironmentModel<D::NameId>,
         seed_partition: Vec<CellCondition<D::NameId>>,
         reuse_trail: bool,
+        fallback_replay_budget: Option<u64>,
     ) -> Result<EnumerationOutcome<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
         // Re-initialize the solver state, like `solve` does. One state is
         // shared across the whole enumeration loop: the formula only grows,
@@ -1498,6 +1867,20 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // the seeds run out the loop continues as free enumeration.
         let mut pending_seeds = seed_partition.into_iter();
 
+        // Arm the fallback-replay deadline of a bounded internal replay
+        // (attempt 2 of `enumerate_universal_with_fallback`): this
+        // enumeration's seeds are internally generated replay hints whose
+        // ACTUAL cost must stay bounded (their observed first-attempt cost
+        // only predicts it). Disarmed explicitly the moment the seeds run
+        // out, before the first free episode (which has the witness probe
+        // as its own guard). Every other enumeration passes `None`: caller
+        // seed partitions, fixed-point reseeds and witness-directed solves
+        // never run under this deadline.
+        let mut replay_phase = fallback_replay_budget.is_some();
+        let replay_work_start = self.state.propagated_total();
+        self.state
+            .arm_fallback_replay_deadline(fallback_replay_budget);
+
         // The uncovered environment region the witness probe most recently
         // escalated to (see the `WitnessProbeTripped` arm below): the next
         // iteration solves it under assumption decisions like a seeded
@@ -1510,6 +1893,15 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // recording, used to attribute propagation work to individual cells.
         #[cfg(feature = "diagnostics")]
         let mut decisions_at_last_cell = 0u64;
+
+        // Per-cell propagated-decision deltas, parallel to `cells`. Tracked
+        // unconditionally (unlike the diagnostics copy above, which feeds
+        // the `universal_cell_decisions` observation point): the
+        // replay-prefix selection of the abandonment fallback uses these as
+        // its work estimates, and the policy must not change with the
+        // `diagnostics` feature.
+        let mut cell_work: Vec<u64> = Vec::new();
+        let mut work_at_last_cell = 0u64;
 
         // Whether the from-scratch solve cost that calibrates the kept-prefix
         // work budget has been recorded yet (the first recorded cell always
@@ -1548,6 +1940,19 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     break;
                 };
                 seeded = self.push_seed_assumptions(&seed)?;
+            }
+
+            // The internal replay (if any) completed all its seeds: disarm
+            // its deadline explicitly BEFORE the first free episode. A free
+            // episode must never observe the replay deadline (it would
+            // spuriously abandon a successfully completed replay); the
+            // witness probe armed below is the free phase's own guard.
+            if replay_phase && !seeded {
+                replay_phase = false;
+                self.state.arm_fallback_replay_deadline(None);
+                self.universal_fallback_stats.actual_replay_work +=
+                    self.state.propagated_total() - replay_work_start;
+                self.universal_fallback_stats.completed_replay_cells += cells.len() as u64;
             }
 
             // Arm the witness probe for a free episode (see
@@ -1625,6 +2030,12 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             .cell_decisions
                             .push(total - decisions_at_last_cell);
                         decisions_at_last_cell = total;
+                    }
+
+                    {
+                        let total = self.state.propagated_total();
+                        cell_work.push(total - work_at_last_cell);
+                        work_at_last_cell = total;
                     }
 
                     if !fresh_cost_recorded {
@@ -1768,19 +2179,60 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                             reuse_trail,
                             "bug: the prefix budget is never armed without trail reuse"
                         );
-                        // Carry the abandoned attempt's coverage work into
-                        // the retry: the recorded cells (in order), then any
-                        // original seeds not yet processed at the abort (the
-                        // prefix budget only arms after the seeds ran out,
-                        // so the leftover is normally empty; chaining keeps
-                        // the contract exact either way). See
+                        // The prefix budget only arms for runs entered over
+                        // a kept trail prefix, kept prefixes only exist in
+                        // the free phase, and the free phase only starts
+                        // after the seeds ran out — so no caller seed can be
+                        // pending here. The retry below replays a PREFIX of
+                        // the recorded cells only; a pending caller seed
+                        // would be silently dropped by it, hence the
+                        // assertion.
+                        debug_assert!(
+                            !seeded && !witness_directed,
+                            "bug: the prefix budget is never armed under assumptions"
+                        );
+                        debug_assert!(
+                            pending_seeds.next().is_none(),
+                            "bug: a prefix-budget abort happened while caller seeds were \
+                             still pending"
+                        );
+                        // Describe the abandoned attempt for the bounded
+                        // replay retry: the recorded cells (in recording
+                        // order) with their observed per-cell costs, the
+                        // attempt's total work, and its fresh-solve
+                        // calibration constant. See
                         // `EnumerationOutcome::ReuseAbandoned`.
-                        let retry_seeds = cells
+                        let recorded = cells
                             .iter()
-                            .map(|cell| cell.condition().clone())
-                            .chain(pending_seeds)
+                            .zip(&cell_work)
+                            .map(|(cell, &observed_work)| ReplaySeed {
+                                condition: cell.condition().clone(),
+                                observed_work,
+                            })
                             .collect();
-                        return Ok(EnumerationOutcome::ReuseAbandoned(retry_seeds));
+                        return Ok(EnumerationOutcome::ReuseAbandoned(AbandonedReplay {
+                            recorded,
+                            abandoned_work: self.state.propagated_total(),
+                            fresh_solve_work: self.state.fresh_solve_cost(),
+                        }));
+                    }
+                    // The bounded internal replay exceeded its actual-work
+                    // deadline: discard the replay-shaped state wholesale
+                    // and let the caller run the historical baseline
+                    // attempt (see `EnumerationOutcome::ReplayAbandoned`).
+                    if value
+                        .downcast_ref::<FallbackReplayBudgetExhausted>()
+                        .is_some()
+                    {
+                        debug_assert!(
+                            replay_phase,
+                            "bug: the replay deadline is only armed while internal \
+                             fallback seeds are being replayed"
+                        );
+                        self.universal_fallback_stats.actual_replay_work +=
+                            self.state.propagated_total() - replay_work_start;
+                        self.universal_fallback_stats.completed_replay_cells += cells.len() as u64;
+                        return Ok(EnumerationOutcome::ReplayAbandoned);
                     }
                     // A free episode that exceeded the witness-probe budget
                     // (see `WITNESS_PROBE_BUDGET`) escalates to the
@@ -3447,6 +3899,102 @@ mod test {
 
     fn literal(variable: usize, negate: bool) -> Literal {
         Literal::new(VariableId::from_index(variable), negate)
+    }
+
+    /// Synthetic replay seeds (empty conditions; the selection only reads
+    /// `observed_work`) for [`select_replay_prefix`] unit tests.
+    fn synthetic_seeds(costs: &[u64]) -> Vec<ReplaySeed<crate::NameId>> {
+        costs
+            .iter()
+            .map(|&observed_work| ReplaySeed {
+                condition: CellCondition::default(),
+                observed_work,
+            })
+            .collect()
+    }
+
+    /// The selection is a recording-order prefix: both caps satisfied,
+    /// exact truncation points, deterministic stop reasons.
+    #[test]
+    fn test_select_replay_prefix_caps() {
+        // Everything fits: replay-all.
+        let seeds = synthetic_seeds(&[100, 200, 300]);
+        assert!(matches!(
+            select_replay_prefix(&seeds, 64, 1_000),
+            (3, 600, ReplaySelectionStop::Complete)
+        ));
+
+        // The cell cap truncates at the exact prefix.
+        assert!(matches!(
+            select_replay_prefix(&seeds, 2, 1_000),
+            (2, 300, ReplaySelectionStop::CellCap)
+        ));
+
+        // The work cap truncates BEFORE the cell cap; the estimated work
+        // of the selection never exceeds the budget.
+        assert!(matches!(
+            select_replay_prefix(&seeds, 64, 250),
+            (1, 100, ReplaySelectionStop::WorkCap)
+        ));
+
+        // A budget below the first cell's cost selects nothing (the caller
+        // then retries with the original caller seeds only).
+        assert!(matches!(
+            select_replay_prefix(&seeds, 64, 99),
+            (0, 0, ReplaySelectionStop::WorkCap)
+        ));
+
+        // Cell cap zero disables internal replay entirely.
+        assert!(matches!(
+            select_replay_prefix(&seeds, 0, 1_000),
+            (0, 0, ReplaySelectionStop::CellCap)
+        ));
+
+        // Saturating arithmetic: huge per-cell costs saturate the running
+        // estimate instead of wrapping below a finite budget. (An infinite
+        // budget of `u64::MAX` deliberately admits everything: that is the
+        // replay-all sweep configuration.)
+        let seeds = synthetic_seeds(&[u64::MAX - 1, u64::MAX - 1]);
+        assert!(matches!(
+            select_replay_prefix(&seeds, 64, u64::MAX - 1),
+            (1, _, ReplaySelectionStop::WorkCap)
+        ));
+        assert!(matches!(
+            select_replay_prefix(&seeds, 64, u64::MAX),
+            (2, u64::MAX, ReplaySelectionStop::Complete)
+        ));
+    }
+
+    /// The 330-seed guard (the historical 79M-propagation replay shape):
+    /// hundreds of deterministic internal seeds cannot bypass the
+    /// configured caps, whichever cap binds first.
+    #[test]
+    fn test_select_replay_prefix_330_seeds_cannot_bypass_caps() {
+        // Cheap cells: the cell cap binds.
+        let seeds = synthetic_seeds(&vec![10; 330]);
+        let budget = 1_000u64
+            .saturating_mul(FALLBACK_REPLAY_WORK_FACTOR)
+            .min(FALLBACK_REPLAY_WORK_CAP);
+        let (selected, estimated, stop) =
+            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget);
+        assert_eq!(selected, FALLBACK_REPLAY_CELL_CAP);
+        assert_eq!(stop, ReplaySelectionStop::CellCap);
+        assert!(estimated <= budget);
+
+        // Expensive cells: the work cap binds far below the cell cap, and
+        // the hard cap bounds the budget itself regardless of how costly
+        // the fresh solve was.
+        let seeds = synthetic_seeds(&vec![100_000; 330]);
+        let budget = u64::MAX
+            .saturating_mul(FALLBACK_REPLAY_WORK_FACTOR)
+            .min(FALLBACK_REPLAY_WORK_CAP);
+        assert_eq!(budget, FALLBACK_REPLAY_WORK_CAP);
+        let (selected, estimated, stop) =
+            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget);
+        assert_eq!(selected, 20, "2M / 100k per cell");
+        assert_eq!(stop, ReplaySelectionStop::WorkCap);
+        assert!(estimated <= FALLBACK_REPLAY_WORK_CAP);
+        assert!(selected < 330 && (selected as u64) * 100_000 <= FALLBACK_REPLAY_WORK_CAP);
     }
 
     /// Formats the cells of a [`UniversalSolution`] for inline snapshots.

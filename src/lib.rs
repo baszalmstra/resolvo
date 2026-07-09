@@ -54,11 +54,11 @@ use itertools::Itertools;
 pub use requirement::Requirement;
 pub use solver::{
     Cell, CellEdge, EmptySolvables, EnvInputSource, EnvironmentModel, InvalidUniversalInput,
-    Problem, Solver, SolverCache, UniversalFailure, UniversalProblem, UniversalSolution,
-    UnsolvableOrCancelled, Violation,
+    Problem, ReplaySelectionStop, Solver, SolverCache, UniversalFailure, UniversalFallbackStats,
+    UniversalProblem, UniversalSolution, UnsolvableOrCancelled, Violation,
 };
 #[cfg(feature = "diagnostics")]
-pub use solver::{CellPinCounts, CellRetract};
+pub use solver::{CellPinCounts, CellRetract, UniversalAttemptKind, UniversalAttemptRecord};
 pub use solver_id::{DenseId, IdMap, IdSet, SolverId, SparseId};
 pub use utils::{IndexedSet, Mapping, MappingIter};
 
