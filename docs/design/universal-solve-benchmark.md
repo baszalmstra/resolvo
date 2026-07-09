@@ -936,14 +936,20 @@ of magnitude below the historical 79M event.
 
 Full-corpus (1000 problems) under the bounded policy: 719 ok, 281
 unsolvable, **0 timeouts** at the 60 s cap, **0 verification failures, 0
-projection failures**, cells median 4 / p95 45 / max 698. Policies diverge
-only on set A (a non-abort row never enters the fallback), and on set A all
-four policies agree on every outcome and record count and every solution
-verifies, so no outcome flip, timeout, or error-semantic change is
-introduced. The cold `--reseed` lockfile flow on the four largest completed
-partitions records zero fallback aborts, confirming the replay deadline
-never touches caller seed partitions; those partitions heal to their fixed
-point in two passes exactly as the un-bounded head does.
+projection failures**, cells median 4 / p95 45 / max 698. The whole corpus
+was additionally re-run end to end under policies N and R: total wall
+**N 766 s / R 765 s / B 755 s**, zero timeouts in all three, and **zero
+outcome flips and zero record-count differences** between any pair over all
+1000 rows. Cell partitions differ only on set A (a non-abort row never
+enters the fallback, so all policies run it identically), and on set A all
+four policies still agree on every outcome and record count and every
+solution verifies. The bounded policy is thus performance-neutral
+corpus-wide (nominally the fastest of the three, within noise) and
+introduces no outcome flip, timeout, or error-semantic change. The cold
+`--reseed` lockfile flow on the four largest completed partitions records
+zero fallback aborts, confirming the replay deadline never touches caller
+seed partitions; those partitions heal to their fixed point in two passes
+exactly as the un-bounded head does.
 
 ### Verdict
 
