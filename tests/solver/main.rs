@@ -2838,3 +2838,69 @@ fn bench_async_encoding() {
         total * 1000.0,
     );
 }
+
+/// Worst-case head-of-line benchmark for the ordered-commit encoder: one slow
+/// shallow candidates fetch plus a deep dependency chain that expands
+/// dynamically inside a single encode invocation (dependency hints make the
+/// encoder fetch and expand candidate dependencies transitively). With
+/// completion-order commits the chain expands while the slow fetch is
+/// pending; with issue-order commits every chain layer discovered after the
+/// slow task waits for its commit. Run with
+/// `cargo test --release --test solver -- --ignored bench_async_hol --nocapture`.
+#[test]
+#[ignore]
+fn bench_async_hol() {
+    use std::time::Instant;
+
+    const DEPTH: usize = 16;
+
+    fn build_provider() -> BundleBoxProvider {
+        let mut pkgs: Vec<(String, u32, Vec<String>)> = Vec::new();
+        for i in 0..DEPTH {
+            let deps = if i + 1 < DEPTH {
+                vec![format!("chain{}", i + 1)]
+            } else {
+                vec![]
+            };
+            for v in 1..=2u32 {
+                pkgs.push((format!("chain{i}"), v, deps.clone()));
+            }
+        }
+        pkgs.push(("slow0".to_string(), 1, vec![]));
+        let pkgs_ref: Vec<(&str, u32, Vec<&str>)> = pkgs
+            .iter()
+            .map(|(n, v, d)| (n.as_str(), *v, d.iter().map(String::as_str).collect()))
+            .collect();
+        BundleBoxProvider::from_packages(&pkgs_ref)
+    }
+
+    for (label, slow) in [("hol-chain-fast", false), ("hol-chain-slow-200ms", true)] {
+        let mut durations = Vec::new();
+        for _ in 0..5 {
+            let mut provider = build_provider();
+            provider.sleep_before_return = true;
+            provider.hint_dependencies_available = true;
+            if slow {
+                provider.slow_candidates.insert("slow0".to_string(), 200);
+            }
+            let requirements = provider.requirements(&["slow0", "chain0"]);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let mut solver = Solver::new(provider).with_runtime(rt);
+            let start = Instant::now();
+            solver
+                .solve(Problem::new().requirements(requirements))
+                .unwrap();
+            durations.push(start.elapsed());
+        }
+        durations.sort();
+        println!(
+            "bench[{label}]: median={:.1}ms min={:.1}ms max={:.1}ms",
+            durations[durations.len() / 2].as_secs_f64() * 1000.0,
+            durations[0].as_secs_f64() * 1000.0,
+            durations[durations.len() - 1].as_secs_f64() * 1000.0,
+        );
+    }
+}
