@@ -2721,3 +2721,120 @@ mod allow_multiple_versions {
     ");
     }
 }
+
+/// Async encoding benchmark: measures wall time, provider concurrency, and
+/// CPU-side scheduling overhead of the encoder's task processing under a
+/// yielding provider. Not a correctness test; run explicitly with
+/// `cargo test --release --test solver -- --ignored bench_async_encoding --nocapture`.
+#[test]
+#[ignore]
+fn bench_async_encoding() {
+    use std::time::Instant;
+
+    // A layered graph: the root requires 20 first-layer packages, each
+    // first-layer package requires 3 unique children, each child 2 unique
+    // grandchildren. 200 packages, 2 versions each; version 1 of every
+    // first-layer package additionally depends on a shared package so the
+    // solver has some real work to do.
+    fn build_provider() -> BundleBoxProvider {
+        let mut pkgs: Vec<(String, u32, Vec<String>)> = Vec::new();
+        for i in 0..20 {
+            let deps: Vec<String> = (0..3).map(|j| format!("c{i}_{j}")).collect();
+            for v in 1..=2u32 {
+                let mut deps = deps.clone();
+                if v == 1 {
+                    deps.push("shared".to_string());
+                }
+                pkgs.push((format!("f{i}"), v, deps));
+            }
+            for j in 0..3 {
+                let gdeps: Vec<String> = (0..2).map(|k| format!("g{i}_{j}_{k}")).collect();
+                for v in 1..=2u32 {
+                    pkgs.push((format!("c{i}_{j}"), v, gdeps.clone()));
+                }
+                for k in 0..2 {
+                    for v in 1..=2u32 {
+                        pkgs.push((format!("g{i}_{j}_{k}"), v, vec![]));
+                    }
+                }
+            }
+        }
+        for v in 1..=2u32 {
+            pkgs.push(("shared".to_string(), v, vec![]));
+        }
+        let pkgs_ref: Vec<(&str, u32, Vec<&str>)> = pkgs
+            .iter()
+            .map(|(n, v, d)| (n.as_str(), *v, d.iter().map(String::as_str).collect()))
+            .collect();
+        BundleBoxProvider::from_packages(&pkgs_ref)
+    }
+
+    let root_names: Vec<String> = (0..20).map(|i| format!("f{i}")).collect();
+
+    // Scenario A: uniform 10ms provider latency (timer-driven).
+    // Scenario B: same, but one early candidates fetch takes 200ms extra
+    //             (worst case for ordered commits: everything issued after it
+    //             must wait for its commit before issuing children).
+    for (label, slow) in [("uniform-10ms", false), ("slow-early-200ms", true)] {
+        let mut durations = Vec::new();
+        let mut max_concurrency = 0;
+        let mut records = 0;
+        for _ in 0..5 {
+            let mut provider = build_provider();
+            provider.sleep_before_return = true;
+            if slow {
+                provider.slow_candidates.insert("f0".to_string(), 200);
+            }
+            let roots: Vec<&str> = root_names.iter().map(String::as_str).collect();
+            let requirements = provider.requirements(&roots);
+            let concurrency = provider.concurrent_requests_max.clone();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let mut solver = Solver::new(provider).with_runtime(rt);
+            let start = Instant::now();
+            let solved = solver
+                .solve(Problem::new().requirements(requirements))
+                .unwrap();
+            durations.push(start.elapsed());
+            max_concurrency = max_concurrency.max(concurrency.get());
+            records = solved.len();
+        }
+        durations.sort();
+        println!(
+            "bench[{label}]: median={:.1}ms min={:.1}ms max={:.1}ms \
+             max_concurrency={max_concurrency} records={records}",
+            durations[durations.len() / 2].as_secs_f64() * 1000.0,
+            durations[0].as_secs_f64() * 1000.0,
+            durations[durations.len() - 1].as_secs_f64() * 1000.0,
+        );
+    }
+
+    // Scenario C: cooperative seeded delays (no timers) measure the CPU-side
+    // scheduling overhead of the encoder's task machinery.
+    let mut durations = Vec::new();
+    for run in 0..30 {
+        let mut provider = build_provider();
+        provider.sleep_before_return = true;
+        provider.delay_seed = 900_000 + run;
+        let roots: Vec<&str> = root_names.iter().map(String::as_str).collect();
+        let requirements = provider.requirements(&roots);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut solver = Solver::new(provider).with_runtime(rt);
+        let start = Instant::now();
+        solver
+            .solve(Problem::new().requirements(requirements))
+            .unwrap();
+        durations.push(start.elapsed());
+    }
+    durations.sort();
+    let total: f64 = durations.iter().map(|d| d.as_secs_f64()).sum();
+    println!(
+        "bench[cooperative-seeded]: median={:.2}ms total(30 runs)={:.1}ms",
+        durations[durations.len() / 2].as_secs_f64() * 1000.0,
+        total * 1000.0,
+    );
+}

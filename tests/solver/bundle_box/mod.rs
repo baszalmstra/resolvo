@@ -109,6 +109,12 @@ pub struct BundleBoxProvider {
     /// tests covering that path set this flag.
     pub allow_refetch: bool,
 
+    /// Extra sleep (in milliseconds, on top of [`Self::maybe_delay`]) applied
+    /// to `get_candidates` calls for the listed packages. Used by benchmarks
+    /// to model a single slow request in an otherwise fast provider. Requires
+    /// a runtime with time support.
+    pub slow_candidates: HashMap<String, u64>,
+
     // A mapping of packages that we have requested candidates for. This way we can keep track of
     // duplicate requests.
     requested_candidates: RefCell<HashSet<NameId>>,
@@ -443,6 +449,9 @@ impl DependencyProvider for BundleBoxProvider {
         self.call_log
             .borrow_mut()
             .push(format!("candidates:{package_name}"));
+        if let Some(&extra_ms) = self.slow_candidates.get(package_name) {
+            tokio::time::sleep(Duration::from_millis(extra_ms)).await;
+        }
         let Some(package) = self.packages.get(package_name) else {
             return self.maybe_delay(None).await;
         };
