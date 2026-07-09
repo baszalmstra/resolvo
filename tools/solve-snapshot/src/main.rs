@@ -1064,6 +1064,13 @@ fn main() {
                         "    blocking completion: {queries} queries, {clause_visits} clause \
                          visits, {literal_visits} literal visits, {hits} hits",
                     );
+                    let (registered, routed, occurrence_visits, fully_false, max_active) =
+                        solver.blocking_completion_index_counters();
+                    eprintln!(
+                        "    blocking index: {registered} registered, {routed} routed, \
+                         {occurrence_visits} occurrence visits, {fully_false} fully false, \
+                         {max_active} max active",
+                    );
                     let mut cell_decisions = solver.universal_cell_decisions().to_vec();
                     if !cell_decisions.is_empty() {
                         cell_decisions.sort_unstable();

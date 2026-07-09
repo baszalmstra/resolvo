@@ -35,6 +35,7 @@ use crate::{
 
 mod assertion_scans;
 mod binary_encoding;
+mod blocking_completion;
 mod cache;
 pub(crate) mod clause;
 mod conditions;
@@ -354,10 +355,18 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// multi-literal ones are filtered during the scan).
     env_clause_ids: Vec<ClauseId>,
 
-    /// The subset of `env_clauses` that are blocking clauses, iterated in
-    /// `decide()` to make sure every solution's undecided-counts-as-false
-    /// completion satisfies them.
+    /// The subset of `env_clauses` that are blocking clauses. `decide()`
+    /// makes sure every solution's undecided-counts-as-false completion
+    /// satisfies them; kept (alongside the incremental index below) for the
+    /// pending-encode gate and the debug reference scan.
     blocking_clauses: Vec<(EnvClauseId, ClauseId)>,
+
+    /// Incremental completion index over the multi-literal blocking
+    /// clauses, replacing the full rescan at the end of `decide()`. Kept in
+    /// lockstep with the assignment trail by lazy sync through
+    /// [`DecisionTracker::take_blocking_sync_floor`]. See
+    /// [`blocking_completion`].
+    blocking_completion: blocking_completion::BlockingCompletionIndex,
 
     /// Index of clause ids that can contribute to a cell's support during
     /// universal solving, grouped by the clause's parent variable (the
@@ -720,6 +729,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             env_clauses: Default::default(),
             env_clause_ids: Default::default(),
             blocking_clauses: Default::default(),
+            blocking_completion: Default::default(),
             env_support_clauses: Default::default(),
             cell_capture_index: Default::default(),
             env_sensitive_parents: Default::default(),
@@ -905,15 +915,6 @@ pub(crate) struct PropagationCounters {
     /// literals each pinning rule contributed (load-bearing extraction
     /// versus disjointness-repair appends). Empty for a plain solve.
     pub cell_pins: Vec<universal::CellPinCounts>,
-    /// Times `decide()` reached the blocking-clause completion check with no
-    /// other decision left (universal solving only).
-    pub blocking_completion_queries: u64,
-    /// Blocking clauses inspected across all completion checks.
-    pub blocking_completion_clause_visits: u64,
-    /// Blocking-clause literals evaluated across all completion checks.
-    pub blocking_completion_literal_visits: u64,
-    /// Completion checks that produced a blocking-clause decision.
-    pub blocking_completion_hits: u64,
     /// Times the kept-prefix conflict budget aborted a trail-reuse attempt.
     pub prefix_budget_aborts: u64,
     /// Times the per-run conflict limit suspended the env-literals-last
@@ -1145,16 +1146,34 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     }
 
     /// Work counters of the blocking-clause completion check in `decide()`:
-    /// `(queries, clause visits, literal visits, hits)`. See
-    /// [`PropagationCounters`].
+    /// `(queries, clause recomputations, literal visits, hits)`. The
+    /// baseline full scan reported `(queries, clause visits, literal
+    /// visits, hits)` through the same accessor, so the two builds compare
+    /// directly. See [`blocking_completion::BlockingCompletionCounters`].
     #[cfg(feature = "diagnostics")]
     pub fn blocking_completion_scan_counters(&self) -> (u64, u64, u64, u64) {
-        let counters = &self.state.propagation_counters;
+        let counters = &self.state.blocking_completion.counters;
         (
-            counters.blocking_completion_queries,
-            counters.blocking_completion_clause_visits,
-            counters.blocking_completion_literal_visits,
-            counters.blocking_completion_hits,
+            counters.queries,
+            counters.recomputes,
+            counters.literal_visits,
+            counters.hits,
+        )
+    }
+
+    /// Maintenance counters of the blocking-clause completion index:
+    /// `(clauses registered, trail variables routed, occurrence entries
+    /// visited, fully-false recomputations, max active size)`. See
+    /// [`blocking_completion::BlockingCompletionCounters`].
+    #[cfg(feature = "diagnostics")]
+    pub fn blocking_completion_index_counters(&self) -> (u64, u64, u64, u64, u64) {
+        let counters = &self.state.blocking_completion.counters;
+        (
+            counters.clauses_registered,
+            counters.trail_routed,
+            counters.occurrence_visits,
+            counters.fully_false,
+            counters.max_active,
         )
     }
 
@@ -2095,72 +2114,62 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // disjointness-repair invariant. Whenever nothing else is left to
         // decide and a blocking clause is not yet satisfied under the
         // completion, decide its first undecided positive literal to true.
-        if best_decision.is_none() {
-            #[cfg(feature = "diagnostics")]
+        // The first unsatisfied clause and its first undecided positive
+        // literal come from the incremental completion index (see
+        // [`blocking_completion`]); the index is synchronized with the
+        // trail only here, when it is actually queried, through its
+        // dedicated floor. Debug builds verify every query against the
+        // historical full scan ([`Self::blocking_completion_reference`]).
+        if best_decision.is_none() && !self.state.blocking_clauses.is_empty() {
+            let state = &mut self.state;
+            let floor = state.decision_tracker.take_blocking_sync_floor();
+            state
+                .blocking_completion
+                .sync(floor, state.decision_tracker.assignments());
+            let indexed = state
+                .blocking_completion
+                .first_unsatisfied(state.decision_tracker.map());
+
+            #[cfg(debug_assertions)]
             {
-                self.state.propagation_counters.blocking_completion_queries += 1;
+                // The reference runs first so a fully-false clause fails
+                // with the historical expect message at the historical
+                // point, then the complete result tuple must match.
+                let reference = self.blocking_completion_reference();
+                let indexed_tuple = indexed.map(|(env_clause_id, clause_id, action)| {
+                    let blocking_completion::CompletionAction::Decide(candidate) = action else {
+                        panic!(
+                            "an unsatisfied blocking clause must have an undecided positive \
+                             literal; a fully-false clause would have conflicted during \
+                             propagation"
+                        );
+                    };
+                    (env_clause_id, clause_id, candidate)
+                });
+                assert_eq!(
+                    indexed_tuple, reference,
+                    "blocking completion index diverged from the reference scan"
+                );
             }
-            'blocking: for &(env_clause_id, clause_id) in &self.state.blocking_clauses {
-                #[cfg(feature = "diagnostics")]
-                {
-                    self.state
-                        .propagation_counters
-                        .blocking_completion_clause_visits += 1;
-                }
+
+            if let Some((env_clause_id, clause_id, action)) = indexed {
                 debug_assert_eq!(
                     self.state.env_clauses[env_clause_id].kind,
                     EnvClauseKind::Blocking,
                     "only blocking clauses are registered for decide()"
                 );
-                let literals = &self.state.env_clauses[env_clause_id].literals;
-                if literals.len() <= 1 {
-                    // Single-literal blocking clauses are assertions, applied
-                    // during propagation.
-                    continue;
-                }
-
-                let mut first_undecided_positive = None;
-                for &literal in literals {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        self.state
-                            .propagation_counters
-                            .blocking_completion_literal_visits += 1;
-                    }
-                    let assigned = self
-                        .state
-                        .decision_tracker
-                        .assigned_value(literal.variable());
-                    // The literal's value under the undecided-counts-as-false
-                    // completion: an undecided variable evaluates positive
-                    // literals to false and negative literals to true.
-                    let completed =
-                        assigned.map_or(literal.negate(), |value| value != literal.negate());
-                    if completed {
-                        // The clause is already satisfied under completion.
-                        continue 'blocking;
-                    }
-                    if !literal.negate() && assigned.is_none() && first_undecided_positive.is_none()
-                    {
-                        first_undecided_positive = Some(literal.variable());
-                    }
-                }
-
-                let candidate = first_undecided_positive.expect(
-                    "an unsatisfied blocking clause must have an undecided positive literal; \
-                     a fully-false clause would have conflicted during propagation",
-                );
-                #[cfg(feature = "diagnostics")]
-                {
-                    self.state.propagation_counters.blocking_completion_hits += 1;
-                }
+                let blocking_completion::CompletionAction::Decide(candidate) = action else {
+                    panic!(
+                        "an unsatisfied blocking clause must have an undecided positive \
+                         literal; a fully-false clause would have conflicted during propagation"
+                    );
+                };
                 best_decision = Some(PossibleDecision {
                     is_explicit_requirement: false,
                     package_activity: 0.0,
                     candidate_count: 1,
                     decision: (candidate, VariableId::root(), clause_id),
                 });
-                break;
             }
         }
 
@@ -2199,6 +2208,57 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     /// queued for encoding and can never match; only the suffix is scanned.
     /// Taking the encode floor here is sound because it is folded into the
     /// same cursor the `run_sat` scan uses.
+    /// The historical full scan over the blocking clauses, kept as the
+    /// debug oracle for the incremental completion index (see
+    /// [`blocking_completion`]): returns the first registered multi-literal
+    /// blocking clause unsatisfied under the undecided-counts-as-false
+    /// completion, together with its first undecided positive literal, and
+    /// fails with the historical message when an unsatisfied clause has no
+    /// undecided positive literal.
+    #[cfg(debug_assertions)]
+    fn blocking_completion_reference(&self) -> Option<(EnvClauseId, ClauseId, VariableId)> {
+        'blocking: for &(env_clause_id, clause_id) in &self.state.blocking_clauses {
+            debug_assert_eq!(
+                self.state.env_clauses[env_clause_id].kind,
+                EnvClauseKind::Blocking,
+                "only blocking clauses are registered for decide()"
+            );
+            let literals = &self.state.env_clauses[env_clause_id].literals;
+            if literals.len() <= 1 {
+                // Single-literal blocking clauses are assertions, applied
+                // during propagation.
+                continue;
+            }
+
+            let mut first_undecided_positive = None;
+            for &literal in literals {
+                let assigned = self
+                    .state
+                    .decision_tracker
+                    .assigned_value(literal.variable());
+                // The literal's value under the undecided-counts-as-false
+                // completion: an undecided variable evaluates positive
+                // literals to false and negative literals to true.
+                let completed =
+                    assigned.map_or(literal.negate(), |value| value != literal.negate());
+                if completed {
+                    // The clause is already satisfied under completion.
+                    continue 'blocking;
+                }
+                if !literal.negate() && assigned.is_none() && first_undecided_positive.is_none() {
+                    first_undecided_positive = Some(literal.variable());
+                }
+            }
+
+            let candidate = first_undecided_positive.expect(
+                "an unsatisfied blocking clause must have an undecided positive literal; \
+                 a fully-false clause would have conflicted during propagation",
+            );
+            return Some((env_clause_id, clause_id, candidate));
+        }
+        None
+    }
+
     fn has_pending_clause_encodes(&mut self) -> bool {
         let encode_floor = self.state.decision_tracker.take_encode_floor();
         self.state.encode_scan_cursor = self.state.encode_scan_cursor.min(encode_floor);
@@ -3635,6 +3695,22 @@ impl<D: DependencyProvider> SolverState<D> {
                     level,
                 )
                 .expect("bug: the unit literal of an environment clause is unassigned");
+        }
+
+        // Index multi-literal blocking clauses for the completion check in
+        // `decide()` (single-literal blocking clauses are assertions,
+        // applied during propagation, and are never indexed). Registration
+        // happens after the possible unit assignment above and may happen
+        // under a retained trail prefix the index has never synchronized
+        // to; the entry starts dirty and is first computed at the next
+        // completion query, which is correct whether the trail is
+        // unchanged, extended, or retracted in between.
+        if kind == EnvClauseKind::Blocking {
+            let literals = &self.env_clauses[env_clause_id].literals;
+            if literals.len() > 1 {
+                self.blocking_completion
+                    .register(env_clause_id, clause_id, literals);
+            }
         }
 
         clause_id

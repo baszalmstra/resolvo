@@ -27,6 +27,14 @@ pub(crate) struct DecisionTracker {
     /// net effect, so a consumer comparing snapshots never needs to see it.
     sync_floor: usize,
 
+    /// The minimum length of `stack` since the last call to
+    /// [`Self::take_blocking_sync_floor`], with exactly the semantics of
+    /// [`Self::sync_floor`]. Consumed by the blocking-clause completion
+    /// index ([`crate::solver::blocking_completion`]), which keeps its own
+    /// trail mirror; each snapshot-comparing consumer needs its own floor
+    /// because taking one resets it.
+    blocking_sync_floor: usize,
+
     /// The lowest stack length observed since the last call to
     /// [`Self::take_assert_floor`]. The assertion watermark uses this to
     /// find which verified assertions lost their assignment to
@@ -120,6 +128,14 @@ impl DecisionTracker {
     /// or beyond it. See [`Self::sync_floor`].
     pub(crate) fn take_sync_floor(&mut self) -> usize {
         std::mem::replace(&mut self.sync_floor, self.stack.len())
+    }
+
+    /// Returns the minimum trail length reached since the previous call (or
+    /// since construction) and resets the floor to the current trail length.
+    /// Identical semantics to [`Self::take_sync_floor`], tracked separately
+    /// for the blocking-clause completion index.
+    pub(crate) fn take_blocking_sync_floor(&mut self) -> usize {
+        std::mem::replace(&mut self.blocking_sync_floor, self.stack.len())
     }
 
     pub(crate) fn level(&self, variable_id: VariableId) -> u32 {
@@ -229,6 +245,7 @@ impl DecisionTracker {
 
         self.propagate_index = self.stack.len();
         self.sync_floor = self.sync_floor.min(self.stack.len());
+        self.blocking_sync_floor = self.blocking_sync_floor.min(self.stack.len());
         self.assert_floor = self.assert_floor.min(self.stack.len());
         self.encode_floor = self.encode_floor.min(self.stack.len());
 
@@ -320,6 +337,38 @@ mod tests {
         // A full clear resets the floor to zero.
         tracker.clear();
         assert_eq!(tracker.take_sync_floor(), 0);
+    }
+
+    #[test]
+    fn blocking_sync_floor_tracks_the_deepest_truncation_independently() {
+        let mut tracker = DecisionTracker::default();
+        assert_eq!(tracker.take_blocking_sync_floor(), 0);
+        assert_eq!(tracker.take_sync_floor(), 0);
+
+        for i in 1..=4 {
+            tracker
+                .try_add_decision(decision(i, true), i as u32)
+                .unwrap();
+        }
+        // Nothing was undone: the floor is the previous snapshot point.
+        assert_eq!(tracker.take_blocking_sync_floor(), 0);
+        assert_eq!(tracker.take_sync_floor(), 0);
+
+        // Undo to level 2, then add new decisions on top: the floor must
+        // point at the truncation, not at the final length.
+        tracker.undo_until(2);
+        for i in 5..=7 {
+            tracker.try_add_decision(decision(i, false), 3).unwrap();
+        }
+        // Consuming the decide queue's floor must not affect this one: the
+        // two floors track the same truncations independently.
+        assert_eq!(tracker.take_sync_floor(), 2);
+        assert_eq!(tracker.take_blocking_sync_floor(), 2);
+        assert_eq!(tracker.take_blocking_sync_floor(), 5);
+
+        // A full clear resets the floor to zero.
+        tracker.clear();
+        assert_eq!(tracker.take_blocking_sync_floor(), 0);
     }
 
     #[test]

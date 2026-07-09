@@ -4659,6 +4659,62 @@ fn test_universal_trail_reuse_conflict_backjumps_through_prefix() {
     ");
 }
 
+/// A three-way cross product: eight cells, so the enumeration appends eight
+/// multi-literal blocking clauses whose literals are alternately satisfied
+/// and invalidated as the transitions backtrack through the shared prefix.
+/// This is the densest exercise of the blocking-clause completion index in
+/// the deterministic suite; in debug builds the index is checked against the
+/// reference scan at every completion query.
+#[test]
+fn test_universal_blocking_completion_alternates_across_backtracks() {
+    let mut provider = BundleBoxProvider::new();
+    provider.add_environment_package("cuda", true);
+    provider.add_environment_package("rocm", true);
+    provider.add_environment_package("metal", true);
+    provider.add_package("x", Pack::new(2), &["cuda 11..100"], &[]);
+    provider.add_package("x", Pack::new(1), &[], &[]);
+    provider.add_package("y", Pack::new(2), &["rocm 5..100"], &[]);
+    provider.add_package("y", Pack::new(1), &[], &[]);
+    provider.add_package("z", Pack::new(2), &["metal 3..100"], &[]);
+    provider.add_package("z", Pack::new(1), &[], &[]);
+
+    let result = universal_solve_snapshot(provider, &["x", "y", "z"], &[]);
+    assert_snapshot!(result, @r"
+    cell: cuda in >=11, <100 AND rocm in >=5, <100 AND metal in >=3, <100
+      x=2
+      y=2
+      z=2
+    cell: cuda in >=11, <100 AND rocm in >=5, <100 AND not (metal in >=3, <100)
+      x=2
+      y=2
+      z=1
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <100) AND metal in >=3, <100
+      x=2
+      y=1
+      z=2
+    cell: cuda in >=11, <100 AND not (rocm in >=5, <100) AND not (metal in >=3, <100)
+      x=2
+      y=1
+      z=1
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <100 AND metal in >=3, <100
+      x=1
+      y=2
+      z=2
+    cell: not (cuda in >=11, <100) AND rocm in >=5, <100 AND not (metal in >=3, <100)
+      x=1
+      y=2
+      z=1
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <100) AND metal in >=3, <100
+      x=1
+      y=1
+      z=2
+    cell: not (cuda in >=11, <100) AND not (rocm in >=5, <100) AND not (metal in >=3, <100)
+      x=1
+      y=1
+      z=1
+    ");
+}
+
 /// A generated dependency graph: `(name, version, deps)` triples plus root specs.
 type GateFuzzGraph = (Vec<(String, u32, Vec<String>)>, Vec<String>);
 

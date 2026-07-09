@@ -230,26 +230,37 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         writeln!(writer, "Dequeues:\t{}", queue_counters.dequeues).unwrap();
         writeln!(writer, "Walk evaluations:\t{}", queue_counters.walk_evals).unwrap();
 
-        writeln!(writer, "\n=== Blocking Completion ===").unwrap();
+        let blocking_counters = &self.state.blocking_completion.counters;
+        writeln!(writer, "\n=== Blocking Completion Index ===").unwrap();
+        writeln!(writer, "Queries:\t{}", blocking_counters.queries).unwrap();
         writeln!(
             writer,
-            "Queries:\t{}",
-            counters.blocking_completion_queries
+            "Clauses registered:\t{}",
+            blocking_counters.clauses_registered
         )
         .unwrap();
         writeln!(
             writer,
-            "Clause visits:\t{}",
-            counters.blocking_completion_clause_visits
+            "Trail variables routed:\t{}",
+            blocking_counters.trail_routed
         )
         .unwrap();
+        writeln!(
+            writer,
+            "Occurrence visits:\t{}",
+            blocking_counters.occurrence_visits
+        )
+        .unwrap();
+        writeln!(writer, "Recomputes:\t{}", blocking_counters.recomputes).unwrap();
         writeln!(
             writer,
             "Literal visits:\t{}",
-            counters.blocking_completion_literal_visits
+            blocking_counters.literal_visits
         )
         .unwrap();
-        writeln!(writer, "Hits:\t{}", counters.blocking_completion_hits).unwrap();
+        writeln!(writer, "Hits:\t{}", blocking_counters.hits).unwrap();
+        writeln!(writer, "Fully false:\t{}", blocking_counters.fully_false).unwrap();
+        writeln!(writer, "Max active:\t{}", blocking_counters.max_active).unwrap();
 
         writeln!(writer, "\n=== Phase Timing ===").unwrap();
         writeln!(
