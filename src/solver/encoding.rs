@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::{any::Any, collections::VecDeque};
 
 use super::{SolverState, clause::WatchedLiterals, conditions};
 use crate::{
@@ -17,10 +17,13 @@ use futures::{
 };
 use indexmap::IndexMap;
 
-/// A pending task future tagged with its issue sequence number: the task's
-/// index into [`Encoder::completed`], where its result must land.
-type PendingTask<'cache, D> =
-    LocalBoxFuture<'cache, (usize, Result<TaskResult<'cache, D>, Box<dyn Any>>)>;
+/// The result of a task: the [`TaskResult`] it produced, or the cancellation
+/// value from the dependency provider.
+type TaskResultOrCancelled<'cache, D> = Result<TaskResult<'cache, D>, Box<dyn Any>>;
+
+/// A pending task future tagged with its issue sequence number, which
+/// determines the [`Encoder::completed`] slot where its result must land.
+type PendingTask<'cache, D> = LocalBoxFuture<'cache, (usize, TaskResultOrCancelled<'cache, D>)>;
 
 type RequirementCondition<'a, S> = Option<(ConditionId, Vec<Vec<DisjunctionComplement<'a, S>>>)>;
 
@@ -66,17 +69,19 @@ pub(crate) struct Encoder<'a, 'cache, D: DependencyProvider> {
     /// A set of packages that should have an at-least-once tracker.
     new_at_least_one_packages: IndexMap<D::NameId, VariableId, ahash::RandomState>,
 
-    /// Completion slots for issued tasks, indexed by issue sequence number.
-    /// A slot is `None` while its task is pending in
-    /// [`Self::pending_futures`] (or after it has been committed) and `Some`
-    /// once the task completed, immediately or asynchronously. The commit
-    /// loop in [`Self::encode_with_deferred`] takes slots strictly in issue
-    /// order.
-    completed: Vec<Option<Result<TaskResult<'cache, D>, Box<dyn Any>>>>,
+    /// Completion slots for issued-but-uncommitted tasks, a sliding window
+    /// over issue sequence numbers: the slot for sequence `s` is
+    /// `completed[s - next_commit]`. A slot is `None` while its task is
+    /// pending in [`Self::pending_futures`] and `Some` once the task
+    /// completed, immediately or asynchronously. The commit loop in
+    /// [`Self::encode_with_deferred`] pops slots from the front — strictly in
+    /// issue order — so the buffer only ever holds the current task frontier,
+    /// not every task ever issued.
+    completed: VecDeque<Option<TaskResultOrCancelled<'cache, D>>>,
 
-    /// The sequence number of the next task result to commit. Every slot
-    /// below this index has already been taken and handed to
-    /// [`Self::on_task_result`].
+    /// The issue sequence number of the next task result to commit, i.e. of
+    /// the front slot of [`Self::completed`]. Every sequence number below
+    /// this has already been committed through [`Self::on_task_result`].
     next_commit: usize,
 }
 
@@ -185,7 +190,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             forbid_seen: IndexedSet::default(),
             level,
             new_at_least_one_packages: IndexMap::default(),
-            completed: Vec::new(),
+            completed: VecDeque::new(),
             next_commit: 0,
         }
     }
@@ -204,11 +209,11 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     where
         F: std::future::Future<Output = Result<TaskResult<'cache, D>, Box<dyn Any>>> + 'cache,
     {
-        let sequence = self.completed.len();
-        self.completed.push(None);
+        let sequence = self.next_commit + self.completed.len();
+        self.completed.push_back(None);
         let mut boxed = future.map(move |result| (sequence, result)).boxed_local();
         match boxed.as_mut().now_or_never() {
-            Some((_, result)) => self.completed[sequence] = Some(result),
+            Some((_, result)) => *self.completed.back_mut().expect("just pushed") = Some(result),
             None => {
                 // Future is still pending. Hand the boxed future to
                 // `pending_futures` so it can be polled asynchronously.
@@ -255,15 +260,17 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // at their sequence turn, matching the synchronous baseline.
         loop {
             // Commit every result that is ready, in sequence order. Handlers
-            // may issue new tasks, growing `completed`.
-            while let Some(slot) = self.completed.get_mut(self.next_commit) {
-                let Some(result) = slot.take() else {
-                    break;
-                };
+            // may issue new tasks, growing `completed` at the back.
+            while let Some(Some(_)) = self.completed.front() {
+                let result = self
+                    .completed
+                    .pop_front()
+                    .expect("checked non-empty")
+                    .expect("checked filled");
                 self.next_commit += 1;
                 self.on_task_result(result?);
             }
-            if self.next_commit == self.completed.len() {
+            if self.completed.is_empty() {
                 // Every issued task has been committed.
                 break;
             }
@@ -274,12 +281,11 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             let Some((sequence, result)) = self.pending_futures.next().await else {
                 unreachable!("an issued task has not been committed, but no futures are pending");
             };
-            debug_assert!(
-                sequence >= self.next_commit,
-                "a task completed after its slot was already committed"
-            );
-            debug_assert!(self.completed[sequence].is_none(), "a task completed twice");
-            self.completed[sequence] = Some(result);
+            let slot = sequence
+                .checked_sub(self.next_commit)
+                .expect("a task completed after its slot was already committed");
+            debug_assert!(self.completed[slot].is_none(), "a task completed twice");
+            self.completed[slot] = Some(result);
         }
 
         self.add_pending_forbid_clauses();
