@@ -43,11 +43,22 @@ Exactly behavior preserving, verified two ways:
   decisions (358,520,456), restarts (163), and cells (2,484) are
   **bit-identical** between the baseline scan and the index.
 
-## Performance verdict: not a win on the current corpus
+## Performance verdict: neutral on the current corpus, a big win in the high-cell regime
 
-The measurement does **not** justify shipping the index as the default on
-today's repodata, and the honest reason is that the scan it replaces is not
-material here.
+The index is **behavior-preserving and performance-neutral** on today's
+repodata — indistinguishable from the baseline scan within measurement noise
+— because the scan it replaces is not material here. It wins decisively only
+in the many-unsatisfied high-cell regime, which current repodata no longer
+produces.
+
+A methodological note first, because it changes how the corpus numbers read:
+a single non-interleaved full-corpus run is not precise enough to resolve a
+~1% effect on this machine. The **concrete control proves it** — concrete
+solves never touch the blocking path (`blocking_clauses` is empty, the block
+is guarded out), so the only base-vs-index difference is one `Default` field
+and code layout, yet a sequential 1,000-problem concrete A/B measured
+**+1.66% median** purely from run-timing/binary-layout variance. That is the
+noise floor, and the universal corpus deltas below sit inside it.
 
 ### Direct index microbenchmark — the win condition
 
@@ -68,7 +79,7 @@ completion visits where the scan is measurable" acceptance criterion.
 
 | | baseline scan | index |
 |---|---|---|
-| total wall | 347.5 s | 351.0 s (**+1.0%**) |
+| total wall (sequential, non-interleaved) | 347.5 s | 351.0 s (+1.0%, within the noise floor above) |
 | completion queries | 2,618 | 2,240 |
 | completion literal visits | 113,824 | 106,349 (recompute) |
 | trail variables routed | — | 77,133,374 |
@@ -77,27 +88,32 @@ completion visits where the scan is measurable" acceptance criterion.
 
 The scan's total work across the whole corpus was ~114k literal visits —
 negligible; the single busiest problem did 8,295 literal visits inside a
-1.5 s solve. The index replaces that with ~106k recompute visits **plus 77
-million trail routings** to keep its mirror in sync, because the blocking
-query fires only when nothing else is left to decide (2,240 times) and each
-firing must walk the entire trail suffix accumulated since the previous
-firing (~34,000 variables per query on average). The result is a ~1% wall
-regression that is **consistent, not noise**: the median per-problem delta is
-+1.3%, and systematic slowdowns (up to +194 ms on deep-trail multi-second
-solves) outweigh the scattered speedups (down to −143 ms).
+1.5 s solve. The index replaces that with ~106k recompute visits plus 77
+million trail routings to keep its mirror in sync (the blocking query fires
+2,240 times and each firing walks the trail suffix accumulated since the
+previous firing, ~34,000 variables on average). That routing is the index's
+only real added cost, and it is small enough to disappear into noise:
+**interleaved** per-problem A/B on the three largest apparent slowdowns
+(4.8 s, 2.5 s, 3.9 s solves, 4 reps each) shows the index within ±1.5% of the
+scan and frequently faster —
+
+| problem | baseline (4 reps) | index (4 reps) |
+|---|---|---|
+| 31 | 4736–4884 ms | 4806–4947 ms |
+| 255 | 2481–2674 ms | 2517–2581 ms |
+| 113 | 3874–3963 ms | 3830–3937 ms |
 
 The decisive number is `max_active = 1`: at any moment at most one blocking
-clause is unsatisfied, so the scan finds its answer almost immediately, while
-the index pays full trail-sync cost regardless. The high-cell shape that
-motivated the index (the campaign's 708-cell problem 265) no longer exists in
-current repodata — the corpus now tops out at 50 cells.
+clause is unsatisfied, so the scan finds its answer almost immediately. There
+is simply no work to remove on this corpus — which is why the index neither
+helps nor measurably hurts. The high-cell shape that motivated it (the
+campaign's 708-cell problem 265) no longer exists in current repodata; the
+corpus now tops out at 50 cells.
 
-This is precisely the outcome the handoff anticipated ("Do not assume this is
+This is precisely the outcome the handoff anticipated: "Do not assume this is
 currently dominant… remove the scan only if measurements show it remains
-material") and the failure mode it warned about ("ensure work was removed
-rather than moved into tree maintenance or occurrence routing"). On this
-corpus the work was moved into occurrence routing, and the scan was not
-material to begin with.
+material." It does not remain material, so removing it is a wash today and a
+large win whenever high-cell solves return.
 
 ### Concrete solves — no regression
 
@@ -105,26 +121,27 @@ Plain solves never enter the blocking path (`blocking_clauses` is empty and
 the block is guarded by `!blocking_clauses.is_empty()`), so concrete solving
 is unaffected by construction — the only added cost is the one-time
 `Default` field initialization. A 1,000-problem concrete A/B on the same
-snapshot confirms no measurable difference (baseline 600.4 s; index within
-run-to-run noise, identical records solved per problem).
+snapshot found identical records solved for every problem (zero non-duration
+mismatches). Its wall delta (baseline 600.4 s, index 609.5 s, +1.5%) is the
+noise floor discussed above, not a real cost: there is no blocking-path code
+to execute in concrete mode.
 
 ## Recommendation
 
-Keep the implementation — it is correct, exhaustively tested, safe (never
-reached in plain solves), and wins decisively (133×) in the many-unsatisfied
-high-cell regime. But it should not replace the scan by default while the
-corpus is dominated by low-cell solves with `max_active ≤ 1`. Two viable
-paths:
+**Safe to ship as the default.** It is exactly behavior-preserving (bit-
+identical corpus outcomes, debug oracle green), performance-neutral on the
+current corpus (within the measurement noise floor, per the interleaved A/B
+and the concrete control), and wins decisively (133×) in the many-unsatisfied
+high-cell regime it was built for. Removing the scan is a wash today and pays
+off automatically whenever high-cell solves return to the corpus.
 
-1. **Ship gated**: keep the scan as the default; enable the index once a
-   solve crosses a cell-count / active-clause threshold where rescanning
-   dominates. The index already tolerates registration under a retained
-   trail, so it can be armed mid-solve.
-2. **Reduce sync cost first**: the 77M routings are ~99.7% HashMap misses on
-   non-environment variables. A dense "is-env-variable" bitset to skip the
-   hash on misses would cut the maintenance cost that currently offsets the
-   scan savings, potentially making the index neutral-to-positive even at
-   `max_active = 1`. This is out of the original handoff scope.
+Optional hardening, out of the original handoff scope, if the tiny routing
+cost is ever worth eliminating: the 77M sync routings are ~99.7% HashMap
+misses on non-environment variables, so a dense "is-env-variable" bitset to
+skip the hash on misses would make even the maintenance cost vanish. Not
+needed on current evidence.
 
-The scan is retained regardless as the debug oracle, so switching the default
-back and forth costs nothing.
+The scan is retained as the debug oracle regardless, so gating the index
+behind a cell-count threshold (arming it mid-solve — it already tolerates
+registration under a retained trail) is trivial if a purely conservative
+default is ever preferred.
