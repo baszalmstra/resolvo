@@ -905,6 +905,15 @@ pub(crate) struct PropagationCounters {
     /// literals each pinning rule contributed (load-bearing extraction
     /// versus disjointness-repair appends). Empty for a plain solve.
     pub cell_pins: Vec<universal::CellPinCounts>,
+    /// Times `decide()` reached the blocking-clause completion check with no
+    /// other decision left (universal solving only).
+    pub blocking_completion_queries: u64,
+    /// Blocking clauses inspected across all completion checks.
+    pub blocking_completion_clause_visits: u64,
+    /// Blocking-clause literals evaluated across all completion checks.
+    pub blocking_completion_literal_visits: u64,
+    /// Completion checks that produced a blocking-clause decision.
+    pub blocking_completion_hits: u64,
     /// Times the kept-prefix conflict budget aborted a trail-reuse attempt.
     pub prefix_budget_aborts: u64,
     /// Times the per-run conflict limit suspended the env-literals-last
@@ -1133,6 +1142,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     #[cfg(feature = "diagnostics")]
     pub fn prefix_budget_aborts(&self) -> u64 {
         self.state.propagation_counters.prefix_budget_aborts
+    }
+
+    /// Work counters of the blocking-clause completion check in `decide()`:
+    /// `(queries, clause visits, literal visits, hits)`. See
+    /// [`PropagationCounters`].
+    #[cfg(feature = "diagnostics")]
+    pub fn blocking_completion_scan_counters(&self) -> (u64, u64, u64, u64) {
+        let counters = &self.state.propagation_counters;
+        (
+            counters.blocking_completion_queries,
+            counters.blocking_completion_clause_visits,
+            counters.blocking_completion_literal_visits,
+            counters.blocking_completion_hits,
+        )
     }
 
     /// Overrides the kept-prefix work budget of universal trail reuse (see
@@ -2073,7 +2096,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // decide and a blocking clause is not yet satisfied under the
         // completion, decide its first undecided positive literal to true.
         if best_decision.is_none() {
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state.propagation_counters.blocking_completion_queries += 1;
+            }
             'blocking: for &(env_clause_id, clause_id) in &self.state.blocking_clauses {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state
+                        .propagation_counters
+                        .blocking_completion_clause_visits += 1;
+                }
                 debug_assert_eq!(
                     self.state.env_clauses[env_clause_id].kind,
                     EnvClauseKind::Blocking,
@@ -2088,6 +2121,12 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
                 let mut first_undecided_positive = None;
                 for &literal in literals {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        self.state
+                            .propagation_counters
+                            .blocking_completion_literal_visits += 1;
+                    }
                     let assigned = self
                         .state
                         .decision_tracker
@@ -2111,6 +2150,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     "an unsatisfied blocking clause must have an undecided positive literal; \
                      a fully-false clause would have conflicted during propagation",
                 );
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state.propagation_counters.blocking_completion_hits += 1;
+                }
                 best_decision = Some(PossibleDecision {
                     is_explicit_requirement: false,
                     package_activity: 0.0,

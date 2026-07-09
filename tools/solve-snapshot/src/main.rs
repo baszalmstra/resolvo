@@ -1058,6 +1058,12 @@ fn main() {
                         solver.env_ordering_restarts(),
                         solver.prefix_budget_aborts(),
                     );
+                    let (queries, clause_visits, literal_visits, hits) =
+                        solver.blocking_completion_scan_counters();
+                    eprintln!(
+                        "    blocking completion: {queries} queries, {clause_visits} clause \
+                         visits, {literal_visits} literal visits, {hits} hits",
+                    );
                     let mut cell_decisions = solver.universal_cell_decisions().to_vec();
                     if !cell_decisions.is_empty() {
                         cell_decisions.sort_unstable();

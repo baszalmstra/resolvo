@@ -230,6 +230,27 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         writeln!(writer, "Dequeues:\t{}", queue_counters.dequeues).unwrap();
         writeln!(writer, "Walk evaluations:\t{}", queue_counters.walk_evals).unwrap();
 
+        writeln!(writer, "\n=== Blocking Completion ===").unwrap();
+        writeln!(
+            writer,
+            "Queries:\t{}",
+            counters.blocking_completion_queries
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "Clause visits:\t{}",
+            counters.blocking_completion_clause_visits
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "Literal visits:\t{}",
+            counters.blocking_completion_literal_visits
+        )
+        .unwrap();
+        writeln!(writer, "Hits:\t{}", counters.blocking_completion_hits).unwrap();
+
         writeln!(writer, "\n=== Phase Timing ===").unwrap();
         writeln!(
             writer,
