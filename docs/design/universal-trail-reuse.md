@@ -9,6 +9,12 @@ bounded by env literals sitting mid-trail, making the env-literals-last
 decision ordering (listed under follow-ups below) the prerequisite for
 the collapse this note aimed at.
 
+The fallback's seeding of the retry with the abandoned attempt's cells —
+the large-partition replay hazard flagged in that verdict — is now bounded
+by a deterministic, cost-aware recording-order prefix policy; see
+`universal-solve-benchmark.md`, section "Cost-aware bounded fallback seed
+replay" (2026-07-09).
+
 Original design follows. Follow-up to the benchmark report
 (`universal-solve-benchmark.md`), which motivates this with a profile:
 high-cell enumerations spend 94% of their time re-deciding and

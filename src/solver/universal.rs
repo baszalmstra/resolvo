@@ -1613,7 +1613,9 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             // (stats accounting); the inner option is the actual-work
             // deadline, `None` when a sweep disabled it.
             let deadline = if self.fallback_replay_deadline_enabled {
-                Some(Some(work_budget.saturating_mul(FALLBACK_REPLAY_DEADLINE_SLACK)))
+                Some(Some(
+                    work_budget.saturating_mul(FALLBACK_REPLAY_DEADLINE_SLACK),
+                ))
             } else {
                 Some(None)
             };

@@ -1,7 +1,8 @@
 # Universal solve benchmark
 
 Status: campaign completed 2026-06-11 on branch
-`universal-solve-bench-fixes` (resolvo and rattler).
+`universal-solve-bench-fixes` (resolvo and rattler); extended 2026-07-09
+with the cost-aware bounded fallback seed replay (final section).
 
 This report benchmarks `Solver::solve_universal` at scale on real
 conda-forge repodata, characterizes its cost distribution against plain
@@ -785,3 +786,179 @@ follow-up.
   call before mainlining restarts.
 - All universal solutions verifier-clean in every run; the 1000-seed
   property test and the decide oracle stayed green throughout.
+
+## Cost-aware bounded fallback seed replay (2026-07-09)
+
+This section reconciles three findings that the earlier campaign left in
+tension and documents the bounded replay policy that resolves them. It was
+produced on branch `claude/implement-and-measure-performance-kijm6k` (based
+on `universal-solver` head `a4f2d43`), which carries all of the night-2
+machinery above.
+
+### The tension
+
+The trail-reuse fallback rebuilds from a fresh state with reuse disabled
+when a prefix-started run exceeds its work budget. Two valid, opposite
+measurements bracket how it should be seeded:
+
+- **`41bf0801` (replay-all).** Discarding the abandoned attempt's cells
+  wasted 40-48% of total work on the idx-33-class aborts of the
+  then-current corpus, so the fallback was changed to seed the retry with
+  every cell the abandoned attempt had recorded.
+- **The trail-reuse verdict (this report, above).** Re-enumerating under
+  330 recorded seed cells exploded one transition to 79M propagations
+  where the unseeded baseline needed ~2.5k conflicts total. Replaying
+  large seed partitions is its own scaling hazard, and the property
+  generator covers only small universes.
+
+Replay-all takes the first measurement and ignores the second; the
+historical baseline (never replay) does the reverse. Neither is supported
+by all the evidence.
+
+### The policy
+
+The `ReuseAbandoned` outcome now carries the abandoned attempt's recorded
+cells with their per-cell propagation costs (tracked unconditionally, so
+the policy is identical with and without the `diagnostics` feature), the
+attempt's total work, and its fresh-solve calibration cost. The reuse-free
+retry replays a bounded, deterministic **recording-order prefix** of those
+cells rather than all of them:
+
+- The prefix is the longest that satisfies both a **cell-count cap** (64)
+  and an **estimated-work budget** (`min(8 x fresh-solve cost, 2M
+  propagations)`). Each cell is priced at `max(observed first-attempt
+  work, one fresh solve)`; the fresh-solve floor is load-bearing (see
+  below). Integer counts and saturating arithmetic only; no wall time, no
+  sampling, no hash order. The prefix is truncated once, never reordered
+  or cherry-picked.
+- If no cell fits the caps the retry uses the original caller seed
+  partition directly (the historical baseline).
+- The actual replay work is separately bounded by a cumulative
+  propagation deadline (`FallbackReplayBudgetExhausted`), armed at `2x`
+  the selection budget and only while internally generated fallback seeds
+  replay. It never applies to caller seed partitions, fixed-point
+  reseeds, witness-directed assumptions, or concrete solves, and is
+  disarmed before the first free episode. On a trip the replay-shaped
+  state is discarded wholesale and one final baseline enumeration runs
+  (original caller seeds, reuse disabled, no deadline).
+
+Control flow is therefore bounded to three attempts per enumeration pass:
+trail reuse, bounded internal replay, historical baseline. Only completed
+replay cells add blocking clauses, and the free phase plus the environment
+witness search remain the coverage authority, so truncating the internal
+replay can change the valid partition (deterministically) but can neither
+drop a solution nor hide an unsolvable region.
+
+### The fresh-solve floor
+
+Instrumentation on the 2026-07 conda-forge linux-64 snapshot answered the
+handoff's first question — *is the historical 79M event seeded or free on
+the current solver?* It is **seeded**: it is internal-replay work, and it
+grows linearly in the number of replayed cells. A cell's observed
+first-attempt cost is its trail-reuse *transition* cost (a few hundred to a
+few thousand propagations under the env-literals-last ordering), while its
+reuse-free seeded replay fully retracts and re-derives the assignment for
+about one fresh solve. Pricing seeds by their observed transition cost
+therefore selects hundreds of cells whose actual replay reliably overshoots
+the deadline and pays the worst case of all three attempts; flooring each
+seed at one fresh solve makes an `8x` budget select about eight cells, which
+is what keeps the replay bounded. (On a forced 63-cell abandonment the
+replay-all estimate is `63 x 1.12M = 70.7M` propagations — the same linear
+shape as the historical 79M event — while the bounded policy selects 1 cell
+and holds actual replay work at 1.12M.)
+
+### Method
+
+`solve-snapshot` built `--release --features diagnostics`, gated on four
+policies through env-var overrides: **N** historical baseline (no internal
+replay), **R** replay-all (`41bf0801`), **B0** bounded prefix without the
+actual-work abort, **B** the complete bounded policy (the compiled-in
+default). Snapshot regenerated from current conda-forge linux-64+noarch
+repodata with rattler's `create-resolvo-snapshot`; model
+`model-linux-64.json` (glibc floor 2.17, cuda absent-or-`>=11,<14`,
+archspec x86_64 lineage). Focused rows repeated three times on an otherwise
+idle machine; medians reported. Every run carried `--verify --project`.
+
+### Benefit set A and the retained-benefit criterion
+
+Benefit set `A` is every row of the 1000-problem corpus whose default
+(bounded) build reports at least one trail-reuse abandonment:
+**{70, 411, 525, 758, 846, 890}** (6 rows; determined by instrumentation,
+byte-identical across the three repeats). Note this is a fresh corpus: the
+idx-33 index of the `41bf0801` study is tied to the June repodata draw and
+does not carry over, and no row of the current corpus reproduces its
+40-48%-benefit shape — every natural-abort row here is a cheap problem.
+
+Medians over set A (three repeats), wall in seconds and propagated
+decisions summed over the set:
+
+| policy | wall (s) | propagations |
+|--------|----------|--------------|
+| N (no replay)     | 11.50 | 28.64M |
+| R (replay-all)    | 10.42 | 23.99M |
+| B0 (bounded, no abort) | 11.36 | 28.79M |
+| B (bounded)       | 11.40 | 28.79M |
+
+The acceptance criterion `(N - B) / (N - R) >= 0.75` is **not met**: the
+wall ratio is 0.09 and the work ratio is negative. The reason is not that
+the bounded policy is expensive — it is statistically indistinguishable
+from no-replay — but that **replay-all has almost no benefit to retain on
+this corpus**. `N - R` is 1.08 s and 4.6M propagations spread across six
+sub-4-second problems (row 70 is unsolvable at ~4 s; the rest are under
+3.5 s), which is noise, not the idx-33-class 40-48% the criterion was
+written against. The bounded selection, floored at one fresh solve per
+cell, captures little of that marginal saving. On a corpus that did contain
+an idx-33-class row the ratio would be the live measurement; here the
+premise (a large replay-all benefit) is simply absent.
+
+### What the policy does buy: hazard containment, no regression
+
+The defensive half of the mission is met and measured. Forcing late
+trail-reuse abandonment on the three highest-cell rows (10, 13, 267) via a
+small kept-prefix budget makes the abandoned attempt record 70-105 cells —
+the many-recorded-cells shape the caps exist for:
+
+| row (cells) | R replays / actual work | B replays / actual work |
+|-------------|-------------------------|-------------------------|
+| 10 (360)    | 70 cells / 3.64M   | 5 cells / 0.75M  |
+| 13 (144)    | 105 cells / 7.22M  | 8 cells / 0.67M  |
+| 267 (108)   | 63 cells / 6.95M (est. exposure 70.7M) | 1 cell / 1.12M |
+
+Replay-all's internal replay grows with the recorded-cell count; the
+bounded policy holds it near one fresh solve regardless. Wall times are
+within noise across all four policies on these rows (B within 0.2 s of R),
+because the base enumeration dominates — the bounded policy removes the
+work-scaling hazard without a wall cost. The 330-seed guard is exercised
+directly in `select_replay_prefix` unit tests: 330 deterministic seeds
+select at most the 64-cell cap (cheap seeds) or `2M / per-cell` (expensive
+seeds), and the armed deadline stays at most 4M propagations, over an order
+of magnitude below the historical 79M event.
+
+Full-corpus (1000 problems) under the bounded policy: 719 ok, 281
+unsolvable, **0 timeouts** at the 60 s cap, **0 verification failures, 0
+projection failures**, cells median 4 / p95 45 / max 698. Policies diverge
+only on set A (a non-abort row never enters the fallback), and on set A all
+four policies agree on every outcome and record count and every solution
+verifies, so no outcome flip, timeout, or error-semantic change is
+introduced. The cold `--reseed` lockfile flow on the four largest completed
+partitions records zero fallback aborts, confirming the replay deadline
+never touches caller seed partitions; those partitions heal to their fixed
+point in two passes exactly as the un-bounded head does.
+
+### Verdict
+
+On the current corpus the bounded fallback replay is a **wash on wall time
+and a strict improvement on worst-case work**: it neither helps nor hurts
+the typical solve, retains the always-on recommendation, and removes the
+large-partition replay hazard that the trail-reuse verdict flagged as
+unguarded. This mirrors the standalone trail-reuse verdict (a wash on
+aggregates, kept for its protection) one level down: with the idx-33-class
+benefit absent from this repodata draw, the honest case for the bounded
+policy is defensive — it makes replay-all's large-partition failure mode
+unreachable at no measured cost — rather than a wall speedup. Should a
+future corpus (or lockfile-sized caller partitions fed back through the
+seed path) reintroduce an idx-33-class abort, the same instrumentation
+(`Solver::universal_fallback_stats`, the per-attempt records, and the
+policy sweep env vars) re-measures the retained-benefit ratio directly, and
+the caps can be retuned against it without touching the hazard guard, which
+is independent of the selection budget.
