@@ -47,6 +47,14 @@ struct Opts {
     #[clap(long, default_value = "0")]
     skip: usize,
 
+    /// Solve only these problem indices (comma separated; still drawing
+    /// every problem from the rng so the corpus stays identical): one
+    /// invocation re-runs a scattered outlier set without paying the
+    /// snapshot load per row. Combines with --skip/--limit, which bound the
+    /// drawn range as before.
+    #[clap(long, value_delimiter = ',')]
+    rows: Vec<usize>,
+
     /// The timeout to use for solving requirements in seconds. If a solve takes
     /// longer if will be cancelled.
     #[clap(long, default_value = "60")]
@@ -768,6 +776,9 @@ fn main() {
         if i < opts.skip {
             continue;
         }
+        if !opts.rows.is_empty() && !opts.rows.contains(&i) {
+            continue;
+        }
 
         // Construct a fresh provider from the snapshot
         let mut provider = snapshot
@@ -930,6 +941,17 @@ fn main() {
                             "1" => true,
                             _ => panic!("RESOLVO_FALLBACK_REPLAY_DEADLINE must be 0 or 1"),
                         });
+                    }
+                    // Forces the kept-prefix work budget, so sweeps can
+                    // provoke LATE trail-reuse abandonments on high-cell
+                    // problems (the many-recorded-cells replay shape the
+                    // fallback caps guard against).
+                    if let Ok(budget) = std::env::var("RESOLVO_PREFIX_BUDGET") {
+                        solver.set_prefix_budget_override(Some(
+                            budget
+                                .parse()
+                                .expect("RESOLVO_PREFIX_BUDGET must be an integer"),
+                        ));
                     }
                 }
                 let result = solver.solve_universal(problem);

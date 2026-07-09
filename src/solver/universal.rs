@@ -252,6 +252,16 @@ pub(crate) const FALLBACK_REPLAY_WORK_FACTOR: u64 = 8;
 /// replay two orders of magnitude below that).
 pub(crate) const FALLBACK_REPLAY_WORK_CAP: u64 = 2_000_000;
 
+/// Slack multiple between the estimated-work SELECTION budget and the
+/// ACTUAL-work deadline armed over the replay: the deadline exists to catch
+/// predictions that are *wrong* (a replay behaving pathologically), not
+/// predictions that are merely a little tight, and a borderline trip pays
+/// the worst case of all three attempts (abandoned reuse + wasted partial
+/// replay + baseline). Two keeps every deadline at most
+/// `2 * min(8 x fresh, 2M) = min(16 x fresh, 4M)` propagations, still well
+/// over an order of magnitude below the historical 79M replay disaster.
+pub(crate) const FALLBACK_REPLAY_DEADLINE_SLACK: u64 = 2;
+
 /// Why the replay-prefix selection stopped where it did (see
 /// [`select_replay_prefix`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,17 +281,30 @@ pub enum ReplaySelectionStop {
 /// wall time, no sampling, no hash iteration order. Truncates once; never
 /// reorders or cherry-picks cheap later cells (recording order is
 /// observable seed influence and the least disruptive policy).
+///
+/// Each cell's replay cost is estimated as
+/// `max(observed_work, fresh_floor)`, with `fresh_floor` the abandoned
+/// attempt's fresh-solve cost. The floor is load-bearing (measured on the
+/// 2026-07 conda-forge corpus): a cell's OBSERVED cost is its trail-reuse
+/// transition cost — a few thousand propagations under the
+/// env-literals-last ordering — while its reuse-free seeded replay fully
+/// retracts and re-derives the assignment, costing about one fresh solve
+/// (the historical 330-seed/79M event is exactly `330 x fresh`, linear,
+/// not superlinear). Pricing seeds below the floor would select prefixes
+/// whose actual replay reliably explodes past the deadline, paying the
+/// worst case of all three attempts.
 fn select_replay_prefix<N>(
     recorded: &[ReplaySeed<N>],
     cell_cap: usize,
     work_budget: u64,
+    fresh_floor: u64,
 ) -> (usize, u64, ReplaySelectionStop) {
     let mut estimated: u64 = 0;
     for (index, seed) in recorded.iter().enumerate() {
         if index >= cell_cap {
             return (index, estimated, ReplaySelectionStop::CellCap);
         }
-        let with_seed = estimated.saturating_add(seed.observed_work);
+        let with_seed = estimated.saturating_add(seed.observed_work.max(fresh_floor));
         if with_seed > work_budget {
             return (index, estimated, ReplaySelectionStop::WorkCap);
         }
@@ -316,11 +339,12 @@ pub struct UniversalFallbackStats {
     pub selected_replay_cells: u64,
     /// Recorded cells the replay-prefix selection dropped (either cap).
     pub dropped_replay_cells: u64,
-    /// Estimated work (sum of observed first-attempt costs) of the selected
-    /// prefixes.
+    /// Estimated work of the selected prefixes: the sum of the cells'
+    /// fresh-floored observed first-attempt costs (see
+    /// [`select_replay_prefix`]).
     pub estimated_replay_work: u64,
-    /// The work budget of the most recent selection (also the armed actual
-    /// deadline when the deadline is enabled).
+    /// The estimated-work budget of the most recent selection. The armed
+    /// actual deadline is `FALLBACK_REPLAY_DEADLINE_SLACK` times this.
     pub replay_work_budget: u64,
     /// Stop reason of the most recent selection.
     pub selection_stop: Option<ReplaySelectionStop>,
@@ -1546,8 +1570,12 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             .fresh_solve_work
             .saturating_mul(self.fallback_replay_work_factor)
             .min(self.fallback_replay_work_cap);
-        let (selected, estimated, stop) =
-            select_replay_prefix(&replay.recorded, self.fallback_replay_cell_cap, work_budget);
+        let (selected, estimated, stop) = select_replay_prefix(
+            &replay.recorded,
+            self.fallback_replay_cell_cap,
+            work_budget,
+            replay.fresh_solve_work,
+        );
         {
             let stats = &mut self.universal_fallback_stats;
             stats.reuse_abandoned += 1;
@@ -1582,7 +1610,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .collect();
             drop(replay);
             let deadline = if self.fallback_replay_deadline_enabled {
-                Some(work_budget)
+                Some(work_budget.saturating_mul(FALLBACK_REPLAY_DEADLINE_SLACK))
             } else {
                 None
             };
@@ -3914,39 +3942,41 @@ mod test {
     }
 
     /// The selection is a recording-order prefix: both caps satisfied,
-    /// exact truncation points, deterministic stop reasons.
+    /// exact truncation points, deterministic stop reasons. (`fresh_floor`
+    /// 0 isolates the pure observed-cost arithmetic; the floor is covered
+    /// below.)
     #[test]
     fn test_select_replay_prefix_caps() {
         // Everything fits: replay-all.
         let seeds = synthetic_seeds(&[100, 200, 300]);
         assert!(matches!(
-            select_replay_prefix(&seeds, 64, 1_000),
+            select_replay_prefix(&seeds, 64, 1_000, 0),
             (3, 600, ReplaySelectionStop::Complete)
         ));
 
         // The cell cap truncates at the exact prefix.
         assert!(matches!(
-            select_replay_prefix(&seeds, 2, 1_000),
+            select_replay_prefix(&seeds, 2, 1_000, 0),
             (2, 300, ReplaySelectionStop::CellCap)
         ));
 
         // The work cap truncates BEFORE the cell cap; the estimated work
         // of the selection never exceeds the budget.
         assert!(matches!(
-            select_replay_prefix(&seeds, 64, 250),
+            select_replay_prefix(&seeds, 64, 250, 0),
             (1, 100, ReplaySelectionStop::WorkCap)
         ));
 
         // A budget below the first cell's cost selects nothing (the caller
         // then retries with the original caller seeds only).
         assert!(matches!(
-            select_replay_prefix(&seeds, 64, 99),
+            select_replay_prefix(&seeds, 64, 99, 0),
             (0, 0, ReplaySelectionStop::WorkCap)
         ));
 
         // Cell cap zero disables internal replay entirely.
         assert!(matches!(
-            select_replay_prefix(&seeds, 0, 1_000),
+            select_replay_prefix(&seeds, 0, 1_000, 0),
             (0, 0, ReplaySelectionStop::CellCap)
         ));
 
@@ -3956,13 +3986,40 @@ mod test {
         // replay-all sweep configuration.)
         let seeds = synthetic_seeds(&[u64::MAX - 1, u64::MAX - 1]);
         assert!(matches!(
-            select_replay_prefix(&seeds, 64, u64::MAX - 1),
+            select_replay_prefix(&seeds, 64, u64::MAX - 1, 0),
             (1, _, ReplaySelectionStop::WorkCap)
         ));
         assert!(matches!(
-            select_replay_prefix(&seeds, 64, u64::MAX),
+            select_replay_prefix(&seeds, 64, u64::MAX, 0),
             (2, u64::MAX, ReplaySelectionStop::Complete)
         ));
+    }
+
+    /// The fresh-solve floor prices every seed at no less than one fresh
+    /// solve (measured: a reuse-free seeded replay costs about one fresh
+    /// solve per cell even when the cell's observed trail-reuse transition
+    /// was a few thousand propagations), so an `8 x fresh` budget selects
+    /// about eight cheap cells rather than hundreds.
+    #[test]
+    fn test_select_replay_prefix_fresh_floor() {
+        let fresh = 90_000u64;
+        let budget = fresh * FALLBACK_REPLAY_WORK_FACTOR;
+        // 40 cells whose observed transition cost was tiny.
+        let seeds = synthetic_seeds(&vec![3_000; 40]);
+        let (selected, estimated, stop) =
+            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget, fresh);
+        assert_eq!(selected, FALLBACK_REPLAY_WORK_FACTOR as usize);
+        assert_eq!(estimated, fresh * FALLBACK_REPLAY_WORK_FACTOR);
+        assert_eq!(stop, ReplaySelectionStop::WorkCap);
+
+        // A cell whose observed cost EXCEEDS the fresh solve keeps its
+        // observed price (the floor is a floor, not a constant).
+        let seeds = synthetic_seeds(&[400_000, 3_000, 3_000]);
+        let (selected, estimated, stop) =
+            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget, fresh);
+        assert_eq!(selected, 3);
+        assert_eq!(estimated, 400_000 + 2 * fresh);
+        assert_eq!(stop, ReplaySelectionStop::Complete);
     }
 
     /// The 330-seed guard (the historical 79M-propagation replay shape):
@@ -3970,13 +4027,13 @@ mod test {
     /// configured caps, whichever cap binds first.
     #[test]
     fn test_select_replay_prefix_330_seeds_cannot_bypass_caps() {
-        // Cheap cells: the cell cap binds.
+        // Cheap cells under a tiny fresh solve: the cell cap binds.
         let seeds = synthetic_seeds(&vec![10; 330]);
         let budget = 1_000u64
             .saturating_mul(FALLBACK_REPLAY_WORK_FACTOR)
             .min(FALLBACK_REPLAY_WORK_CAP);
         let (selected, estimated, stop) =
-            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget);
+            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget, 10);
         assert_eq!(selected, FALLBACK_REPLAY_CELL_CAP);
         assert_eq!(stop, ReplaySelectionStop::CellCap);
         assert!(estimated <= budget);
@@ -3990,11 +4047,25 @@ mod test {
             .min(FALLBACK_REPLAY_WORK_CAP);
         assert_eq!(budget, FALLBACK_REPLAY_WORK_CAP);
         let (selected, estimated, stop) =
-            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget);
+            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget, 100_000);
         assert_eq!(selected, 20, "2M / 100k per cell");
         assert_eq!(stop, ReplaySelectionStop::WorkCap);
         assert!(estimated <= FALLBACK_REPLAY_WORK_CAP);
         assert!(selected < 330 && (selected as u64) * 100_000 <= FALLBACK_REPLAY_WORK_CAP);
+
+        // The historical event itself: 330 seeds, fresh solve ~240k (330 x
+        // 240k = 79M). The hard cap admits at most 2M/240k = 8 cells and
+        // the armed deadline stays at 4M, twenty times below the event.
+        let seeds = synthetic_seeds(&vec![5_000; 330]);
+        let fresh = 240_000u64;
+        let budget = fresh
+            .saturating_mul(FALLBACK_REPLAY_WORK_FACTOR)
+            .min(FALLBACK_REPLAY_WORK_CAP);
+        let (selected, estimated, _) =
+            select_replay_prefix(&seeds, FALLBACK_REPLAY_CELL_CAP, budget, fresh);
+        assert_eq!(selected, 8);
+        assert!(estimated <= budget);
+        assert!(budget.saturating_mul(FALLBACK_REPLAY_DEADLINE_SLACK) <= 4_000_000);
     }
 
     /// Formats the cells of a [`UniversalSolution`] for inline snapshots.

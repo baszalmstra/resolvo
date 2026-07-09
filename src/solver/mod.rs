@@ -252,8 +252,12 @@ pub struct Solver<D: DependencyProvider, RT: AsyncRuntime = NowOrNeverRuntime> {
     /// `max(fresh_solve_cost * PREFIX_BUDGET_FACTOR, PREFIX_BUDGET_FLOOR)`.
     /// Forcing it to `0` makes the first prefix-started run abort
     /// immediately, which is the only way tests can deterministically drive
-    /// the trail-reuse abandonment fallback of `solve_universal`.
-    #[cfg(test)]
+    /// the trail-reuse abandonment fallback of `solve_universal`. Also
+    /// available (via [`Solver::set_prefix_budget_override`]) to diagnostics
+    /// builds, where benchmark sweeps use a small nonzero budget to force
+    /// LATE abandonments on high-cell problems: the recorded-cells-at-abort
+    /// shape that exercises the fallback replay caps at scale.
+    #[cfg(any(test, feature = "diagnostics"))]
     test_prefix_budget_override: Option<u64>,
 
     /// Test-only override of the free-phase witness-probe budget (see
@@ -1040,7 +1044,7 @@ impl<D: DependencyProvider> Solver<D, NowOrNeverRuntime> {
             env_ordering_work_factor: ENV_ORDERING_WORK_FACTOR,
             env_ordering_work_floor: ENV_ORDERING_WORK_FLOOR,
             universal_passes: 0,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "diagnostics"))]
             test_prefix_budget_override: None,
             #[cfg(test)]
             test_witness_probe_override: None,
@@ -1293,6 +1297,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         self.test_prefix_budget_override = budget;
     }
 
+    /// Overrides the kept-prefix work budget of universal trail reuse (the
+    /// diagnostics twin of [`Solver::set_test_prefix_budget_override`]):
+    /// benchmark sweeps use a small nonzero budget to force late trail-reuse
+    /// abandonments on high-cell problems, which recreates the
+    /// many-recorded-cells replay shape the fallback caps guard against.
+    /// Diagnostics-only; the compiled-in budget applies when unset.
+    #[cfg(feature = "diagnostics")]
+    pub fn set_prefix_budget_override(&mut self, budget: Option<u64>) {
+        self.test_prefix_budget_override = budget;
+    }
+
     /// The number of times the witness probe escalated a free universal
     /// enumeration episode to the environment-witness search (see
     /// `universal::WITNESS_PROBE_BUDGET`): the episode exceeded its
@@ -1329,7 +1344,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             env_ordering_work_factor: self.env_ordering_work_factor,
             env_ordering_work_floor: self.env_ordering_work_floor,
             universal_passes: self.universal_passes,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "diagnostics"))]
             test_prefix_budget_override: self.test_prefix_budget_override,
             #[cfg(test)]
             test_witness_probe_override: self.test_witness_probe_override,
@@ -1553,7 +1568,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             #[allow(unused_mut)]
             let mut budget =
                 (self.state.fresh_solve_cost * PREFIX_BUDGET_FACTOR).max(PREFIX_BUDGET_FLOOR);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "diagnostics"))]
             if let Some(override_budget) = self.test_prefix_budget_override {
                 budget = override_budget;
             }
