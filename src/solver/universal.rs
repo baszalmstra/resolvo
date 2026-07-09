@@ -1609,14 +1609,17 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .map(|seed| seed.condition.clone())
                 .collect();
             drop(replay);
+            // The outer `Some` marks the attempt as an internal replay
+            // (stats accounting); the inner option is the actual-work
+            // deadline, `None` when a sweep disabled it.
             let deadline = if self.fallback_replay_deadline_enabled {
-                Some(work_budget.saturating_mul(FALLBACK_REPLAY_DEADLINE_SLACK))
+                Some(Some(work_budget.saturating_mul(FALLBACK_REPLAY_DEADLINE_SLACK)))
             } else {
-                None
+                Some(None)
             };
             #[cfg(test)]
             let deadline = match self.test_fallback_replay_budget_override {
-                Some(budget) => Some(budget),
+                Some(budget) => Some(Some(budget)),
                 None => deadline,
             };
             self.universal_fallback_stats.replay_attempts += 1;
@@ -1684,7 +1687,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         environment_model: &EnvironmentModel<D::NameId>,
         seed_partition: Vec<CellCondition<D::NameId>>,
         reuse_trail: bool,
-        fallback_replay_budget: Option<u64>,
+        fallback_replay_budget: Option<Option<u64>>,
     ) -> Result<EnumerationOutcome<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
         #[cfg(not(feature = "diagnostics"))]
         let () = attempt_kind;
@@ -1841,7 +1844,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         environment_model: EnvironmentModel<D::NameId>,
         seed_partition: Vec<CellCondition<D::NameId>>,
         reuse_trail: bool,
-        fallback_replay_budget: Option<u64>,
+        fallback_replay_budget: Option<Option<u64>>,
     ) -> Result<EnumerationOutcome<D::SolvableId, D::NameId>, UniversalFailure<D::NameId>> {
         // Re-initialize the solver state, like `solve` does. One state is
         // shared across the whole enumeration loop: the formula only grows,
@@ -1907,7 +1910,7 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         let mut replay_phase = fallback_replay_budget.is_some();
         let replay_work_start = self.state.propagated_total();
         self.state
-            .arm_fallback_replay_deadline(fallback_replay_budget);
+            .arm_fallback_replay_deadline(fallback_replay_budget.flatten());
 
         // The uncovered environment region the witness probe most recently
         // escalated to (see the `WitnessProbeTripped` arm below): the next
