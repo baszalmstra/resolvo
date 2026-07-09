@@ -651,4 +651,85 @@ mod tests {
             assert_eq!(harness.query(&mut index), expected, "after {kind}");
         }
     }
+
+    /// Direct index benchmark (protocol item 5): many registered clauses,
+    /// each query touching few occurrences. This is the index's win
+    /// condition — the full scan re-reads every clause on every query while
+    /// the index only recomputes the entries whose variable changed. Ignored
+    /// by default; run in release for timing:
+    /// `cargo test --release --lib blocking_completion -- --ignored --nocapture bench_index_vs_full_scan`.
+    #[test]
+    #[ignore = "benchmark; run explicitly in release builds"]
+    fn bench_index_vs_full_scan_sparse_touches() {
+        // N disjoint two-literal clauses over private variable pairs, so a
+        // query that flips one variable invalidates exactly one clause. The
+        // last clause stays the first unsatisfied one throughout (every
+        // earlier clause is satisfied by its negative literal), so the winner
+        // is stable and both approaches do their full characteristic work.
+        const CLAUSES: usize = 5_000;
+        const QUERIES: usize = 5_000;
+
+        let clause_literals: Vec<[Literal; 2]> = (0..CLAUSES)
+            .map(|i| [negative(2 * i + 1), positive(2 * i + 2)])
+            .collect();
+
+        let mut index = BlockingCompletionIndex::default();
+        let mut harness = Harness::default();
+        for (i, literals) in clause_literals.iter().enumerate() {
+            index.register(env_clause_id(i), clause_id(i), literals.as_slice());
+        }
+
+        // A full-scan reference over the same clause list and map.
+        let full_scan = |map: &DecisionMap| -> Option<usize> {
+            'clause: for (position, literals) in clause_literals.iter().enumerate() {
+                for &literal in literals {
+                    let assigned = map.value(literal.variable());
+                    let completed =
+                        assigned.map_or(literal.negate(), |value| value != literal.negate());
+                    if completed {
+                        continue 'clause;
+                    }
+                }
+                return Some(position);
+            }
+            None
+        };
+
+        // Warm the index and confirm the two agree before timing.
+        assert_eq!(
+            harness.query(&mut index).map(|(env, _, _)| env),
+            full_scan(&harness.map).map(env_clause_id)
+        );
+
+        // Time the incremental index: each query flips one negative variable
+        // true and back, touching a single clause's occurrence list.
+        let start = std::time::Instant::now();
+        for q in 0..QUERIES {
+            let var_index = 2 * (q % CLAUSES) + 1;
+            harness.push(var_index, true);
+            let _ = harness.query(&mut index);
+            harness.pop();
+            let _ = harness.query(&mut index);
+        }
+        let index_time = start.elapsed();
+
+        // Time the full scan over the identical query sequence.
+        let start = std::time::Instant::now();
+        let mut sink = 0usize;
+        for q in 0..QUERIES {
+            let var_index = 2 * (q % CLAUSES) + 1;
+            harness.map.set(variable(var_index), true, 1);
+            sink += full_scan(&harness.map).unwrap_or(0);
+            harness.map.reset(variable(var_index));
+            sink += full_scan(&harness.map).unwrap_or(0);
+        }
+        let scan_time = start.elapsed();
+        std::hint::black_box(sink);
+
+        eprintln!(
+            "{CLAUSES} clauses, {QUERIES}x2 queries: index {index_time:?}, \
+             full scan {scan_time:?} ({:.1}x)",
+            scan_time.as_secs_f64() / index_time.as_secs_f64()
+        );
+    }
 }
