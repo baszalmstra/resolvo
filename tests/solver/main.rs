@@ -4715,6 +4715,39 @@ fn test_universal_blocking_completion_alternates_across_backtracks() {
     ");
 }
 
+/// Synthetic high-cell benchmark for the blocking-clause completion path in
+/// `decide()`: ten independent env-dependent version choices enumerate a
+/// 1,024-cell cross product, appending one multi-literal blocking clause per
+/// cell. Ignored by default; run explicitly in a release build for timing:
+/// `cargo test --release --test solver -- --ignored --nocapture bench_universal_cross_product`.
+#[test]
+#[ignore = "benchmark; run explicitly in release builds"]
+fn bench_universal_cross_product_1024_cells() {
+    let mut provider = BundleBoxProvider::new();
+    let names: Vec<String> = (0..10).map(|i| format!("x{i}")).collect();
+    for (i, name) in names.iter().enumerate() {
+        let env = format!("env{i}");
+        provider.add_environment_package(&env, true);
+        let dep = format!("{env} 1..100");
+        provider.add_package(name, Pack::new(2), &[dep.as_str()], &[]);
+        provider.add_package(name, Pack::new(1), &[], &[]);
+    }
+    let specs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let requirements = provider.requirements(&specs);
+
+    let mut solver = Solver::new(provider);
+    let problem = UniversalProblem::new()
+        .requirements(requirements)
+        .environment_model(EnvironmentModel::new(vec![]));
+    let start = std::time::Instant::now();
+    let solution = solver
+        .solve_universal(problem)
+        .expect("the cross product is solvable in every region");
+    let elapsed = start.elapsed();
+    assert_eq!(solution.cells().len(), 1024);
+    eprintln!("1024-cell cross product solved in {elapsed:?}");
+}
+
 /// A generated dependency graph: `(name, version, deps)` triples plus root specs.
 type GateFuzzGraph = (Vec<(String, u32, Vec<String>)>, Vec<String>);
 
