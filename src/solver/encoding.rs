@@ -1,4 +1,4 @@
-use std::{any::Any, collections::VecDeque};
+use std::any::Any;
 
 use super::{SolverState, clause::WatchedLiterals, conditions};
 use crate::{
@@ -17,7 +17,10 @@ use futures::{
 };
 use indexmap::IndexMap;
 
-type PendingTask<'cache, D> = LocalBoxFuture<'cache, Result<TaskResult<'cache, D>, Box<dyn Any>>>;
+/// A pending task future tagged with its issue sequence number: the task's
+/// index into [`Encoder::completed`], where its result must land.
+type PendingTask<'cache, D> =
+    LocalBoxFuture<'cache, (usize, Result<TaskResult<'cache, D>, Box<dyn Any>>)>;
 
 type RequirementCondition<'a, S> = Option<(ConditionId, Vec<Vec<DisjunctionComplement<'a, S>>>)>;
 
@@ -25,10 +28,14 @@ type RequirementCondition<'a, S> = Option<(ConditionId, Vec<Vec<DisjunctionCompl
 /// provider into rules and variables that are used by the solver.
 ///
 /// This type allows concurrency in the dependency provider by concurrently
-/// requesting information from the provider. This is achieved by recording all
-/// futures in a [`FuturesUnordered`] and processing them as they become
-/// available instead of waiting for individual futures to complete and
-/// processing their response.
+/// requesting information from the provider. All still-pending futures are
+/// recorded in a [`FuturesUnordered`] and polled together, so fetches overlap
+/// freely. Their *results*, however, are committed (i.e. allowed to mutate
+/// solver state and issue child tasks) strictly in task-issue order through a
+/// reorder buffer. This makes clause and variable registration order a
+/// function of the problem alone — identical to what the synchronous
+/// [`crate::runtime::NowOrNeverRuntime`] produces — instead of depending on
+/// provider latency, future wake order, or cache warmth.
 ///
 /// The encoder itself is completely single threaded (and not `Send`) but the
 /// dependency provider is free to spawn tasks on other threads.
@@ -59,9 +66,18 @@ pub(crate) struct Encoder<'a, 'cache, D: DependencyProvider> {
     /// A set of packages that should have an at-least-once tracker.
     new_at_least_one_packages: IndexMap<D::NameId, VariableId, ahash::RandomState>,
 
-    /// Results from futures that completed immediately during
-    /// `try_immediate_or_queue`.
-    pending_results: VecDeque<Result<TaskResult<'cache, D>, Box<dyn Any>>>,
+    /// Completion slots for issued tasks, indexed by issue sequence number.
+    /// A slot is `None` while its task is pending in
+    /// [`Self::pending_futures`] (or after it has been committed) and `Some`
+    /// once the task completed, immediately or asynchronously. The commit
+    /// loop in [`Self::encode_with_deferred`] takes slots strictly in issue
+    /// order.
+    completed: Vec<Option<Result<TaskResult<'cache, D>, Box<dyn Any>>>>,
+
+    /// The sequence number of the next task result to commit. Every slot
+    /// below this index has already been taken and handed to
+    /// [`Self::on_task_result`].
+    next_commit: usize,
 }
 
 /// The result of a future that was queued for processing.
@@ -169,14 +185,17 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             forbid_seen: IndexedSet::default(),
             level,
             new_at_least_one_packages: IndexMap::default(),
-            pending_results: VecDeque::new(),
+            completed: Vec::new(),
+            next_commit: 0,
         }
     }
 
-    /// Poll `future` once on the stack. If it resolves immediately (as all
-    /// futures do under [`NowOrNeverRuntime`]), record the result for
-    /// iterative processing; otherwise hand the boxed future off to
-    /// [`Self::pending_futures`] for later polling.
+    /// Assign the next issue sequence number to `future`, then poll it once
+    /// on the stack. If it resolves immediately (as all futures do under
+    /// [`NowOrNeverRuntime`]), store the result in its completion slot;
+    /// otherwise hand the boxed future off to [`Self::pending_futures`] for
+    /// later polling, tagged with the sequence number so its eventual result
+    /// lands in the right slot.
     ///
     /// We still box the future, so the allocation cost is the same. The
     /// win over pushing straight to `FuturesUnordered` is avoiding its slab
@@ -185,9 +204,11 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     where
         F: std::future::Future<Output = Result<TaskResult<'cache, D>, Box<dyn Any>>> + 'cache,
     {
-        let mut boxed = future.boxed_local();
+        let sequence = self.completed.len();
+        self.completed.push(None);
+        let mut boxed = future.map(move |result| (sequence, result)).boxed_local();
         match boxed.as_mut().now_or_never() {
-            Some(result) => self.pending_results.push_back(result),
+            Some((_, result)) => self.completed[sequence] = Some(result),
             None => {
                 // Future is still pending. Hand the boxed future to
                 // `pending_futures` so it can be polled asynchronously.
@@ -223,20 +244,42 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             self.queue_deferred_requirement(entry);
         }
 
-        // Process pending work until none remains. Immediately completed
-        // futures are drained iteratively rather than recursing through
-        // on_task_result -> queue_* -> on_task_result. Each loop iteration
-        // drains synchronously-ready results first, then awaits the next
-        // truly-async future, so the trailing drain on stream exhaustion
-        // happens naturally on the next iteration.
+        // Process pending work until none remains. Task results are committed
+        // strictly in issue order (the sequence numbers assigned by
+        // `queue_future`) regardless of the order in which their futures
+        // complete. Already-issued fetches still run concurrently — the
+        // reorder buffer only delays *committing* a result (mutating solver
+        // state and issuing child tasks), never the fetch itself. Handlers
+        // are processed iteratively rather than recursing through
+        // on_task_result -> queue_* -> on_task_result. Errors also surface
+        // at their sequence turn, matching the synchronous baseline.
         loop {
-            while let Some(result) = self.pending_results.pop_front() {
+            // Commit every result that is ready, in sequence order. Handlers
+            // may issue new tasks, growing `completed`.
+            while let Some(slot) = self.completed.get_mut(self.next_commit) {
+                let Some(result) = slot.take() else {
+                    break;
+                };
+                self.next_commit += 1;
                 self.on_task_result(result?);
             }
-            let Some(future_result) = self.pending_futures.next().await else {
+            if self.next_commit == self.completed.len() {
+                // Every issued task has been committed.
                 break;
+            }
+
+            // The task that must commit next is still pending. Await any
+            // completion; a later task may finish first and park in its slot
+            // until its turn comes.
+            let Some((sequence, result)) = self.pending_futures.next().await else {
+                unreachable!("an issued task has not been committed, but no futures are pending");
             };
-            self.on_task_result(future_result?);
+            debug_assert!(
+                sequence >= self.next_commit,
+                "a task completed after its slot was already committed"
+            );
+            debug_assert!(self.completed[sequence].is_none(), "a task completed twice");
+            self.completed[sequence] = Some(result);
         }
 
         self.add_pending_forbid_clauses();

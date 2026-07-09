@@ -48,6 +48,34 @@ pub struct SolverCache<D: DependencyProvider> {
     hint_dependencies_available: RefCell<<D::SolvableId as SolverId>::Set>,
 }
 
+/// Removes the in-flight entry for a single-flight key and notifies waiters
+/// when dropped.
+///
+/// The owner of a single-flight fetch holds this guard while awaiting the
+/// provider. If the owning future is dropped before it publishes its result
+/// (e.g. the encoder aborts on cancellation or an error from another task),
+/// the guard still removes the in-flight entry and wakes all waiters. Waiters
+/// loop back to the cache lookup, observe that neither a published value nor
+/// an in-flight entry exists, and retry the fetch themselves — instead of
+/// waiting forever on a notification that will never arrive. Without this, a
+/// cancelled solve would permanently poison the entry for later solves that
+/// reuse the same cache.
+struct InFlightGuard<'a, K: std::hash::Hash + Eq> {
+    in_flight: &'a RefCell<HashMap<K, Rc<Event>>>,
+    key: K,
+}
+
+impl<K: std::hash::Hash + Eq> Drop for InFlightGuard<'_, K> {
+    fn drop(&mut self) {
+        let event = self
+            .in_flight
+            .borrow_mut()
+            .remove(&self.key)
+            .expect("only the owner removes the in-flight entry");
+        event.notify(usize::MAX);
+    }
+}
+
 impl<D: DependencyProvider> SolverCache<D> {
     /// Constructs a new instance from a provider.
     pub fn new(provider: D) -> Self {
@@ -80,78 +108,81 @@ impl<D: DependencyProvider> SolverCache<D> {
         &self,
         package_name: D::NameId,
     ) -> Result<&Candidates<D::SolvableId>, Box<dyn Any>> {
-        // If we already have the candidates for this package cached we can simply
-        // return
-        let candidates_id = match self.package_name_to_candidates.get(package_name) {
-            Some(id) => id,
-            None => {
-                // Since getting the candidates from the provider is a potentially blocking
-                // operation, we want to check beforehand whether we should cancel the solving
-                // process
-                if let Some(value) = self.provider.should_cancel_with_value() {
-                    return Err(value);
+        let candidates_id = loop {
+            // If we already have the candidates for this package cached we can
+            // simply return.
+            if let Some(id) = self.package_name_to_candidates.get(package_name) {
+                break id;
+            }
+
+            // Since getting the candidates from the provider is a potentially blocking
+            // operation, we want to check beforehand whether we should cancel the solving
+            // process
+            if let Some(value) = self.provider.should_cancel_with_value() {
+                return Err(value);
+            }
+
+            // Check if there is an in-flight request
+            let in_flight_request = self
+                .package_name_to_candidates_in_flight
+                .borrow()
+                .get(&package_name)
+                .cloned();
+            match in_flight_request {
+                Some(in_flight) => {
+                    // Found an in-flight request. Wait for it to settle, then
+                    // loop back to the lookup: if the owner published a result
+                    // it is found there, and if the owner was dropped before
+                    // publishing (e.g. on cancellation) this waiter retries
+                    // the fetch itself.
+                    in_flight.listen().await;
                 }
+                None => {
+                    // Prepare an in-flight notifier for other requests coming in.
+                    self.package_name_to_candidates_in_flight
+                        .borrow_mut()
+                        .insert(package_name, Rc::new(Event::new()));
 
-                // Check if there is an in-flight request
-                let in_flight_request = self
-                    .package_name_to_candidates_in_flight
-                    .borrow()
-                    .get(&package_name)
-                    .cloned();
-                match in_flight_request {
-                    Some(in_flight) => {
-                        // Found an in-flight request, wait for that request to finish and return
-                        // the computed result.
-                        in_flight.listen().await;
-                        self.package_name_to_candidates
-                            .get(package_name)
-                            .expect("after waiting for a request the result should be available")
-                    }
-                    None => {
-                        // Prepare an in-flight notifier for other requests coming in.
-                        self.package_name_to_candidates_in_flight
-                            .borrow_mut()
-                            .insert(package_name, Rc::new(Event::new()));
+                    // The guard removes the entry and notifies waiters when
+                    // dropped, even if this future never reaches the
+                    // publication below.
+                    let _in_flight_guard = InFlightGuard {
+                        in_flight: &self.package_name_to_candidates_in_flight,
+                        key: package_name,
+                    };
 
-                        // Otherwise we have to get them from the DependencyProvider
-                        let candidates = self
-                            .provider
-                            .get_candidates(package_name)
-                            .await
-                            .unwrap_or_default();
+                    // Otherwise we have to get them from the DependencyProvider
+                    let candidates = self
+                        .provider
+                        .get_candidates(package_name)
+                        .await
+                        .unwrap_or_default();
 
-                        // Store information about which solvables dependency information is easy to
-                        // retrieve.
-                        {
-                            let mut hint_dependencies_available =
-                                self.hint_dependencies_available.borrow_mut();
-                            let dependencies_available_candidates =
-                                match &candidates.hint_dependencies_available {
-                                    HintDependenciesAvailable::None => &candidates.candidates[0..0],
-                                    HintDependenciesAvailable::All => &candidates.candidates,
-                                    HintDependenciesAvailable::Some(candidates) => candidates,
-                                };
-                            for &hint_candidate in dependencies_available_candidates.iter() {
-                                hint_dependencies_available.insert(hint_candidate);
-                            }
+                    // Store information about which solvables dependency information is easy to
+                    // retrieve.
+                    {
+                        let mut hint_dependencies_available =
+                            self.hint_dependencies_available.borrow_mut();
+                        let dependencies_available_candidates =
+                            match &candidates.hint_dependencies_available {
+                                HintDependenciesAvailable::None => &candidates.candidates[0..0],
+                                HintDependenciesAvailable::All => &candidates.candidates,
+                                HintDependenciesAvailable::Some(candidates) => candidates,
+                            };
+                        for &hint_candidate in dependencies_available_candidates.iter() {
+                            hint_dependencies_available.insert(hint_candidate);
                         }
-
-                        // Allocate an ID so we can refer to the candidates from everywhere
-                        let candidates_id = self.candidates.alloc(candidates);
-                        self.package_name_to_candidates
-                            .set(package_name, Some(candidates_id));
-
-                        // Remove the in-flight request now that we inserted the result and notify
-                        // any waiters
-                        let notifier = self
-                            .package_name_to_candidates_in_flight
-                            .borrow_mut()
-                            .remove(&package_name)
-                            .expect("notifier should be there");
-                        notifier.notify(usize::MAX);
-
-                        candidates_id
                     }
+
+                    // Allocate an ID so we can refer to the candidates from everywhere
+                    let candidates_id = self.candidates.alloc(candidates);
+                    self.package_name_to_candidates
+                        .set(package_name, Some(candidates_id));
+
+                    // Dropping the guard removes the in-flight entry and
+                    // notifies any waiters, which now find the published
+                    // result on their next lookup.
+                    break candidates_id;
                 }
             }
         };

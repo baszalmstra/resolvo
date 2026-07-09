@@ -1728,6 +1728,114 @@ fn test_registration_order_determinism() {
     }
 }
 
+/// A candidate fetch whose owning future is dropped before it publishes (the
+/// encoder aborts on error or cancellation) must not poison the cache's
+/// single-flight bookkeeping: a waiter that joined the in-flight request has
+/// to wake up, observe that no result was published, and retry the fetch
+/// itself. Before the in-flight guard existed the waiter would wait forever
+/// on a notification that never arrives, deadlocking any later solve that
+/// reuses the same cache.
+#[test]
+fn test_dropped_candidates_fetch_does_not_poison_single_flight() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    // Find a delay seed whose first provider call stays pending on the first
+    // poll, so the owner future can be dropped mid-fetch.
+    for seed in 1..=8u64 {
+        let mut provider = BundleBoxProvider::from_packages(&[("a", 1, vec![])]);
+        provider.sleep_before_return = true;
+        provider.delay_seed = seed;
+        provider.allow_refetch = true;
+        let name = provider.package_name("a");
+        let cache = resolvo::SolverCache::new(provider);
+
+        // The owner starts the provider fetch and stays pending.
+        let mut owner = Box::pin(cache.get_or_cache_candidates(name));
+        if owner.as_mut().poll(&mut cx).is_ready() {
+            // This seed resolves the first call synchronously; try another.
+            continue;
+        }
+
+        // The waiter joins the in-flight request.
+        let mut waiter = Box::pin(cache.get_or_cache_candidates(name));
+        assert!(waiter.as_mut().poll(&mut cx).is_pending());
+
+        // Drop the owner before it publishes its result.
+        drop(owner);
+
+        // The waiter must recover on its own within a bounded number of
+        // polls: wake, notice the missing result, and refetch.
+        for _ in 0..64 {
+            if let Poll::Ready(result) = waiter.as_mut().poll(&mut cx) {
+                let candidates =
+                    result.unwrap_or_else(|_| panic!("the retried fetch should not be cancelled"));
+                assert_eq!(candidates.candidates.len(), 1);
+                return;
+            }
+        }
+        panic!(
+            "the waiter did not recover after the owner was dropped; \
+             the single-flight entry is poisoned"
+        );
+    }
+    panic!("no delay seed produced a pending first fetch");
+}
+
+/// A solve that is cancelled while fetches are in flight must not corrupt the
+/// solver's cache: a later solve on the same solver (which reuses the cache)
+/// has to complete normally.
+#[test]
+fn test_solve_after_cancellation_reuses_cache() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("a", 1, vec!["dep1", "dep2", "dep3"]),
+        ("dep1", 1, vec![]),
+        ("dep2", 1, vec![]),
+        ("dep3", 1, vec![]),
+    ]);
+    provider.add_package(
+        "trigger",
+        Pack::new(1).cancel_during_get_dependencies(),
+        &[],
+        &[],
+    );
+    provider.sleep_before_return = true;
+    provider.delay_seed = 991;
+    provider.allow_refetch = true;
+    let cancelled_requirements = provider.requirements(&["trigger", "a"]);
+    let retry_requirements = provider.requirements(&["a"]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut solver = Solver::new(provider).with_runtime(rt);
+
+    let result = solver.solve(Problem::new().requirements(cancelled_requirements));
+    assert!(
+        matches!(result, Err(UnsolvableOrCancelled::Cancelled(_))),
+        "the first solve should have been cancelled"
+    );
+
+    // The second solve reuses the cache of the first, including any
+    // single-flight state the cancellation left behind.
+    solver.provider().clear_cancel();
+    let solved = solver
+        .solve(Problem::new().requirements(retry_requirements))
+        .expect("the solve after cancellation must succeed");
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r"
+    a=1
+    dep1=1
+    dep2=1
+    dep3=1
+    ");
+}
+
 /// Pin the observable semantic divergence between the lazy-conditional path
 /// and the prior eager SAT encoding.
 ///
@@ -2613,4 +2721,3 @@ mod allow_multiple_versions {
     ");
     }
 }
-

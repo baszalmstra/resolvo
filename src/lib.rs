@@ -143,6 +143,16 @@ pub trait DependencyProvider: Sized + Interner {
     /// solver will iteratively try to select the highest version. If a
     /// conflict is found with the highest version the next version is
     /// tried. This continues until a solution is found.
+    ///
+    /// The returned order must be a pure function of the candidates being
+    /// sorted and stable provider data. Because metadata is fetched
+    /// concurrently, the `solver` cache passed here may contain more or fewer
+    /// entries depending on request timing and on data cached by earlier
+    /// solves; an implementation whose order depends on such incidental cache
+    /// residency makes clause and variable registration order — and
+    /// potentially the selected solution — nondeterministic. Reading from the
+    /// cache (or fetching through it) is fine as long as the resulting order
+    /// is the same whether or not entries were already resident.
     async fn sort_candidates(&self, solver: &SolverCache<Self>, solvables: &mut [Self::SolvableId]);
 
     /// Returns the dependencies for the specified solvable.

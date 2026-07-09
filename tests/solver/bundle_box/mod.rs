@@ -102,6 +102,13 @@ pub struct BundleBoxProvider {
     /// requirement itself is encoded.
     pub hint_dependencies_available: bool,
 
+    /// Permits repeated `get_candidates`/`get_dependencies` requests for the
+    /// same key. The solver cache normally guarantees single-flight, so
+    /// duplicates are asserted against; a fetch that was cancelled mid-flight
+    /// (its future dropped before publication) is legitimately retried and
+    /// tests covering that path set this flag.
+    pub allow_refetch: bool,
+
     // A mapping of packages that we have requested candidates for. This way we can keep track of
     // duplicate requests.
     requested_candidates: RefCell<HashSet<NameId>>,
@@ -315,6 +322,13 @@ impl BundleBoxProvider {
         std::mem::take(&mut *self.call_log.borrow_mut())
     }
 
+    /// Clears a cancellation triggered through
+    /// [`Pack::cancel_during_get_dependencies`], so a later solve on the same
+    /// solver can run to completion.
+    pub fn clear_cancel(&self) {
+        self.cancel_solving.set(false);
+    }
+
     pub fn requested_package_names(&self) -> Vec<String> {
         self.requested_candidates
             .borrow()
@@ -421,7 +435,7 @@ impl DependencyProvider for BundleBoxProvider {
         );
 
         assert!(
-            self.requested_candidates.borrow_mut().insert(name),
+            self.requested_candidates.borrow_mut().insert(name) || self.allow_refetch,
             "duplicate get_candidates request"
         );
 
@@ -482,7 +496,7 @@ impl DependencyProvider for BundleBoxProvider {
         );
 
         assert!(
-            self.requested_dependencies.borrow_mut().insert(solvable),
+            self.requested_dependencies.borrow_mut().insert(solvable) || self.allow_refetch,
             "duplicate get_dependencies request"
         );
 
