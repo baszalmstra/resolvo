@@ -106,6 +106,14 @@ pub struct BundleBoxProvider {
     // duplicate requests.
     requested_candidates: RefCell<HashSet<NameId>>,
     requested_dependencies: RefCell<HashSet<SolvableId>>,
+
+    /// Ordered log of provider fetch calls (`candidates:<name>` and
+    /// `dependencies:<name>=<version>`). Both call kinds record here at call
+    /// time, which for the encoder is task-issue time (the first poll of a
+    /// queued future happens synchronously inside `queue_future`). The log is
+    /// therefore a direct observable for the encoder's task-issue order, which
+    /// in turn determines clause/variable registration order.
+    call_log: RefCell<Vec<String>>,
     interned_solvables: RefCell<HashMap<(NameId, Pack), SolvableId>>,
 }
 
@@ -301,6 +309,12 @@ impl BundleBoxProvider {
     /// Returns the package names for which the solver has issued a
     /// `get_candidates` request. Used by tests that verify lazy candidate
     /// loading does not fetch unreachable packages.
+    /// Returns (and clears) the ordered fetch-call log. See
+    /// [`Self::call_log`].
+    pub fn take_call_log(&self) -> Vec<String> {
+        std::mem::take(&mut *self.call_log.borrow_mut())
+    }
+
     pub fn requested_package_names(&self) -> Vec<String> {
         self.requested_candidates
             .borrow()
@@ -412,6 +426,9 @@ impl DependencyProvider for BundleBoxProvider {
         );
 
         let package_name = self.pool.resolve_package_name(name);
+        self.call_log
+            .borrow_mut()
+            .push(format!("candidates:{package_name}"));
         let Some(package) = self.packages.get(package_name) else {
             return self.maybe_delay(None).await;
         };
@@ -472,6 +489,9 @@ impl DependencyProvider for BundleBoxProvider {
         let candidate = self.pool.resolve_solvable(solvable);
         let package_name = self.pool.resolve_package_name(candidate.name);
         let pack = candidate.record;
+        self.call_log
+            .borrow_mut()
+            .push(format!("dependencies:{package_name}={pack}"));
 
         if pack.cancel_during_get_dependencies {
             self.cancel_solving.set(true);

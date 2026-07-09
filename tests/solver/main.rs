@@ -1634,6 +1634,100 @@ fn test_lazy_conditional_determinism_async() {
     }
 }
 
+/// Registration-order determinism: the encoder must issue its fetch tasks (and
+/// therefore register clauses/variables) in an order that is a function of the
+/// problem alone — not of provider latency or future completion order. The
+/// compatibility baseline is the cold synchronous [`NowOrNeverRuntime`] run;
+/// every async run, under any delay schedule, must produce the *identical*
+/// ordered provider call log.
+///
+/// The graph deliberately exercises every registration-order-sensitive
+/// feature: a shared-requires gate (`shared` has 5 candidates), constraints
+/// (`b` constrains `c 1..2`, forcing a backtrack off `c=2`), a locked package
+/// (`d`), an excluded candidate (`shared=5`), a deferred conditional that
+/// fires mid-solve (`d; if e`), an eagerly-firing conditional (`icons; if
+/// gnome`), a union root requirement, and multiple encode invocations.
+#[test]
+fn test_registration_order_determinism() {
+    fn build_provider() -> BundleBoxProvider {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("a", 1, vec!["shared 1..4", "c"]),
+            ("a", 2, vec!["shared 2..6", "c", "d; if e"]),
+            ("c", 1, vec![]),
+            ("c", 2, vec!["leaf"]),
+            ("d", 1, vec![]),
+            ("d", 2, vec!["e"]),
+            ("d", 3, vec![]),
+            ("e", 1, vec![]),
+            ("shared", 1, vec![]),
+            ("shared", 2, vec![]),
+            ("shared", 3, vec![]),
+            ("shared", 4, vec![]),
+            ("shared", 5, vec![]),
+            ("menu", 1, vec!["icons; if gnome", "gnome"]),
+            ("gnome", 1, vec![]),
+            ("icons", 1, vec![]),
+            ("leaf", 1, vec![]),
+        ]);
+        provider.add_package("b", 1.into(), &["shared", "d 1..3"], &["c 1..2"]);
+        provider.set_locked("d", 2);
+        provider.exclude("shared", 5, "broken");
+        provider
+    }
+
+    fn run(delay_seed: Option<u64>, hints: bool) -> (String, Vec<String>) {
+        let mut provider = build_provider();
+        provider.hint_dependencies_available = hints;
+        let requirements = provider.requirements(&["a", "b", "menu", "c 1..3 | d 1..4"]);
+        let problem = Problem::new().requirements(requirements);
+        let (solution, log) = match delay_seed {
+            None => {
+                let mut solver = Solver::new(provider);
+                let solved = solver.solve(problem).unwrap();
+                (
+                    transaction_to_string(solver.provider(), &solved),
+                    solver.provider().take_call_log(),
+                )
+            }
+            Some(seed) => {
+                provider.sleep_before_return = true;
+                provider.delay_seed = seed;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let mut solver = Solver::new(provider).with_runtime(rt);
+                let solved = solver.solve(problem).unwrap();
+                (
+                    transaction_to_string(solver.provider(), &solved),
+                    solver.provider().take_call_log(),
+                )
+            }
+        };
+        (solution, log)
+    }
+
+    for hints in [false, true] {
+        let (baseline_solution, baseline_log) = run(None, hints);
+        assert!(
+            !baseline_log.is_empty(),
+            "baseline should have recorded fetch calls"
+        );
+        for seed in 1..=24u64 {
+            let (solution, log) = run(Some(770_000 + seed), hints);
+            assert_eq!(
+                solution, baseline_solution,
+                "solution diverged from the cold synchronous baseline \
+                 (hints: {hints}, delay seed {seed})"
+            );
+            assert_eq!(
+                log, baseline_log,
+                "provider fetch order diverged from the cold synchronous \
+                 baseline (hints: {hints}, delay seed {seed})"
+            );
+        }
+    }
+}
+
 /// Pin the observable semantic divergence between the lazy-conditional path
 /// and the prior eager SAT encoding.
 ///
@@ -2519,3 +2613,4 @@ mod allow_multiple_versions {
     ");
     }
 }
+
