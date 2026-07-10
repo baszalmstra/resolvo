@@ -3021,6 +3021,14 @@ impl<D: UniversalDependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         if self.test_coverage_precheck_disabled {
             return false;
         }
+        // Diagnostics-only A/B lever for the benchmark harness: setting
+        // RESOLVO_DISABLE_COVERAGE_PRECHECK exercises the pre-precheck
+        // termination path on the same binary. Not compiled into release
+        // builds without the feature.
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("RESOLVO_DISABLE_COVERAGE_PRECHECK").is_some() {
+            return false;
+        }
         true
     }
 
