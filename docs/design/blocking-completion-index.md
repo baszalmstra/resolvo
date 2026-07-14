@@ -73,6 +73,25 @@ This is the regime the index was built for: many simultaneously-registered
 clauses, each query changing few occurrences. It meets the ">10× fewer
 completion visits where the scan is measurable" acceptance criterion.
 
+### Universal corpus distribution — 1,000 problems
+
+Both builds over 1,000 seed-0 universal problems (711 ok / 289 unsolvable,
+outcomes bit-identical, 0 timeouts). The duration distributions are
+indistinguishable and the per-problem difference is a near-symmetric cloud
+centred on zero (mean +5.9 ms, median +2.0 ms, std 66.5 ms; 425 problems
+faster, 575 slower). Reproduce with
+`tools/solve-snapshot/blocking_index_comparison.ipynb`.
+
+![Solve-duration distribution](../../tools/solve-snapshot/figures/fig1_duration_histogram.png)
+
+![Per-problem duration difference](../../tools/solve-snapshot/figures/fig2_perproblem_diff.png)
+
+The work counters explain why it is a wash — the scan's literal visits
+(364,397 over the 1,000 problems) barely fall (to 345,246), while the index
+must route 150 million trail variables through its mirror to achieve that:
+
+![Blocking-completion work](../../tools/solve-snapshot/figures/fig3_work_counters.png)
+
 ### Universal corpus A/B — the reality check
 
 500 problems, seed 0, 60 s timeout, sequential:
