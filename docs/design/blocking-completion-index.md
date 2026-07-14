@@ -134,6 +134,38 @@ currently dominant… remove the scan only if measurements show it remains
 material." It does not remain material, so removing it is a wash today and a
 large win whenever high-cell solves return.
 
+### Cross-channel check — conda-pypi
+
+conda-forge is not the only channel that could produce high-cell solves, so
+the index was also measured against **conda-pypi** — a much larger channel
+(598,725 package names vs conda-forge's 33,144, served as sharded repodata).
+Building a snapshot required hardening the fetch tool for conda-pypi's scale
+(transient 503 retry, skipping shards with malformed upstream records such as
+a literal `"nightlynightly"` version, per-shard retry-then-skip, and a
+`--max-names` memory-bounded sample), but the universal result is unambiguous:
+
+| sample | env version sets | solvable cells (max / mean) | `max_active` | scan literal visits |
+|---|---|---|---|---|
+| 60k names (10%) | 7 (only the injected env-specs) | 1 / 1.00 | 0 | 0 |
+| 250k names (42%) | 7 (unchanged) | 1 / 1.00 | 0 | 0 |
+
+conda-pypi is *flatter* than conda-forge, not richer. **No conda-pypi package
+constrains `__cuda` or `__archspec` into more than one version set** (the
+relation table stays at the injected env-specs regardless of sample size), so
+every universal solve collapses to a single environment cell and registers no
+multi-literal blocking clause at all — the index has literally nothing to
+track (`max_active = 0`, zero scan work). This is structural: PyPI wheels
+express platform compatibility through manylinux/`__glibc` tags, not the
+fine-grained `__cuda × __archspec` build matrices that generate cells in
+conda-forge. Outcomes were bit-identical between scan and index. (The low
+absolute solvable rate — 34/500 — is a sampling artifact: a strided name
+subset breaks dependency closure, and 438/472 unsolvables are missing-candidate
+errors. It does not affect the cell/`max_active` conclusion, which is
+sample-independent.)
+
+The high-cell workload the index targets is therefore absent from *both*
+current channels tested.
+
 ### Concrete solves — no regression
 
 Plain solves never enter the blocking path (`blocking_clauses` is empty and
