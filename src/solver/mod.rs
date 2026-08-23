@@ -24,12 +24,10 @@ use crate::{
     },
     requirement::RequirementMap,
     runtime::{AsyncRuntime, NowOrNeverRuntime},
-    solver::binary_encoding::AtMostOnceTracker,
     solver_id::{IdMap, IdSet, SolverId},
     utils::{IndexedSet, Mapping},
 };
 
-mod binary_encoding;
 mod cache;
 pub(crate) mod clause;
 mod conditions;
@@ -218,7 +216,21 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     clauses_added_for_package: <D::NameId as SolverId>::Set,
     clauses_added_for_solvable: WithRootSet<D::SolvableId>,
     pub(crate) allow_multiple_names: <D::NameId as SolverId>::Set,
-    at_most_one_trackers: HashMap<D::NameId, AtMostOnceTracker<VariableId>>,
+    at_most_one_trackers: HashMap<D::NameId, usize>,
+
+    /// Same-name at-most-one groups, enforced natively during propagation
+    /// instead of through materialized clauses. Reason clauses are allocated
+    /// lazily, only for propagations that actually happen.
+    amo_groups: Vec<AmoGroup<D::NameId>>,
+
+    /// Maps a variable index to the index of the at-most-one group it belongs
+    /// to (`u32::MAX` when it belongs to none).
+    amo_group_of: Vec<u32>,
+
+    /// Lazily allocated binary forbid clauses, keyed by (chosen, forbidden).
+    /// These serve as reasons for conflict analysis; they are never watched
+    /// because the native group propagation subsumes them.
+    amo_reasons: HashMap<(VariableId, VariableId), ClauseId>,
 
     /// Keeps track of auxiliary variables that are used to encode at-least-one
     /// solvable for a package.
@@ -293,6 +305,9 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             clauses_added_for_solvable: Default::default(),
             allow_multiple_names: Default::default(),
             at_most_one_trackers: Default::default(),
+            amo_groups: Vec::new(),
+            amo_group_of: Vec::new(),
+            amo_reasons: Default::default(),
             at_least_one_tracker: Default::default(),
             constrains_aux_vars: Default::default(),
             requires_aux_vars: Default::default(),
@@ -1189,9 +1204,25 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // an error is returned.
 
         let interner = self.cache.provider();
-        let clause_kinds = &self.state.clauses.kinds;
 
         while let Some(decision) = self.state.decision_tracker.next_unpropagated() {
+            // Natively propagate same-name at-most-one groups: when a member
+            // becomes true, every other member of its group must become false.
+            if decision.value {
+                if let Some(group_idx) = self
+                    .state
+                    .amo_group_of
+                    .as_slice()
+                    .get(decision.variable.to_index())
+                    .copied()
+                    .filter(|&group_idx| group_idx != u32::MAX)
+                {
+                    self.state
+                        .propagate_at_most_one(group_idx as usize, decision.variable, level)?;
+                }
+            }
+
+            let clause_kinds = &self.state.clauses.kinds;
             let watched_literal = Literal::new(decision.variable, decision.value);
 
             #[cfg(feature = "diagnostics")]
@@ -1646,7 +1677,97 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
     }
 }
 
+/// A same-name at-most-one group whose exclusivity is enforced natively
+/// during propagation instead of through materialized clauses.
+pub(crate) struct AmoGroup<N> {
+    /// The package name the group belongs to.
+    name: N,
+
+    /// The candidate variables of which at most one can be true. Global
+    /// deduplication in the encoder guarantees each variable is added once.
+    members: Vec<VariableId>,
+
+    /// The member last propagated to true. Only a hint: it is validated
+    /// against the decision tracker before use, so a stale value after
+    /// backtracking is harmless.
+    chosen: Option<VariableId>,
+}
+
+impl<N> AmoGroup<N> {
+    pub(crate) fn new(name: N) -> Self {
+        Self {
+            name,
+            members: Vec::new(),
+            chosen: None,
+        }
+    }
+
+    pub(crate) fn push_member(&mut self, variable: VariableId) {
+        self.members.push(variable);
+    }
+
+    pub(crate) fn chosen(&self) -> Option<VariableId> {
+        self.chosen
+    }
+
+    pub(crate) fn members(&self) -> &[VariableId] {
+        &self.members
+    }
+}
+
 impl<D: DependencyProvider> SolverState<D> {
+    /// Returns the lazily allocated binary forbid clause (¬winner ∨ ¬loser)
+    /// used as the reason for at-most-one propagations of this pair.
+    pub(crate) fn amo_reason(
+        &mut self,
+        name: D::NameId,
+        winner: VariableId,
+        loser: VariableId,
+    ) -> ClauseId {
+        *self.amo_reasons.entry((winner, loser)).or_insert_with(|| {
+            let (watched_literals, kind) =
+                WatchedLiterals::forbid_multiple(winner, loser.negative(), name);
+            // The clause is intentionally never registered with the watch
+            // system: the native group propagation subsumes its propagation,
+            // the clause only exists to act as a reason during conflict
+            // analysis.
+            self.clauses.alloc(watched_literals, kind)
+        })
+    }
+
+    /// Called when `winner` was assigned true: forces every other member of
+    /// its at-most-one group to false.
+    pub(crate) fn propagate_at_most_one(
+        &mut self,
+        group_idx: usize,
+        winner: VariableId,
+        level: u32,
+    ) -> Result<(), PropagationError> {
+        self.amo_groups[group_idx].chosen = Some(winner);
+        let name = self.amo_groups[group_idx].name;
+        let mut member_idx = 0;
+        while let Some(&member) = self.amo_groups[group_idx].members.get(member_idx) {
+            member_idx += 1;
+            if member == winner {
+                continue;
+            }
+            match self.decision_tracker.assigned_value(member) {
+                Some(false) => {}
+                Some(true) => {
+                    let clause_id = self.amo_reason(name, winner, member);
+                    return Err(PropagationError::Conflict(member, false, clause_id));
+                }
+                None => {
+                    let clause_id = self.amo_reason(name, winner, member);
+                    self.decision_tracker
+                        .try_add_decision(Decision::new(member, false, clause_id), level)
+                        .expect("the variable was checked to be undecided");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Registers a newly encoded requires clause with the incremental decide
     /// queue.
     pub(crate) fn add_requires_clause(

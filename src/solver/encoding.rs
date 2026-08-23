@@ -1,6 +1,6 @@
 use std::{any::Any, collections::VecDeque};
 
-use super::{SolverState, clause::WatchedLiterals, conditions};
+use super::{AmoGroup, PropagationError, SolverState, clause::WatchedLiterals, conditions};
 use crate::{
     Candidates, ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
     Requirement, SolverCache, StringId, VariableId, VersionSetId,
@@ -1103,82 +1103,75 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// clauses for the packages that are reachable from a requirement as an
     /// optimization.
     fn add_pending_forbid_clauses(&mut self) {
-        for (name_id, candidate_var) in
-            self.pending_forbid_clauses
-                .drain(..)
-                .flat_map(|(name_id, candidate_vars)| {
-                    candidate_vars
-                        .into_iter()
-                        .map(move |candidate_var| (name_id, candidate_var))
-                })
-        {
-            // Add forbid constraints for this solvable on all other
-            // solvables that have been visited already for the same
-            // version set name.
-            let mut other_solvables = self
-                .state
-                .at_most_one_trackers
-                .remove(&name_id)
-                .unwrap_or_default();
-            let variable_is_new = other_solvables.add(
-                candidate_var,
-                |a, b, positive| {
-                    let literal_b = if positive { b.positive() } else { b.negative() };
-                    let literal_a = a.negative();
-                    let (watched_literals, kind) =
-                        WatchedLiterals::forbid_multiple(a, literal_b, name_id);
-                    // Inlined `add_clause`: `other_solvables` (above) holds a
-                    // mutable borrow of `at_most_one_trackers`, so we cannot
-                    // call `self.state.add_clause(..)` here.
-                    let clause_id = self.state.clauses.alloc(watched_literals, kind);
-                    if let Some(wl) =
-                        self.state.clauses.watched_literals[clause_id.to_index()].as_mut()
-                    {
-                        self.state.watches.start_watching(wl, clause_id);
-                    }
+        for (name_id, candidate_vars) in self.pending_forbid_clauses.drain(..) {
+            // Find or create the at-most-one group for this package name.
+            let group_idx = match self.state.at_most_one_trackers.get(&name_id) {
+                Some(&idx) => idx,
+                None => {
+                    let idx = self.state.amo_groups.len();
+                    self.state.amo_groups.push(AmoGroup::new(name_id));
+                    self.state.at_most_one_trackers.insert(name_id, idx);
+                    idx
+                }
+            };
 
-                    // Add a decision if a decision has already been made for one of the literals.
-                    let set_literal = match (
-                        literal_a.eval(self.state.decision_tracker.map()),
-                        literal_b.eval(self.state.decision_tracker.map()),
-                    ) {
-                        (Some(false), None) => Some(literal_b),
-                        (None, Some(false)) => Some(literal_a),
-                        (Some(false), Some(false)) => {
-                            // Both solvables are already decided true, but the
-                            // forbid clause that would have prevented this didn't
-                            // exist yet (it's being created right now). Report it
-                            // as a conflict so the solver can backtrack.
+            for candidate_var in candidate_vars {
+                let var_idx = candidate_var.to_index();
+                if self.state.amo_group_of.len() <= var_idx {
+                    self.state.amo_group_of.resize(var_idx + 1, u32::MAX);
+                }
+
+                // A variable belongs to exactly one package, hence at most one
+                // group. `forbid_seen` only deduplicates within a single encode
+                // call, so a candidate is offered again when a different
+                // requirer of the same package is encoded in a later iteration.
+                // Skip it if it already belongs to this group (the old
+                // `AtMostOnceTracker` persisted an `IndexSet` per name for this).
+                if self.state.amo_group_of[var_idx] == group_idx as u32 {
+                    continue;
+                }
+
+                self.state.amo_groups[group_idx].push_member(candidate_var);
+                self.state.amo_group_of[var_idx] = group_idx as u32;
+
+                // Mirror the propagation the materialized clauses used to do
+                // at creation time: a member that joins while the group
+                // already has a true member must be forced false, and a
+                // member that joins while itself already true forces every
+                // other member false.
+                match self.state.decision_tracker.assigned_value(candidate_var) {
+                    Some(true) => {
+                        if let Err(PropagationError::Conflict(_, _, clause_id)) = self
+                            .state
+                            .propagate_at_most_one(group_idx, candidate_var, self.level)
+                        {
+                            // Two group members are already decided true, but
+                            // the constraint that would have prevented this
+                            // didn't exist yet. Report it as a conflict so
+                            // the solver can backtrack.
                             self.conflicting_clauses.push(clause_id);
-                            return;
                         }
-                        _ => None,
-                    };
-                    if let Some(literal) = set_literal {
-                        self.state
-                            .decision_tracker
-                            .try_add_decision(
-                                Decision::new(
-                                    literal.variable(),
-                                    literal.satisfying_value(),
-                                    clause_id,
-                                ),
-                                self.level,
-                            )
-                            .expect("we checked that there is no value yet");
                     }
-                },
-                || {
-                    self.state
-                        .variable_map
-                        .alloc_forbid_multiple_variable(name_id)
-                },
-            );
-            self.state
-                .at_most_one_trackers
-                .insert(name_id, other_solvables);
+                    None => {
+                        let chosen = self.state.amo_groups[group_idx].chosen().filter(|&c| {
+                            c != candidate_var
+                                && self.state.decision_tracker.assigned_value(c) == Some(true)
+                        });
+                        if let Some(chosen) = chosen {
+                            let clause_id =
+                                self.state.amo_reason(name_id, chosen, candidate_var);
+                            self.state
+                                .decision_tracker
+                                .try_add_decision(
+                                    Decision::new(candidate_var, false, clause_id),
+                                    self.level,
+                                )
+                                .expect("the candidate was checked to be undecided");
+                        }
+                    }
+                    Some(false) => {}
+                }
 
-            if variable_is_new {
                 if let Some(at_least_one_variable) = self.state.at_least_one_tracker.get(name_id) {
                     let (watched_literals, kind) =
                         WatchedLiterals::any_of(at_least_one_variable, candidate_var);
@@ -1213,7 +1206,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 .state
                 .at_most_one_trackers
                 .get(&name_id)
-                .map(|tracker| tracker.variables.iter().copied().collect())
+                .map(|&idx| self.state.amo_groups[idx].members().to_vec())
                 .unwrap_or_default();
 
             // Add clauses for the existing variables.

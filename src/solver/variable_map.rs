@@ -33,9 +33,6 @@ pub(crate) enum VariableOrigin<N, S> {
     /// The variable represents a specific solvable.
     Solvable(S),
 
-    /// A variable that helps encode an at most one constraint.
-    ForbidMultiple(N),
-
     /// A variable that indicates that any solvable of a particular package is
     /// part of the solution.
     AtLeastOne(N),
@@ -120,11 +117,6 @@ impl<N: SolverId, S: SolverId> VariableMap<N, S> {
         }
     }
 
-    /// Allocate a variable that helps encode an at most one constraint.
-    pub fn alloc_forbid_multiple_variable(&mut self, name: N) -> VariableId {
-        self.alloc(VariableOrigin::ForbidMultiple(name))
-    }
-
     /// Allocate a variable helps encode whether at least one solvable for a
     /// particular package is selected.
     pub fn alloc_at_least_one_variable(&mut self, name: N) -> VariableId {
@@ -195,9 +187,6 @@ impl<I: Interner> Display for VariableDisplay<'_, I> {
             VariableOrigin::Root => write!(f, "root"),
             VariableOrigin::Solvable(solvable_id) => {
                 write!(f, "{}", self.interner.display_solvable(solvable_id))
-            }
-            VariableOrigin::ForbidMultiple(name) => {
-                write!(f, "forbid-multiple({})", self.interner.display_name(name))
             }
             VariableOrigin::AtLeastOne(name) => {
                 write!(f, "any-of({})", self.interner.display_name(name))
