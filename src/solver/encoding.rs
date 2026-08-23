@@ -8,7 +8,7 @@ use crate::{
     solver::{
         conditions::{DeferredConjunct, DeferredRequirement, Disjunction},
         decision::Decision,
-        decision_map::AmoMemberAdded,
+        decision_map::{AmoGroupId, AmoMemberAdded},
     },
     solver_id::{IdMap, IdSet},
 };
@@ -385,16 +385,21 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         // name.
         //
         // We only register candidates that can actually be selected to keep
-        // the groups (and the sweeps over their members) small.
-        for (solvable, variable_id) in candidates
-            .iter()
-            .zip(version_set_variables.iter())
-            .flat_map(|(&candidates, variable)| {
-                candidates.iter().copied().zip(variable.iter().copied())
-            })
-        {
-            let name_id = self.cache.provider().solvable_name(solvable);
-            self.register_forbid_target(name_id, variable_id);
+        // the groups (and the sweeps over their members) small. All matching
+        // candidates of a version set share that version set's package name,
+        // so resolve the name and its group once per candidate list instead of
+        // once per candidate.
+        for (&candidates, variables) in candidates.iter().zip(version_set_variables.iter()) {
+            let Some(&first_solvable) = candidates.first() else {
+                continue;
+            };
+            let name_id = self.cache.provider().solvable_name(first_solvable);
+            let Some(group) = self.amo_group(name_id) else {
+                continue;
+            };
+            for &variable_id in variables {
+                self.register_group_member(group, name_id, variable_id);
+            }
         }
 
         // Queue requesting the dependencies of the candidates as well if they are
@@ -426,11 +431,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     match disjunction_complement {
                         DisjunctionComplement::Solvables(version_set, solvables) => {
                             let name_id = self.cache.provider().version_set_name(version_set);
+                            let group = self.amo_group(name_id);
                             disjunction_literals.reserve(solvables.len());
                             for &solvable in solvables {
                                 let variable = self.state.variable_map.intern_solvable(solvable);
                                 disjunction_literals.push(variable.positive());
-                                self.register_forbid_target(name_id, variable);
+                                if let Some(group) = group {
+                                    self.register_group_member(group, name_id, variable);
+                                }
                             }
                         }
                         DisjunctionComplement::Empty(version_set) => {
@@ -1067,21 +1075,15 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         });
     }
 
-    /// Registers `variable` as a candidate of `name_id`'s at-most-one group,
-    /// creating the group on first use. Membership takes effect immediately,
-    /// so clause construction and propagation observe the package-level value
-    /// of the variable from this point on. Returns silently if the variable
-    /// has already been registered, and skips registration entirely for
-    /// packages that allow multiple versions.
-    ///
-    /// The at-most-one constraint itself is enforced natively by the decision
-    /// map (see [`crate::solver::decision_map::DecisionMap`]); no clauses are
-    /// materialized here.
-    fn register_forbid_target(&mut self, name_id: D::NameId, variable: VariableId) {
+    /// Returns the at-most-one group for a package, creating it on first use,
+    /// or `None` for packages that allow multiple versions. Resolved once per
+    /// candidate list so the per-candidate work in
+    /// [`Self::register_group_member`] stays free of hash lookups.
+    fn amo_group(&mut self, name_id: D::NameId) -> Option<AmoGroupId> {
         if self.state.allow_multiple_names.contains(name_id) {
-            return;
+            return None;
         }
-        let group = match self.state.at_most_one_groups.get(&name_id) {
+        Some(match self.state.at_most_one_groups.get(&name_id) {
             Some(&group) => group,
             None => {
                 let group = self.state.decision_tracker.map_mut().alloc_amo_group();
@@ -1090,7 +1092,23 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                 self.state.at_most_one_groups.insert(name_id, group);
                 group
             }
-        };
+        })
+    }
+
+    /// Registers `variable` as a member of its package's at-most-one `group`.
+    /// Membership takes effect immediately, so clause construction and
+    /// propagation observe the package-level value of the variable from this
+    /// point on. Returns silently if the variable has already been registered.
+    ///
+    /// The at-most-one constraint itself is enforced natively by the decision
+    /// map (see [`crate::solver::decision_map::DecisionMap`]); no clauses are
+    /// materialized here.
+    fn register_group_member(
+        &mut self,
+        group: AmoGroupId,
+        name_id: D::NameId,
+        variable: VariableId,
+    ) {
         match self
             .state
             .decision_tracker
