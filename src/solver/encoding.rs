@@ -390,15 +390,24 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         //
         // We only add these clauses for packages that can actually be selected to
         // reduce the overall number of clauses.
-        for (solvable, variable_id) in candidates
-            .iter()
-            .zip(version_set_variables.iter())
-            .flat_map(|(&candidates, variable)| {
-                candidates.iter().copied().zip(variable.iter().copied())
-            })
-        {
-            let name_id = self.cache.provider().solvable_name(solvable);
-            self.register_forbid_target(name_id, variable_id);
+        // All matching candidates of a version set share that version set's
+        // package name, so resolve the name once per candidate list instead of
+        // once per candidate, and hoist the per-name bookkeeping of
+        // `register_forbid_target` out of the inner loop as well.
+        for (&candidates, variables) in candidates.iter().zip(version_set_variables.iter()) {
+            let Some(&first_solvable) = candidates.first() else {
+                continue;
+            };
+            let name_id = self.cache.provider().solvable_name(first_solvable);
+            if self.state.allow_multiple_names.contains(name_id) {
+                continue;
+            }
+            let pending = self.pending_forbid_clauses.entry(name_id).or_default();
+            for &variable_id in variables {
+                if self.forbid_seen.insert(variable_id) {
+                    pending.push(variable_id);
+                }
+            }
         }
 
         // Queue requesting the dependencies of the candidates as well if they are
