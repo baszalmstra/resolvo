@@ -109,15 +109,41 @@ enum RequirementState {
     ///
     /// A package-level decision changes the effective value of every sibling
     /// candidate without routing the siblings through the occurrence lists,
-    /// so a frontier is additionally stamped with the decision map's
-    /// at-most-one revision at walk time and treated as dirty once the
+    /// so a frontier is additionally stamped with an at-most-one revision at
+    /// walk time (see [`FrontierStamp`]) and treated as dirty once that
     /// revision moves on.
     Frontier {
         candidate: VariableId,
         version_set: VersionSetId,
         count: u32,
-        amo_revision: u64,
+        stamp: FrontierStamp,
     },
+}
+
+/// Which at-most-one revision counter a cached frontier was stamped against.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum FrontierStamp {
+    /// No walked candidate belongs to an at-most-one group: effective values
+    /// only ever change explicitly, and the per-candidate occurrences dirty
+    /// the entry, so the stamp never goes stale.
+    Ungrouped,
+    /// Every walked grouped candidate belongs to this one group (the common
+    /// case): only this group's decisions can invalidate the walk, so a
+    /// decision on an unrelated package leaves the frontier valid.
+    Group(AmoGroupId, u64),
+    /// The walk spanned candidates of multiple groups; validate against the
+    /// map-wide revision.
+    Global(u64),
+}
+
+impl FrontierStamp {
+    fn is_fresh(self, map: &DecisionMap) -> bool {
+        match self {
+            FrontierStamp::Ungrouped => true,
+            FrontierStamp::Group(group, revision) => map.amo_revision(Some(group)) == revision,
+            FrontierStamp::Global(revision) => map.amo_revision(None) == revision,
+        }
+    }
 }
 
 struct RequirementEntry {
@@ -516,12 +542,13 @@ impl<D: DependencyProvider> DecideQueue<D> {
             // per-candidate occurrences dirty this entry when it breaks; a
             // package-level decision cannot.
             RequirementState::Satisfied { .. } => return entry.state,
-            // A frontier is stale as soon as any package-level decision was
-            // made or undone since the walk: siblings of the (un)chosen
-            // candidate changed their effective value without being routed
-            // through the occurrence lists.
-            RequirementState::Frontier { amo_revision, .. } => {
-                if amo_revision == map.amo_revision() {
+            // A frontier is stale as soon as a package-level decision that
+            // can affect its candidates was made or undone since the walk:
+            // the siblings of the (un)chosen candidate changed their
+            // effective value without being routed through the occurrence
+            // lists.
+            RequirementState::Frontier { stamp, .. } => {
+                if stamp.is_fresh(map) {
                     return entry.state;
                 }
             }
@@ -545,12 +572,25 @@ impl<D: DependencyProvider> DecideQueue<D> {
         }
 
         entry.state = RequirementState::Dirty;
+        // Track which at-most-one groups the walked candidates belong to, so
+        // the frontier can be stamped with a single group's revision when
+        // possible. `Some(None)` means "no grouped candidate seen yet".
+        let mut walk_groups: Option<Option<AmoGroupId>> = Some(None);
         let mut first: Option<(VariableId, VersionSetId, u32)> = None;
         'walk: for (version_set, candidates) in requirement
             .version_sets(provider)
             .zip(version_set_candidates)
         {
             for &candidate in candidates {
+                if let Some(walked) = walk_groups.as_mut() {
+                    if let Some(group) = map.amo_group_of(candidate) {
+                        match *walked {
+                            None => *walked = Some(group),
+                            Some(existing) if existing != group => walk_groups = None,
+                            Some(_) => {}
+                        }
+                    }
+                }
                 match map.value(candidate) {
                     Some(true) => {
                         entry.state = RequirementState::Satisfied { by: candidate };
@@ -575,11 +615,18 @@ impl<D: DependencyProvider> DecideQueue<D> {
                     "when we get here it means that all candidates have been assigned false. This should not be able to happen at this point because during propagation the solvable should have been assigned false as well."
                 )
             };
+            let stamp = match walk_groups {
+                Some(None) => FrontierStamp::Ungrouped,
+                Some(Some(group)) => FrontierStamp::Group(group, map.amo_revision(Some(group))),
+                // A walk that spanned multiple groups falls back to the
+                // map-wide revision.
+                None => FrontierStamp::Global(map.amo_revision(None)),
+            };
             entry.state = RequirementState::Frontier {
                 candidate,
                 version_set,
                 count,
-                amo_revision: map.amo_revision(),
+                stamp,
             };
         }
         entry.state

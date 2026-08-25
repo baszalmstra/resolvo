@@ -63,6 +63,13 @@ struct AmoGroup {
 
     /// All member variables, in registration order.
     members: Vec<VariableId>,
+
+    /// Bumped whenever this group's choice is set or cleared: the only events
+    /// that change member values without touching the members themselves.
+    /// Consumers that cache the result of scanning this group's member values
+    /// (see [`crate::solver::decide_queue`]) validate against this instead of
+    /// being invalidated per implicitly changed member.
+    revision: u64,
 }
 
 /// The result of [`DecisionMap::add_amo_member`].
@@ -104,11 +111,10 @@ pub(crate) struct DecisionMap {
     /// All at-most-one groups, indexed by [`AmoGroupId`].
     groups: Vec<AmoGroup>,
 
-    /// Bumped whenever any group's choice is set or cleared: the only events
-    /// that change variable values without touching the changed variables
-    /// themselves. Consumers that cache the result of scanning variable
-    /// values (see [`crate::solver::decide_queue`]) validate against this
-    /// instead of being invalidated per implicitly changed variable.
+    /// Bumped whenever *any* group's choice is set or cleared, for consumers
+    /// whose cached scan spans multiple groups. Prefer the per-group
+    /// revision where the scanned candidates all belong to one group, so an
+    /// unrelated package decision does not invalidate the cache.
     amo_revision: u64,
 }
 
@@ -129,6 +135,7 @@ impl DecisionMap {
             let group = &mut self.groups[group.to_index()];
             if group.chosen == Some(variable_id) {
                 group.chosen = None;
+                group.revision += 1;
                 self.amo_revision += 1;
             }
         }
@@ -156,15 +163,22 @@ impl DecisionMap {
                     "a second member of an at-most-one group was assigned true"
                 );
                 group.chosen = Some(variable_id);
+                group.revision += 1;
                 self.amo_revision += 1;
             }
         }
     }
 
-    /// The current at-most-one revision; see [`Self::amo_revision`].
+    /// The revision a cached scan over candidate values must validate
+    /// against: the group's own revision when every scanned candidate that
+    /// belongs to a group belongs to `group`, or the map-wide revision when
+    /// the scan spans multiple groups (`None`). See [`Self::amo_revision`].
     #[inline]
-    pub fn amo_revision(&self) -> u64 {
-        self.amo_revision
+    pub fn amo_revision(&self, group: Option<AmoGroupId>) -> u64 {
+        match group {
+            Some(group) => self.groups[group.to_index()].revision,
+            None => self.amo_revision,
+        }
     }
 
     /// Clears all assignments (explicit and package-level) but retains the
@@ -174,6 +188,7 @@ impl DecisionMap {
         self.map.clear();
         for group in &mut self.groups {
             group.chosen = None;
+            group.revision += 1;
         }
         self.amo_revision += 1;
     }
@@ -247,6 +262,7 @@ impl DecisionMap {
         self.groups.push(AmoGroup {
             chosen: None,
             members: Vec::new(),
+            revision: 0,
         });
         id
     }
@@ -306,6 +322,7 @@ impl DecisionMap {
             (Some(true), Some(chosen)) => AmoMemberAdded::Conflict { chosen },
             (Some(true), None) => {
                 group.chosen = Some(variable);
+                group.revision += 1;
                 let falsified_others = group.members.len() > 1;
                 // The siblings' effective values just changed; invalidate
                 // cached value scans (see [`Self::amo_revision`]).
@@ -410,7 +427,8 @@ mod test {
         let group = map.alloc_amo_group();
         map.add_amo_member(group, var(1));
 
-        let revision = map.amo_revision();
+        let global_revision = map.amo_revision(None);
+        let group_revision = map.amo_revision(Some(group));
         map.set(var(2), true, 1);
         assert!(matches!(
             map.add_amo_member(group, var(2)),
@@ -419,7 +437,16 @@ mod test {
             }
         ));
         assert_eq!(map.value(var(1)), Some(false));
-        assert_ne!(map.amo_revision(), revision, "value scans must revalidate");
+        assert_ne!(
+            map.amo_revision(None),
+            global_revision,
+            "value scans must revalidate"
+        );
+        assert_ne!(
+            map.amo_revision(Some(group)),
+            group_revision,
+            "group-stamped value scans must revalidate"
+        );
     }
 
     #[test]
