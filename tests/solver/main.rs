@@ -800,6 +800,40 @@ fn test_solve_with_soft_requirement_forbid_clause_conflict() {
     "###);
 }
 
+/// Candidates registered for a package that has already chosen another
+/// candidate are immediately false through the package-level at-most-one
+/// group, without trail entries. The requires clauses encoded for the soft
+/// requirements must observe those package-level values at insertion time.
+#[test]
+fn test_soft_requirement_candidates_registered_after_package_decision() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("b", 1, vec![]),
+        ("b", 2, vec![]),
+        ("b", 3, vec![]),
+        ("x", 1, vec!["b 0..10"]),
+        ("y", 1, vec!["b 2..4"]),
+    ]);
+
+    // The hard requirement only matches b=1, so b=2 and b=3 join the
+    // at-most-one group of "b" during the soft solves, after b=1 was chosen.
+    let requirements = provider.requirements(&["b 1..2"]);
+    let extra_solvables = [provider.solvable_id("x", 1), provider.solvable_id("y", 1)];
+
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new()
+        .requirements(requirements)
+        .soft_requirements(extra_solvables);
+    let solved = solver.solve(problem).unwrap();
+
+    // x is satisfied by the pinned b=1; y requires a different b, which is
+    // false by the package-level decision, and must be dropped.
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r###"
+    b=1
+    x=1
+    "###);
+}
+
 #[test]
 fn test_solve_with_additional_with_constrains() {
     let mut provider = BundleBoxProvider::from_packages(&[
@@ -2538,6 +2572,440 @@ mod allow_multiple_versions {
         assert_snapshot!(result, @r"
     kernel=2
     kernel=3
+    ");
+    }
+}
+
+/// Regression tests for the native at-most-one enforcement, ported from
+/// the `perf/resolvo-native-amo` propagator branch so both implementations
+/// are held to the same edge cases.
+mod native_amo_regression {
+    use super::*;
+
+    /// Build a provider from `(name, version, deps)` triples and solve the
+    /// given root specs. Returns the sorted transaction string.
+    fn solve_to_string(packages: &[(&str, u32, Vec<&str>)], specs: &[&str]) -> String {
+        let mut provider = BundleBoxProvider::from_packages(packages);
+        let requirements = provider.requirements(specs);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver
+            .solve(problem)
+            .unwrap_or_else(|e| panic!("expected a solution, got {e:?}"));
+        transaction_to_string(solver.provider(), &solved)
+    }
+
+    /// Backtracking after a native AMO propagation: `a=2` picks `x=2` (which
+    /// sets the group's `chosen` hint) and then conflicts on `b`. After the
+    /// backtrack `x=2` is unassigned but the group's `chosen` hint still points
+    /// at it (stale). `a=1` then discovers `x=1`, which joins the group as a
+    /// *new* member. The stale hint must not force `x=1` false, and once `x=1`
+    /// is propagated true a different member (the stale one) must be chosen.
+    #[test]
+    fn test_backtrack_stale_chosen_then_different_member() {
+        let result = solve_to_string(
+            &[
+                ("a", 2, vec!["x 2..3", "b 2..3"]),
+                ("a", 1, vec!["x 1..2"]),
+                ("x", 1, vec![]),
+                ("x", 2, vec![]),
+                ("b", 1, vec![]),
+                ("b", 2, vec![]),
+            ],
+            &["a", "b 1..2"],
+        );
+        assert_eq!(result, "a=1\nb=1\nx=1\n", "{result}");
+        assert_eq!(result.matches("x=").count(), 1, "{result}");
+    }
+
+    /// A candidate that joins a group while another member is already true
+    /// must be forced false at join time. `a=1` requires `x 2..3` (forcing
+    /// `x=2` true), and transitively `y=1` requires `x 1..3` (matching both
+    /// `x=1` and `x=2`), so `x=1` joins the group in a later encoding pass
+    /// while `x=2` is already true. The join-time force must materialize the
+    /// pairwise forbid reason and assign `x=1` false; the `y` requires clause
+    /// stays satisfied by `x=2`.
+    #[test]
+    fn test_member_joins_while_another_is_true() {
+        let result = solve_to_string(
+            &[
+                ("a", 1, vec!["x 2..3", "y"]),
+                ("y", 1, vec!["x 1..3"]),
+                ("x", 1, vec![]),
+                ("x", 2, vec![]),
+            ],
+            &["a"],
+        );
+        assert_eq!(result, "a=1\nx=2\ny=1\n", "{result}");
+        assert_eq!(result.matches("x=").count(), 1, "{result}");
+    }
+
+    /// A candidate forced true through a `Requires` clause (not a top-level
+    /// decision) must trigger native AMO propagation on its siblings. `a=1`
+    /// requires `b 2..3` which matches only `b=2`; the other two `b`
+    /// candidates must be forced false.
+    #[test]
+    fn test_candidate_forced_true_via_requires_triggers_amo() {
+        let result = solve_to_string(
+            &[
+                ("a", 1, vec!["b 2..3"]),
+                ("b", 1, vec![]),
+                ("b", 2, vec![]),
+                ("b", 3, vec![]),
+            ],
+            &["a"],
+        );
+        assert_eq!(result, "a=1\nb=2\n", "{result}");
+        assert_eq!(result.matches("b=").count(), 1, "{result}");
+    }
+
+    /// An unsat problem whose refutation must resolve through a
+    /// lazily-materialized forbid reason clause: `a=1` forces `b=2` true via a
+    /// requires clause while the root forces `b=3` true, and neither can be
+    /// dropped because the pairwise forbid reason is what links them.
+    #[test]
+    fn test_unsat_refutation_through_lazy_forbid_reason() {
+        let provider = BundleBoxProvider::from_packages(&[
+            ("a", 1, vec!["b 2..3"]),
+            ("b", 2, vec![]),
+            ("b", 3, vec![]),
+        ]);
+        let error = solve_unsat(provider, &["a", "b 3..4"]);
+        assert!(error.contains("b 2"), "{error}");
+        assert!(error.contains("b 3"), "{error}");
+    }
+
+    /// `allow_multiple` packages must skip the native AMO group while normal
+    /// same-name groups interleaved with them must still enforce at-most-one.
+    #[test]
+    fn test_allow_multiple_interleaved_with_normal_group() {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("multi", 1, vec![]),
+            ("multi", 2, vec![]),
+            ("single", 1, vec![]),
+            ("single", 2, vec![]),
+            ("single", 3, vec![]),
+            ("app-a", 1, vec!["multi 1..2", "single 1..3"]),
+            ("app-b", 1, vec!["multi 2..3", "single 2..4"]),
+        ]);
+        provider.set_allow_multiple("multi");
+
+        let requirements = provider.requirements(&["app-a", "app-b"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_eq!(
+            result, "app-a=1\napp-b=1\nmulti=1\nmulti=2\nsingle=2\n",
+            "{result}"
+        );
+        assert_eq!(result.matches("multi=").count(), 2, "{result}");
+        assert_eq!(result.matches("single=").count(), 1, "{result}");
+    }
+
+    /// A locked solvable must be enforced together with the native AMO group:
+    /// the lock forbids every sibling while the group forbids the rest.
+    #[test]
+    fn test_locked_with_native_amo() {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("a", 1, vec![]),
+            ("a", 2, vec![]),
+            ("a", 3, vec![]),
+        ]);
+        provider.set_locked("a", 2);
+
+        let requirements = provider.requirements(&["a"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_eq!(result, "a=2\n", "{result}");
+        assert_eq!(result.matches("a=").count(), 1, "{result}");
+    }
+
+    /// An excluded solvable must be dropped by the native AMO group and the
+    /// remaining highest candidate selected.
+    #[test]
+    fn test_excluded_with_native_amo() {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("a", 1, vec![]),
+            ("a", 2, vec![]),
+            ("a", 3, vec![]),
+        ]);
+        provider.exclude("a", 2, "it is externally excluded");
+
+        let requirements = provider.requirements(&["a"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_eq!(result, "a=3\n", "{result}");
+        assert_eq!(result.matches("a=").count(), 1, "{result}");
+    }
+
+    /// A same-name group with many members exercises the O(n) group scan and
+    /// the `amo_group_of` resize path. Selecting the highest candidate must
+    /// force every sibling false. The clause count must stay linear (the old
+    /// bitwise encoding would materialize O(n log n) clauses up front).
+    #[test]
+    fn test_many_members_group_scan() {
+        let mut provider = BundleBoxProvider::new();
+        for v in 1..=50u32 {
+            provider.add_package("big", v.into(), &[], &[]);
+        }
+
+        let requirements = provider.requirements(&["big"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_eq!(result, "big=50\n", "{result}");
+        assert_eq!(result.matches("big=").count(), 1, "{result}");
+
+        // The native group propagator materializes one forbid clause per
+        // actually-forced sibling (49 here) plus a handful of requires/any-of
+        // clauses. The bitwise encoding would allocate ~n·log n (> 300)
+        // clauses before any propagation, so an upper bound of 200 keeps this
+        // a meaningful laziness guard without being brittle.
+        let clauses = solver.clause_count();
+        assert!(
+            clauses < 200,
+            "expected a linear clause count for 50 group members, got {clauses}"
+        );
+    }
+}
+// ============================================================================
+// Regression tests for the IndexedSet `Vec<u64>`-word rewrite and the
+// per-candidate-list forbid-clause registration optimization.
+// ============================================================================
+
+mod indexed_set_regression {
+    use resolvo::{DenseIndex, IndexedSet, NameId};
+
+    fn id(i: usize) -> NameId {
+        NameId::from_index(i)
+    }
+
+    /// Every index on a 64-bit word boundary (and its neighbours) must round-
+    /// trip through insert/contains exactly once. A shift/word-indexing bug in
+    /// the `Vec<u64>` rewrite would show up here as a wrong word or bit lane.
+    #[test]
+    fn test_word_boundaries() {
+        let mut set = IndexedSet::<NameId>::default();
+        for &i in &[0usize, 63, 64, 65, 127, 128, 191, 192, 255, 256, 511, 512] {
+            assert!(
+                set.insert(id(i)),
+                "first insert of {i} must report newly inserted"
+            );
+            assert!(set.contains(id(i)), "contains({i}) must be true");
+            assert!(
+                !set.insert(id(i)),
+                "second insert of {i} must report duplicate"
+            );
+        }
+        for &i in &[1usize, 62, 66, 126, 129, 190, 193] {
+            assert!(!set.contains(id(i)), "contains({i}) must be false");
+        }
+    }
+
+    /// Sparse, non-contiguous insertion with a large index must grow the word
+    /// vector and leave the untouched lanes clear.
+    #[test]
+    fn test_sparse_and_large_indices() {
+        let mut set = IndexedSet::<NameId>::default();
+        assert!(!set.contains(id(10_000)), "empty set contains nothing");
+        assert!(set.insert(id(10_000)));
+        assert!(set.contains(id(10_000)));
+        assert!(!set.contains(id(9_999)));
+        assert!(!set.contains(id(10_001)));
+
+        // Inserting a small index after a huge one must not disturb the huge
+        // one or the untouched boundary words.
+        assert!(set.insert(id(0)));
+        assert!(set.contains(id(0)));
+        assert!(set.contains(id(10_000)));
+        assert!(!set.contains(id(63)));
+        assert!(!set.contains(id(64)));
+        assert!(!set.contains(id(65)));
+    }
+
+    /// Sequential fill over many words, duplicate rejection, and reversed-order
+    /// insertion (grow-then-backfill) must all behave like a set.
+    #[test]
+    fn test_duplicate_inserts_and_sequential_fill() {
+        let mut set = IndexedSet::<NameId>::default();
+        for i in 0..=2_000usize {
+            assert!(set.insert(id(i)), "first insert of {i}");
+        }
+        for i in 0..=2_000usize {
+            assert!(!set.insert(id(i)), "duplicate insert of {i}");
+            assert!(set.contains(id(i)));
+        }
+        assert!(!set.contains(id(2_001)));
+
+        let mut set2 = IndexedSet::<NameId>::default();
+        for i in (0..=300usize).rev() {
+            assert!(set2.insert(id(i)));
+        }
+        for i in 0..=300usize {
+            assert!(set2.contains(id(i)));
+        }
+    }
+}
+
+mod forbid_registration_regression {
+    use super::*;
+
+    /// Solves a simple provider built from `packages` for the given root specs
+    /// and returns the sorted transaction string.
+    fn solve_to_string(packages: &[(&str, u32, Vec<&str>)], specs: &[&str]) -> String {
+        let mut provider = BundleBoxProvider::from_packages(packages);
+        let requirements = provider.requirements(specs);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        transaction_to_string(solver.provider(), &solved)
+    }
+
+    /// A union over two non-overlapping version sets of the *same* package must
+    /// install exactly one version. The optimization resolves the package name
+    /// once per candidate list; both lists must land in the same
+    /// `pending_forbid_clauses` bucket so the forbid-multiple clause is built.
+    #[test]
+    fn test_union_same_package_single_version() {
+        let result = solve_to_string(
+            &[("x", 1, vec![]), ("x", 2, vec![]), ("x", 3, vec![])],
+            &["x 1..2 | x 3..4"],
+        );
+        // Exactly one version of `x` must be selected: the forbid-multiple
+        // clause has to be registered for both candidate lists.
+        assert_eq!(result.matches("x=").count(), 1, "{result}");
+        assert_snapshot!(result, @"x=1");
+    }
+
+    /// Overlapping same-name version sets share candidate variables. The global
+    /// `forbid_seen` dedup must keep the duplicate from being pushed twice
+    /// while still registering every distinct candidate.
+    #[test]
+    fn test_union_overlapping_same_package_dedup() {
+        let result = solve_to_string(
+            &[("x", 1, vec![]), ("x", 2, vec![]), ("x", 3, vec![])],
+            &["x 1..3 | x 2..4"],
+        );
+        assert_eq!(result.matches("x=").count(), 1, "{result}");
+        assert_snapshot!(result, @"x=2");
+    }
+
+    /// An empty candidate list in the *first* version set of a union must be
+    /// skipped without disturbing the following non-empty list.
+    #[test]
+    fn test_union_empty_first_candidate_list() {
+        let result = solve_to_string(&[("a", 1, vec![]), ("b", 1, vec![])], &["a 5..6 | b 1..2"]);
+        assert_snapshot!(result, @"b=1");
+    }
+
+    /// An empty candidate list in a *later* version set of a union must also be
+    /// skipped while the earlier list still registers its forbid target.
+    #[test]
+    fn test_union_empty_second_candidate_list() {
+        let result = solve_to_string(&[("x", 1, vec![]), ("x", 2, vec![])], &["x 1..2 | x 5..6"]);
+        assert_snapshot!(result, @"x=1");
+    }
+
+    /// A locked solvable combined with a union requirement: the lock forbids the
+    /// non-locked candidates, so the union branch containing them resolves to the
+    /// locked version.
+    #[test]
+    fn test_locked_through_union() {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("x", 1, vec![]),
+            ("x", 2, vec![]),
+            ("x", 3, vec![]),
+        ]);
+        provider.set_locked("x", 1);
+
+        let requirements = provider.requirements(&["x 2..3 | x 1..2"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_snapshot!(result, @"x=1");
+    }
+
+    /// An excluded solvable inside a union branch: the exclusion clause forces
+    /// that branch off and the other union branch is selected.
+    #[test]
+    fn test_excluded_through_union() {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("x", 1, vec![]),
+            ("x", 2, vec![]),
+            ("x", 3, vec![]),
+        ]);
+        provider.exclude("x", 2, "it is externally excluded");
+
+        let requirements = provider.requirements(&["x 2..3 | x 1..2"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_snapshot!(result, @"x=1");
+    }
+
+    /// A union whose members are an `allow_multiple` package and a *normal*
+    /// package: skipping forbid registration for the multiversion member must
+    /// not leak into the sibling member. `single` is forced to version 2 while
+    /// the union offers `single=1`; without the normal package's forbid clause
+    /// both `single=1` and `single=2` would be installable.
+    #[test]
+    fn test_allow_multiple_does_not_disable_forbid_for_sibling_union_member() {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("multi", 0, vec![]),
+            ("single", 1, vec![]),
+            ("single", 2, vec![]),
+            ("app-a", 1, vec!["multi 0..1 | single 1..2"]),
+            ("app-b", 1, vec!["single 2..3"]),
+        ]);
+        provider.set_allow_multiple("multi");
+
+        let requirements = provider.requirements(&["app-a", "app-b"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_snapshot!(result, @r"
+    app-a=1
+    app-b=1
+    multi=0
+    single=2
+    ");
+    }
+
+    /// `allow_multiple` combined with an empty candidate list and a union, all
+    /// reached transitively: `helper 2..3` has no candidates (empty list is
+    /// skipped) while the two non-overlapping `multi` ranges install two
+    /// versions because forbid clauses are (correctly) suppressed for it.
+    #[test]
+    fn test_allow_multiple_union_with_empty_branch_transitive() {
+        let mut provider = BundleBoxProvider::from_packages(&[
+            ("multi", 1, vec![]),
+            ("multi", 2, vec![]),
+            ("multi", 3, vec![]),
+            ("helper", 1, vec![]),
+            ("app-a", 1, vec!["multi 1..2 | helper 2..3"]),
+            ("app-b", 1, vec!["multi 3..4"]),
+        ]);
+        provider.set_allow_multiple("multi");
+
+        let requirements = provider.requirements(&["app-a", "app-b"]);
+        let mut solver = Solver::new(provider);
+        let problem = Problem::new().requirements(requirements);
+        let solved = solver.solve(problem).unwrap();
+        let result = transaction_to_string(solver.provider(), &solved);
+        assert_snapshot!(result, @r"
+    app-a=1
+    app-b=1
+    multi=1
+    multi=3
     ");
     }
 }

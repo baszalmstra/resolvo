@@ -1,21 +1,19 @@
 use std::marker::PhantomData;
 
-use bitvec::vec::BitVec;
-
 use crate::id::DenseIndex;
 
 /// A dense set keyed by a [`DenseIndex`]. Equivalent to a `HashSet<Id>` but
-/// backed by a [`BitVec`], so test-and-set is O(1) with no hashing overhead.
-/// Grows on demand to fit the largest inserted index.
+/// backed by plain `u64` words, so test-and-set is O(1) with no hashing
+/// overhead. Grows on demand to fit the largest inserted index.
 pub struct IndexedSet<Id> {
-    bits: BitVec,
+    words: Vec<u64>,
     _marker: PhantomData<fn(Id) -> Id>,
 }
 
 impl<Id> Default for IndexedSet<Id> {
     fn default() -> Self {
         Self {
-            bits: BitVec::new(),
+            words: Vec::new(),
             _marker: PhantomData,
         }
     }
@@ -26,16 +24,22 @@ impl<Id: DenseIndex> IndexedSet<Id> {
     #[inline]
     pub fn insert(&mut self, id: Id) -> bool {
         let idx = id.to_index();
-        if idx >= self.bits.len() {
-            self.bits.resize(idx + 1, false);
+        let (word, bit) = (idx / 64, 1u64 << (idx % 64));
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
         }
-        // SAFETY: `resize` above guarantees `idx < self.bits.len()`.
-        !unsafe { self.bits.replace_unchecked(idx, true) }
+        let entry = &mut self.words[word];
+        let was_set = *entry & bit != 0;
+        *entry |= bit;
+        !was_set
     }
 
     /// Returns `true` if `id` is present.
     #[inline]
     pub fn contains(&self, id: Id) -> bool {
-        self.bits.get(id.to_index()).is_some_and(|b| *b)
+        let idx = id.to_index();
+        self.words
+            .get(idx / 64)
+            .is_some_and(|word| word & (1u64 << (idx % 64)) != 0)
     }
 }

@@ -1,7 +1,7 @@
 ---
-source: tests/solver.rs
+source: tests/solver/main.rs
+assertion_line: 518
 expression: error
-snapshot_kind: text
 ---
 The following packages are incompatible
 ├─ c * can be installed with any of the following options:

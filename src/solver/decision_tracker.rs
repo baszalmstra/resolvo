@@ -30,7 +30,13 @@ pub(crate) struct DecisionTracker {
 
 impl DecisionTracker {
     pub(crate) fn clear(&mut self) {
-        *self = Default::default();
+        // Assignments are search state and are discarded; the at-most-one
+        // group definitions in the map describe the encoded problem and must
+        // survive a restart.
+        self.map.clear_assignments();
+        self.stack.clear();
+        self.propagate_index = 0;
+        self.sync_floor = 0;
     }
 
     #[cfg(feature = "diagnostics")]
@@ -46,6 +52,14 @@ impl DecisionTracker {
     #[inline]
     pub(crate) fn map(&self) -> &DecisionMap {
         &self.map
+    }
+
+    /// Mutable access to the map, used by the encoder to register at-most-one
+    /// group memberships. Assignments must only be made through
+    /// [`Self::try_add_decision`] so that the trail stays consistent.
+    #[inline]
+    pub(crate) fn map_mut(&mut self) -> &mut DecisionMap {
+        &mut self.map
     }
 
     pub(crate) fn stack(&self) -> impl DoubleEndedIterator<Item = Decision> + '_ {

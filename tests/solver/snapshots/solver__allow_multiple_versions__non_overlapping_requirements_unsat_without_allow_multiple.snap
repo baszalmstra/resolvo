@@ -1,5 +1,6 @@
 ---
 source: tests/solver/main.rs
+assertion_line: 2453
 expression: result
 ---
 The following packages are incompatible

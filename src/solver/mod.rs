@@ -24,12 +24,11 @@ use crate::{
     },
     requirement::RequirementMap,
     runtime::{AsyncRuntime, NowOrNeverRuntime},
-    solver::binary_encoding::AtMostOnceTracker,
+    solver::decision_map::AmoGroupId,
     solver_id::{IdMap, IdSet, SolverId},
     utils::{IndexedSet, Mapping},
 };
 
-mod binary_encoding;
 mod cache;
 pub(crate) mod clause;
 mod conditions;
@@ -218,7 +217,33 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     clauses_added_for_package: <D::NameId as SolverId>::Set,
     clauses_added_for_solvable: WithRootSet<D::SolvableId>,
     pub(crate) allow_multiple_names: <D::NameId as SolverId>::Set,
-    at_most_one_trackers: HashMap<D::NameId, AtMostOnceTracker<VariableId>>,
+
+    /// The at-most-one group of each package name. The groups themselves (and
+    /// their memberships) live in the decision map, which enforces the
+    /// at-most-one constraint natively: assigning one member true makes every
+    /// sibling evaluate to false without materialized pairwise clauses or
+    /// trail entries.
+    at_most_one_groups: HashMap<D::NameId, AmoGroupId>,
+
+    /// The package name of each at-most-one group, indexed by [`AmoGroupId`].
+    amo_group_names: Vec<D::NameId>,
+
+    /// Variables that are registered as a member of some at-most-one group.
+    /// Only a dense dedup front for the encoder: requirements re-offer the
+    /// same candidates constantly, and testing a bit here is much cheaper
+    /// than probing the decision map's per-variable entries.
+    amo_registered: IndexedSet<VariableId>,
+
+    /// Lazily materialized pairwise (¬sibling ∨ ¬chosen) clauses, used as the
+    /// reason for implicitly false variables in conflict analysis and error
+    /// reporting. Keyed by (sibling, chosen).
+    forbid_pair_clauses: HashMap<(VariableId, VariableId), ClauseId>,
+
+    /// Groups whose members were implicitly falsified outside of propagation
+    /// (e.g. a candidate registered for a package that already has a chosen
+    /// member). The next propagation round wakes the watchers of the affected
+    /// members' positive literals.
+    pending_group_wakes: Vec<AmoGroupId>,
 
     /// Keeps track of auxiliary variables that are used to encode at-least-one
     /// solvable for a package.
@@ -292,7 +317,11 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             clauses_added_for_package: Default::default(),
             clauses_added_for_solvable: Default::default(),
             allow_multiple_names: Default::default(),
-            at_most_one_trackers: Default::default(),
+            at_most_one_groups: Default::default(),
+            amo_group_names: Default::default(),
+            amo_registered: Default::default(),
+            forbid_pair_clauses: Default::default(),
+            pending_group_wakes: Default::default(),
             at_least_one_tracker: Default::default(),
             constrains_aux_vars: Default::default(),
             requires_aux_vars: Default::default(),
@@ -327,6 +356,12 @@ pub(crate) struct PropagationCounters {
     pub unwatched_calls_by_type: PropagationVisitsByType,
     pub propagate_calls: u64,
     pub conflicts: u64,
+    /// Member probes performed by group sweeps (one per member of a decided
+    /// package's group).
+    pub sweep_probes: u64,
+    /// Sweep probes that found an implicitly false member and walked its
+    /// positive watch list.
+    pub sweep_walks: u64,
     /// Time spent adding clauses from the dependency provider.
     pub encoding_duration: std::time::Duration,
     pub propagation_duration: std::time::Duration,
@@ -1068,13 +1103,17 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             tracing::debug!(
                 "││ Previously decided value: {}. Derived from: {}",
                 !attempted_value,
-                self.state.clauses.kinds[self
+                match self
                     .state
                     .decision_tracker
                     .find_clause_for_assignment(conflicting_solvable)
-                    .unwrap()
-                    .to_index()]
-                .display(&self.state.variable_map, self.provider()),
+                {
+                    Some(derived_from) => self.state.clauses.kinds[derived_from.to_index()]
+                        .display(&self.state.variable_map, self.provider())
+                        .to_string(),
+                    // An implicitly false variable has no trail entry.
+                    None => "the package-level choice of another candidate".to_string(),
+                },
             );
         }
 
@@ -1188,8 +1227,15 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         // remaining literals of a clause we cause a conflict, propagation is halted and
         // an error is returned.
 
-        let interner = self.cache.provider();
-        let clause_kinds = &self.state.clauses.kinds;
+        // Wake watchers of variables that were implicitly falsified outside
+        // of propagation (a candidate registered for a package that already
+        // has a chosen member). The group stays queued until its sweep
+        // completes, so a conflict abort retries the whole sweep on the next
+        // propagation round.
+        while let Some(&group) = self.state.pending_group_wakes.last() {
+            self.sweep_group_watchers(group, level)?;
+            self.state.pending_group_wakes.pop();
+        }
 
         while let Some(decision) = self.state.decision_tracker.next_unpropagated() {
             let watched_literal = Literal::new(decision.variable, decision.value);
@@ -1199,121 +1245,202 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 self.state.propagation_counters.decisions_propagated += 1;
             }
 
-            debug_assert!(
-                watched_literal.eval(self.state.decision_tracker.map()) == Some(false),
-                "we are only watching literals that are turning false"
-            );
+            self.propagate_watchers_of(watched_literal, level)?;
 
-            // Propagate, iterating through the linked list of clauses that
-            // watch this solvable.
-            let mut next_cursor = self
-                .state
-                .watches
-                .cursor(&mut self.state.clauses.watched_literals, watched_literal);
-            while let Some(cursor) = next_cursor.take() {
-                let clause_id = cursor.clause_id();
-                let clause = &clause_kinds[clause_id.to_index()];
-                let watch_index = cursor.watch_index();
-
-                #[cfg(feature = "diagnostics")]
+            // A group member assigned true falsifies each sibling. An
+            // implicit group does so without a trail entry per sibling, so
+            // only the clauses watching the siblings' positive literals need
+            // waking; an explicit (small) group assigns each sibling false
+            // on the trail with a pairwise reason clause.
+            if decision.value {
+                if let Some(group) = self
+                    .state
+                    .decision_tracker
+                    .map()
+                    .amo_group_of(decision.variable)
                 {
-                    self.state.propagation_counters.clause_visits += 1;
-                    self.state.propagation_counters.visits_by_type.count(clause);
-                }
-
-                // If the other literal the current clause is watching is already true, we can
-                // skip this clause. Its is already satisfied.
-                let watched_literals = cursor.watched_literals();
-                // Prefetch the next clause's `WatchedLiterals` to overlap the
-                // pointer-chasing latency with this iteration's work. The
-                // inner BCP loop is memory-bound on this linked-list walk.
-                cursor.prefetch_next();
-                let other_watched_literal =
-                    watched_literals.watched_literals[1 - cursor.watch_index()];
-                if other_watched_literal.eval(self.state.decision_tracker.map()) == Some(true) {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        self.state.propagation_counters.early_skips += 1;
-                    }
-                    // Continue with the next clause in the linked list.
-                    next_cursor = cursor.next();
-                } else if let Some(literal) = if clause.is_binary() {
-                    // Binary clauses can never move their watches; skip the
-                    // `next_unwatched_literal` scan entirely.
-                    None
-                } else {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        self.state
-                            .propagation_counters
-                            .unwatched_calls_by_type
-                            .count(clause);
-                    }
-                    watched_literals.next_unwatched_literal(
-                        clause,
-                        &self.state.learnt_clauses,
-                        &self.state.requirement_to_sorted_candidates,
-                        &self.state.disjunctions,
-                        self.state.decision_tracker.map(),
-                        watch_index,
-                    )
-                } {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        self.state.propagation_counters.watch_moves += 1;
-                    }
-                    // Update the watch to point to the new literal
-                    next_cursor = cursor.update(literal);
-                } else {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        self.state.propagation_counters.unit_propagations += 1;
-                    }
-                    // We could not find another literal to watch, which means the remaining
-                    // watched literal must be set to true.
-                    let decided = self
+                    if self
                         .state
                         .decision_tracker
-                        .try_add_decision(
-                            Decision::new(
-                                other_watched_literal.variable(),
-                                other_watched_literal.satisfying_value(),
-                                clause_id,
-                            ),
-                            level,
-                        )
-                        .map_err(|_| {
-                            #[cfg(feature = "diagnostics")]
-                            {
-                                self.state.propagation_counters.conflicts += 1;
-                            }
-                            PropagationError::Conflict(
-                                other_watched_literal.variable(),
-                                true,
-                                clause_id,
-                            )
-                        })?;
+                        .map()
+                        .amo_group_is_implicit(group)
+                    {
+                        self.sweep_group_watchers(group, level)?;
+                    } else {
+                        self.state
+                            .falsify_group_siblings(group, decision.variable, level)?;
+                    }
+                }
+            }
+        }
 
-                    if decided {
-                        match clause {
-                            // Skip logging for ForbidMultipleInstances, which is so noisy
-                            Clause::ForbidMultipleInstances(..) => {}
-                            _ => {
-                                tracing::debug!(
-                                    "├ Propagate {} = {}. {}",
-                                    other_watched_literal
-                                        .variable()
-                                        .display(&self.state.variable_map, interner),
-                                    other_watched_literal.satisfying_value(),
-                                    clause.display(&self.state.variable_map, interner)
-                                );
-                            }
+        Ok(())
+    }
+
+    /// Wakes the clauses watching the positive literal of every implicitly
+    /// false member of `group`. Explicitly assigned members are skipped: their
+    /// watchers are woken by the regular trail-driven propagation.
+    fn sweep_group_watchers(
+        &mut self,
+        group: AmoGroupId,
+        level: u32,
+    ) -> Result<(), PropagationError> {
+        let member_count = self
+            .state
+            .decision_tracker
+            .map()
+            .amo_group_member_count(group);
+        for index in 0..member_count {
+            let member = self
+                .state
+                .decision_tracker
+                .map()
+                .amo_group_member(group, index);
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state.propagation_counters.sweep_probes += 1;
+            }
+            if self
+                .state
+                .decision_tracker
+                .map()
+                .implicitly_false_by(member)
+                .is_none()
+            {
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state.propagation_counters.sweep_walks += 1;
+            }
+            self.propagate_watchers_of(member.positive(), level)?;
+        }
+        Ok(())
+    }
+
+    /// Walks the linked list of clauses watching `watched_literal`, which has
+    /// just turned false, moving watches or unit-propagating as required.
+    fn propagate_watchers_of(
+        &mut self,
+        watched_literal: Literal,
+        level: u32,
+    ) -> Result<(), PropagationError> {
+        let interner = self.cache.provider();
+        let clause_kinds = &self.state.clauses.kinds;
+
+        debug_assert!(
+            watched_literal.eval(self.state.decision_tracker.map()) == Some(false),
+            "we are only watching literals that are turning false"
+        );
+
+        // Propagate, iterating through the linked list of clauses that
+        // watch this solvable.
+        let mut next_cursor = self
+            .state
+            .watches
+            .cursor(&mut self.state.clauses.watched_literals, watched_literal);
+        while let Some(cursor) = next_cursor.take() {
+            let clause_id = cursor.clause_id();
+            let clause = &clause_kinds[clause_id.to_index()];
+            let watch_index = cursor.watch_index();
+
+            #[cfg(feature = "diagnostics")]
+            {
+                self.state.propagation_counters.clause_visits += 1;
+                self.state.propagation_counters.visits_by_type.count(clause);
+            }
+
+            // If the other literal the current clause is watching is already true, we can
+            // skip this clause. Its is already satisfied.
+            let watched_literals = cursor.watched_literals();
+            // Prefetch the next clause's `WatchedLiterals` to overlap the
+            // pointer-chasing latency with this iteration's work. The
+            // inner BCP loop is memory-bound on this linked-list walk.
+            cursor.prefetch_next();
+            let other_watched_literal = watched_literals.watched_literals[1 - cursor.watch_index()];
+            if other_watched_literal.eval(self.state.decision_tracker.map()) == Some(true) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state.propagation_counters.early_skips += 1;
+                }
+                // Continue with the next clause in the linked list.
+                next_cursor = cursor.next();
+            } else if let Some(literal) = if clause.is_binary() {
+                // Binary clauses can never move their watches; skip the
+                // `next_unwatched_literal` scan entirely.
+                None
+            } else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state
+                        .propagation_counters
+                        .unwatched_calls_by_type
+                        .count(clause);
+                }
+                watched_literals.next_unwatched_literal(
+                    clause,
+                    &self.state.learnt_clauses,
+                    &self.state.requirement_to_sorted_candidates,
+                    &self.state.disjunctions,
+                    self.state.decision_tracker.map(),
+                    watch_index,
+                )
+            } {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state.propagation_counters.watch_moves += 1;
+                }
+                // Update the watch to point to the new literal
+                next_cursor = cursor.update(literal);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.state.propagation_counters.unit_propagations += 1;
+                }
+                // We could not find another literal to watch, which means the remaining
+                // watched literal must be set to true.
+                let decided = self
+                    .state
+                    .decision_tracker
+                    .try_add_decision(
+                        Decision::new(
+                            other_watched_literal.variable(),
+                            other_watched_literal.satisfying_value(),
+                            clause_id,
+                        ),
+                        level,
+                    )
+                    .map_err(|_| {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            self.state.propagation_counters.conflicts += 1;
+                        }
+                        PropagationError::Conflict(
+                            other_watched_literal.variable(),
+                            true,
+                            clause_id,
+                        )
+                    })?;
+
+                if decided {
+                    match clause {
+                        // Skip logging for ForbidMultipleInstances, which is so noisy
+                        Clause::ForbidMultipleInstances(..) => {}
+                        _ => {
+                            tracing::debug!(
+                                "├ Propagate {} = {}. {}",
+                                other_watched_literal
+                                    .variable()
+                                    .display(&self.state.variable_map, interner),
+                                other_watched_literal.satisfying_value(),
+                                clause.display(&self.state.variable_map, interner)
+                            );
                         }
                     }
-
-                    // Skip to the next clause in the linked list.
-                    next_cursor = cursor.next();
                 }
+
+                // Skip to the next clause in the linked list.
+                next_cursor = cursor.next();
             }
         }
 
@@ -1427,12 +1554,38 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         tracing::debug!("=== ANALYZE UNSOLVABLE");
 
         let mut involved = HashSet::default();
+        // Virtual (¬chosen ∨ ¬sibling) clauses encountered while chasing
+        // causes; materialized and added to the conflict after the walk.
+        let mut pair_reasons: Vec<(VariableId, VariableId)> = Vec::new();
+
+        // An implicitly false variable has no trail entry; its cause is the
+        // chosen candidate of its package, linked through the virtual
+        // pairwise clause.
+        let record_involved = |involved: &mut HashSet<VariableId>,
+                               pair_reasons: &mut Vec<(VariableId, VariableId)>,
+                               decision_tracker: &DecisionTracker,
+                               variable: VariableId| {
+            if let Some(chosen) = decision_tracker.map().implicitly_false_by(variable) {
+                if !pair_reasons.contains(&(variable, chosen)) {
+                    pair_reasons.push((variable, chosen));
+                }
+                involved.insert(chosen);
+            } else {
+                involved.insert(variable);
+            }
+        };
+
         self.state.clauses.kinds[clause_id.to_index()].visit_literals(
             &self.state.learnt_clauses,
             &self.state.requirement_to_sorted_candidates,
             &self.state.disjunctions,
             |literal| {
-                involved.insert(literal.variable());
+                record_involved(
+                    &mut involved,
+                    &mut pair_reasons,
+                    &self.state.decision_tracker,
+                    literal.variable(),
+                );
             },
         );
 
@@ -1474,10 +1627,20 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     if literal.eval(self.state.decision_tracker.map()) == Some(true) {
                         assert_eq!(literal.variable(), decision.variable);
                     } else {
-                        involved.insert(literal.variable());
+                        record_involved(
+                            &mut involved,
+                            &mut pair_reasons,
+                            &self.state.decision_tracker,
+                            literal.variable(),
+                        );
                     }
                 },
             );
+        }
+
+        for (sibling, chosen) in pair_reasons {
+            let pair_clause_id = self.state.forbid_pair_clause(sibling, chosen);
+            conflict.add_clause(pair_clause_id);
         }
 
         conflict
@@ -1512,6 +1675,11 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
         let mut s_value;
         let mut learnt_why = Vec::new();
+        // The virtual (¬chosen ∨ ¬sibling) clauses through which implicitly
+        // false variables were resolved; materialized after the loop and
+        // recorded in `learnt_why` so unsolvable analysis can expand this
+        // learnt clause into user-facing clauses.
+        let mut pair_reasons: Vec<(VariableId, VariableId)> = Vec::new();
         let mut first_iteration = true;
         let clause_kinds = &self.state.clauses.kinds;
         loop {
@@ -1522,26 +1690,44 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 &self.state.requirement_to_sorted_candidates,
                 &self.state.disjunctions,
                 |literal| {
-                    if !first_iteration && literal.variable() == conflicting_solvable {
+                    let mut variable = literal.variable();
+
+                    // A variable that is false only through its package's
+                    // choice has no trail entry; its reason is the virtual
+                    // clause (¬chosen ∨ ¬variable), so resolving through it
+                    // simply substitutes the chosen candidate.
+                    if let Some(chosen) = self
+                        .state
+                        .decision_tracker
+                        .map()
+                        .implicitly_false_by(variable)
+                    {
+                        if !pair_reasons.contains(&(variable, chosen)) {
+                            pair_reasons.push((variable, chosen));
+                        }
+                        variable = chosen;
+                    }
+
+                    if !first_iteration && variable == conflicting_solvable {
                         // We are only interested in the causes of the conflict, so we ignore the
                         // solvable whose value was propagated
                         return;
                     }
 
-                    if !seen.insert(literal.variable()) {
+                    if !seen.insert(variable) {
                         // Skip literals we have already seen
                         return;
                     }
 
-                    let decision_level = self.state.decision_tracker.level(literal.variable());
+                    let decision_level = self.state.decision_tracker.level(variable);
                     if decision_level == current_level {
                         causes_at_current_level += 1;
                     } else if current_level > 1 {
                         let learnt_literal = Literal::new(
-                            literal.variable(),
+                            variable,
                             self.state
                                 .decision_tracker
-                                .assigned_value(literal.variable())
+                                .assigned_value(variable)
                                 .unwrap(),
                         );
                         if decision_level > back_track_to {
@@ -1606,6 +1792,13 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
             }
         }
 
+        // Materialize the virtual pairwise clauses that took part in the
+        // resolution so they show up among this learnt clause's causes.
+        for (sibling, chosen) in pair_reasons {
+            let pair_clause_id = self.state.forbid_pair_clause(sibling, chosen);
+            learnt_why.push(pair_clause_id);
+        }
+
         // Add the clause
         let learnt_id = self.state.learnt_clauses.alloc(learnt);
         self.state.learnt_why.insert(learnt_id, learnt_why);
@@ -1664,7 +1857,7 @@ impl<D: DependencyProvider> SolverState<D> {
             clause_id,
             names,
             &self.disjunctions,
-            self.decision_tracker.assigned_value(parent),
+            self.decision_tracker.map(),
         );
     }
 
@@ -1683,6 +1876,68 @@ impl<D: DependencyProvider> SolverState<D> {
         self.watches.start_watching(wl, clause_id);
 
         clause_id
+    }
+
+    /// Returns (materializing and caching on first use) the pairwise
+    /// at-most-one clause (¬sibling ∨ ¬chosen). The at-most-one constraint is
+    /// enforced natively by the group machinery, so these clauses only exist
+    /// where a clause id is required: as the reason of a falsified sibling
+    /// (explicit groups and conflict analysis over implicit ones) and in
+    /// user-facing conflicts. They are intentionally never registered with
+    /// the watch system: the native group enforcement subsumes their
+    /// propagation.
+    pub(crate) fn forbid_pair_clause(
+        &mut self,
+        sibling: VariableId,
+        chosen: VariableId,
+    ) -> ClauseId {
+        if let Some(&clause_id) = self.forbid_pair_clauses.get(&(sibling, chosen)) {
+            return clause_id;
+        }
+        let group = self
+            .decision_tracker
+            .map()
+            .amo_group_of(sibling)
+            .expect("pairwise clauses are only created for at-most-one group members");
+        let name_id = self.amo_group_names[group.to_index()];
+        let (watched_literals, kind) =
+            WatchedLiterals::forbid_multiple(sibling, chosen.negative(), name_id);
+        let clause_id = self.clauses.alloc(watched_literals, kind);
+        self.forbid_pair_clauses
+            .insert((sibling, chosen), clause_id);
+        clause_id
+    }
+
+    /// Called when `winner` (a member of an *explicit* at-most-one group) was
+    /// assigned true: forces every other member of the group to false on the
+    /// trail, with the pairwise clause as reason.
+    pub(crate) fn falsify_group_siblings(
+        &mut self,
+        group: AmoGroupId,
+        winner: VariableId,
+        level: u32,
+    ) -> Result<(), PropagationError> {
+        let member_count = self.decision_tracker.map().amo_group_member_count(group);
+        for index in 0..member_count {
+            let member = self.decision_tracker.map().amo_group_member(group, index);
+            if member == winner {
+                continue;
+            }
+            match self.decision_tracker.assigned_value(member) {
+                Some(false) => {}
+                Some(true) => {
+                    let clause_id = self.forbid_pair_clause(member, winner);
+                    return Err(PropagationError::Conflict(member, false, clause_id));
+                }
+                None => {
+                    let clause_id = self.forbid_pair_clause(member, winner);
+                    self.decision_tracker
+                        .try_add_decision(Decision::new(member, false, clause_id), level)
+                        .expect("the member was checked to be undecided");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the solvables that the solver has chosen to include in the

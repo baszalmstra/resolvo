@@ -1,16 +1,16 @@
 use std::{any::Any, collections::VecDeque};
 
-use super::{SolverState, clause::WatchedLiterals, conditions};
+use super::{PropagationError, SolverState, clause::WatchedLiterals, conditions};
 use crate::{
-    Candidates, ConditionId, ConditionalRequirement, DenseIndex, Dependencies, DependencyProvider,
-    Requirement, SolverCache, StringId, VariableId, VersionSetId,
+    Candidates, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider, Requirement,
+    SolverCache, StringId, VariableId, VersionSetId,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     solver::{
         conditions::{DeferredConjunct, DeferredRequirement, Disjunction},
         decision::Decision,
+        decision_map::{AmoGroupId, AmoMemberAdded},
     },
     solver_id::{IdMap, IdSet},
-    utils::IndexedSet,
 };
 use futures::{
     FutureExt, StreamExt, TryFutureExt, future::LocalBoxFuture, stream::FuturesUnordered,
@@ -47,14 +47,10 @@ pub(crate) struct Encoder<'a, 'cache, D: DependencyProvider> {
     /// current state.
     conflicting_clauses: Vec<ClauseId>,
 
-    /// Stores for which packages and solvables we want to add forbid clauses.
-    pending_forbid_clauses: IndexMap<D::NameId, Vec<VariableId>, ahash::RandomState>,
-
-    /// Tracks which variables have already been added to
-    /// `pending_forbid_clauses` to avoid accumulating millions of duplicate
-    /// entries. A variable belongs to exactly one package, so deduplicating
-    /// globally is safe.
-    forbid_seen: IndexedSet<VariableId>,
+    /// Variables that joined their package's at-most-one group during this
+    /// encoding round, waiting for their at-least-one wiring at the end of
+    /// the round.
+    new_amo_members: Vec<(D::NameId, VariableId)>,
 
     /// A set of packages that should have an at-least-once tracker.
     new_at_least_one_packages: IndexMap<D::NameId, VariableId, ahash::RandomState>,
@@ -165,8 +161,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             root_dependencies,
             pending_futures: FuturesUnordered::new(),
             conflicting_clauses: Vec::new(),
-            pending_forbid_clauses: IndexMap::default(),
-            forbid_seen: IndexedSet::default(),
+            new_amo_members: Vec::new(),
             level,
             new_at_least_one_packages: IndexMap::default(),
             pending_results: VecDeque::new(),
@@ -239,7 +234,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             self.on_task_result(future_result?);
         }
 
-        self.add_pending_forbid_clauses();
+        self.add_pending_amo_member_clauses();
         self.add_pending_at_least_one_clauses();
 
         Ok(self.conflicting_clauses)
@@ -385,20 +380,26 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             })
             .collect::<Vec<_>>();
 
-        // Make sure that for every candidate that we require we also have a forbid
-        // clause to force one solvable per package name.
+        // Make sure that every candidate that we require is a member of its
+        // package's at-most-one group, which forces one solvable per package
+        // name.
         //
-        // We only add these clauses for packages that can actually be selected to
-        // reduce the overall number of clauses.
-        for (solvable, variable_id) in candidates
-            .iter()
-            .zip(version_set_variables.iter())
-            .flat_map(|(&candidates, variable)| {
-                candidates.iter().copied().zip(variable.iter().copied())
-            })
-        {
-            let name_id = self.cache.provider().solvable_name(solvable);
-            self.register_forbid_target(name_id, variable_id);
+        // We only register candidates that can actually be selected to keep
+        // the groups (and the sweeps over their members) small. All matching
+        // candidates of a version set share that version set's package name,
+        // so resolve the name and its group once per candidate list instead of
+        // once per candidate.
+        for (&candidates, variables) in candidates.iter().zip(version_set_variables.iter()) {
+            let Some(&first_solvable) = candidates.first() else {
+                continue;
+            };
+            let name_id = self.cache.provider().solvable_name(first_solvable);
+            let Some(group) = self.amo_group(name_id) else {
+                continue;
+            };
+            for &variable_id in variables {
+                self.register_group_member(group, name_id, variable_id);
+            }
         }
 
         // Queue requesting the dependencies of the candidates as well if they are
@@ -430,11 +431,14 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
                     match disjunction_complement {
                         DisjunctionComplement::Solvables(version_set, solvables) => {
                             let name_id = self.cache.provider().version_set_name(version_set);
+                            let group = self.amo_group(name_id);
                             disjunction_literals.reserve(solvables.len());
                             for &solvable in solvables {
                                 let variable = self.state.variable_map.intern_solvable(solvable);
                                 disjunction_literals.push(variable.positive());
-                                self.register_forbid_target(name_id, variable);
+                                if let Some(group) = group {
+                                    self.register_group_member(group, name_id, variable);
+                                }
                             }
                         }
                         DisjunctionComplement::Empty(version_set) => {
@@ -1071,110 +1075,127 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         });
     }
 
-    /// Record `variable` as a candidate for a forbid-multiple clause under
-    /// `name_id`. Returns silently if the variable has already been registered;
-    /// see [`Self::forbid_seen`] for why globally-deduplicating is safe.
-    /// Also skips registration for packages that allow multiple versions.
-    fn register_forbid_target(&mut self, name_id: D::NameId, variable: VariableId) {
+    /// Returns the at-most-one group for a package, creating it on first use,
+    /// or `None` for packages that allow multiple versions. Resolved once per
+    /// candidate list so the per-candidate work in
+    /// [`Self::register_group_member`] stays free of hash lookups.
+    fn amo_group(&mut self, name_id: D::NameId) -> Option<AmoGroupId> {
         if self.state.allow_multiple_names.contains(name_id) {
-            return;
+            return None;
         }
-        if self.forbid_seen.insert(variable) {
-            self.pending_forbid_clauses
-                .entry(name_id)
-                .or_default()
-                .push(variable);
-        }
+        Some(match self.state.at_most_one_groups.get(&name_id) {
+            Some(&group) => group,
+            None => {
+                let group = self.state.decision_tracker.map_mut().alloc_amo_group();
+                debug_assert_eq!(self.state.amo_group_names.len(), group.to_index());
+                self.state.amo_group_names.push(name_id);
+                self.state.at_most_one_groups.insert(name_id, group);
+                group
+            }
+        })
     }
 
-    /// Add forbid clauses for solvables that we discovered as reachable from a
-    /// requires clause.
+    /// Registers `variable` as a member of its package's at-most-one `group`.
+    /// Membership takes effect immediately, so clause construction and
+    /// propagation observe the package-level value of the variable from this
+    /// point on. Returns silently if the variable has already been registered.
     ///
-    /// The number of forbid clauses for a package is O(n log n) so we only add
-    /// clauses for the packages that are reachable from a requirement as an
-    /// optimization.
-    fn add_pending_forbid_clauses(&mut self) {
-        for (name_id, candidate_var) in
-            self.pending_forbid_clauses
-                .drain(..)
-                .flat_map(|(name_id, candidate_vars)| {
-                    candidate_vars
-                        .into_iter()
-                        .map(move |candidate_var| (name_id, candidate_var))
-                })
+    /// The at-most-one constraint itself is enforced natively by the decision
+    /// map (see [`crate::solver::decision_map::DecisionMap`]); no clauses are
+    /// materialized here.
+    fn register_group_member(
+        &mut self,
+        group: AmoGroupId,
+        name_id: D::NameId,
+        variable: VariableId,
+    ) {
+        // Dense one-bit dedup: candidates are re-offered by every requirement
+        // that mentions them. A variable belongs to exactly one package, so
+        // deduplicating globally is safe.
+        if !self.state.amo_registered.insert(variable) {
+            return;
+        }
+        match self
+            .state
+            .decision_tracker
+            .map_mut()
+            .add_amo_member(group, variable)
         {
-            // Add forbid constraints for this solvable on all other
-            // solvables that have been visited already for the same
-            // version set name.
-            let mut other_solvables = self
-                .state
-                .at_most_one_trackers
-                .remove(&name_id)
-                .unwrap_or_default();
-            let variable_is_new = other_solvables.add(
-                candidate_var,
-                |a, b, positive| {
-                    let literal_b = if positive { b.positive() } else { b.negative() };
-                    let literal_a = a.negative();
-                    let (watched_literals, kind) =
-                        WatchedLiterals::forbid_multiple(a, literal_b, name_id);
-                    // Inlined `add_clause`: `other_solvables` (above) holds a
-                    // mutable borrow of `at_most_one_trackers`, so we cannot
-                    // call `self.state.add_clause(..)` here.
-                    let clause_id = self.state.clauses.alloc(watched_literals, kind);
-                    if let Some(wl) =
-                        self.state.clauses.watched_literals[clause_id.to_index()].as_mut()
-                    {
-                        self.state.watches.start_watching(wl, clause_id);
+            AmoMemberAdded::AlreadyMember => return,
+            AmoMemberAdded::Added
+            | AmoMemberAdded::AddedBecameChoice {
+                falsified_others: false,
+            } => {}
+            AmoMemberAdded::AddedFalsified { chosen } => {
+                if self
+                    .state
+                    .decision_tracker
+                    .map()
+                    .amo_group_is_implicit(group)
+                {
+                    // The member turned implicitly false without a trail entry
+                    // to wake its watchers; schedule a catch-up sweep for the
+                    // next propagation round.
+                    if !self.state.pending_group_wakes.contains(&group) {
+                        self.state.pending_group_wakes.push(group);
                     }
-
-                    // Add a decision if a decision has already been made for one of the literals.
-                    let set_literal = match (
-                        literal_a.eval(self.state.decision_tracker.map()),
-                        literal_b.eval(self.state.decision_tracker.map()),
-                    ) {
-                        (Some(false), None) => Some(literal_b),
-                        (None, Some(false)) => Some(literal_a),
-                        (Some(false), Some(false)) => {
-                            // Both solvables are already decided true, but the
-                            // forbid clause that would have prevented this didn't
-                            // exist yet (it's being created right now). Report it
-                            // as a conflict so the solver can backtrack.
-                            self.conflicting_clauses.push(clause_id);
-                            return;
-                        }
-                        _ => None,
-                    };
-                    if let Some(literal) = set_literal {
-                        self.state
-                            .decision_tracker
-                            .try_add_decision(
-                                Decision::new(
-                                    literal.variable(),
-                                    literal.satisfying_value(),
-                                    clause_id,
-                                ),
-                                self.level,
-                            )
-                            .expect("we checked that there is no value yet");
-                    }
-                },
-                || {
+                } else {
+                    // Explicit group: falsify the member on the trail, exactly
+                    // like the sibling sweep would have if the member had been
+                    // registered before the choice.
+                    let clause_id = self.state.forbid_pair_clause(variable, chosen);
                     self.state
-                        .variable_map
-                        .alloc_forbid_multiple_variable(name_id)
-                },
-            );
-            self.state
-                .at_most_one_trackers
-                .insert(name_id, other_solvables);
-
-            if variable_is_new {
-                if let Some(at_least_one_variable) = self.state.at_least_one_tracker.get(name_id) {
-                    let (watched_literals, kind) =
-                        WatchedLiterals::any_of(at_least_one_variable, candidate_var);
-                    self.state.add_clause(watched_literals, kind);
+                        .decision_tracker
+                        .try_add_decision(Decision::new(variable, false, clause_id), self.level)
+                        .expect("the member was checked to be undecided");
                 }
+            }
+            AmoMemberAdded::AddedBecameChoice {
+                falsified_others: true,
+            } => {
+                if self
+                    .state
+                    .decision_tracker
+                    .map()
+                    .amo_group_is_implicit(group)
+                {
+                    // The siblings turned implicitly false without trail
+                    // entries to wake their watchers; schedule a catch-up
+                    // sweep for the next propagation round.
+                    if !self.state.pending_group_wakes.contains(&group) {
+                        self.state.pending_group_wakes.push(group);
+                    }
+                } else if let Err(PropagationError::Conflict(_, _, clause_id)) = self
+                    .state
+                    .falsify_group_siblings(group, variable, self.level)
+                {
+                    // Two group members are already decided true, but the
+                    // constraint that would have prevented this didn't exist
+                    // yet. Report it as a conflict so the solver can
+                    // backtrack.
+                    self.conflicting_clauses.push(clause_id);
+                }
+            }
+            AmoMemberAdded::Conflict { chosen } => {
+                // Both candidates are already decided true, but the constraint
+                // that would have prevented this didn't exist yet (the
+                // membership is being created right now). Report it as a
+                // conflict so the solver can backtrack.
+                let clause_id = self.state.forbid_pair_clause(variable, chosen);
+                self.conflicting_clauses.push(clause_id);
+            }
+        }
+        self.new_amo_members.push((name_id, variable));
+    }
+
+    /// Wires every candidate that joined an at-most-one group this round into
+    /// its package's at-least-one variable, if one exists.
+    fn add_pending_amo_member_clauses(&mut self) {
+        for (name_id, candidate_var) in std::mem::take(&mut self.new_amo_members) {
+            if let Some(at_least_one_variable) = self.state.at_least_one_tracker.get(name_id) {
+                let (watched_literals, kind) =
+                    WatchedLiterals::any_of(at_least_one_variable, candidate_var);
+                self.state.add_clause(watched_literals, kind);
             }
         }
     }
@@ -1184,10 +1205,11 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// clause is added that forces the auxiliary variable to turn true if any
     /// solvable is selected.
     ///
-    /// This function only looks at solvables that are added to the at most once
-    /// tracker. The encoder has an optimization that it only creates clauses
-    /// for packages that are references from a requires clause. Any other
-    /// solvable will never be selected anyway so we can completely ignore it.
+    /// This function only looks at solvables that are members of the package's
+    /// at-most-one group. The encoder has an optimization that it only
+    /// registers members for packages that are referenced from a requires
+    /// clause. Any other solvable will never be selected anyway so we can
+    /// completely ignore it.
     ///
     /// No clause is added to force the auxiliary variable to turn false. This
     /// is on purpose because we dont not need this state to compute a proper
@@ -1196,25 +1218,30 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// See [`super::conditions`] for more information about conditions.
     fn add_pending_at_least_one_clauses(&mut self) {
         for (name_id, at_least_one_variable) in self.new_at_least_one_packages.drain(..) {
-            // Find the at-most-one tracker for the package. We want to reuse the same
-            // variables.
-            // Collect variable IDs to avoid borrowing at_most_one_trackers
-            // across the mutable add_clause call.
+            // Find the at-most-one group for the package. We want to reuse the
+            // same variables. Collect variable IDs to avoid borrowing the
+            // decision map across the mutable add_clause call.
             let variables: Vec<_> = self
                 .state
-                .at_most_one_trackers
+                .at_most_one_groups
                 .get(&name_id)
-                .map(|tracker| tracker.variables.iter().copied().collect())
+                .map(|&group| {
+                    self.state
+                        .decision_tracker
+                        .map()
+                        .amo_group_members(group)
+                        .to_vec()
+                })
                 .unwrap_or_default();
 
             // Add clauses for the existing variables.
-            for helper_var in variables {
+            for member_var in variables {
                 let (watched_literals, kind) =
-                    WatchedLiterals::any_of(at_least_one_variable, helper_var);
+                    WatchedLiterals::any_of(at_least_one_variable, member_var);
                 let clause_id = self.state.add_clause(watched_literals, kind);
 
                 // Assign true if any of the variables is true.
-                if self.state.decision_tracker.assigned_value(helper_var) == Some(true) {
+                if self.state.decision_tracker.assigned_value(member_var) == Some(true) {
                     self.state
                         .decision_tracker
                         .try_add_decision(
