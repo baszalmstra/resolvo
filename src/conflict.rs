@@ -54,7 +54,6 @@ impl Conflict {
 
         let root_node = Self::add_node(&mut graph, &mut nodes, SolvableIdOrRoot::root());
         let unresolved_node = graph.add_node(ConflictNode::UnresolvedDependency);
-        let mut last_node_by_name: HashMap<D::NameId, NodeIndex> = HashMap::default();
 
         // The shared constrains encoding splits each (parent, excluded
         // candidate) pair over two clauses linked by an auxiliary variable.
@@ -241,25 +240,26 @@ impl Conflict {
                     graph.add_edge(root_node, node2_id, ConflictEdge::Conflict(conflict));
                 }
                 &Clause::ForbidMultipleInstances(instance1_id, instance2_id, _) => {
+                    // A pairwise (¬instance1 ∨ ¬instance2) clause between two
+                    // candidates of the same package: instance1 is the
+                    // rejected candidate and instance2 the one the package
+                    // chose instead.
                     let solvable1 = instance1_id
                         .as_solvable_or_root(&state.variable_map)
                         .expect("only solvables can be excluded");
                     let node1_id = Self::add_node(&mut graph, &mut nodes, solvable1);
 
-                    let VariableOrigin::ForbidMultiple(name) =
-                        state.variable_map.origin(instance2_id.variable())
-                    else {
-                        unreachable!("expected only forbid variables")
-                    };
+                    let solvable2 = instance2_id
+                        .variable()
+                        .as_solvable_or_root(&state.variable_map)
+                        .expect("only solvables can be excluded");
+                    let node2_id = Self::add_node(&mut graph, &mut nodes, solvable2);
 
-                    let previous_node = last_node_by_name.insert(name, node1_id);
-                    if let Some(previous_node) = previous_node {
-                        graph.add_edge(
-                            previous_node,
-                            node1_id,
-                            ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
-                        );
-                    }
+                    graph.add_edge(
+                        node1_id,
+                        node2_id,
+                        ConflictEdge::Conflict(ConflictCause::ForbidMultipleInstances),
+                    );
                 }
                 &Clause::Constrains(package_id, dep_id, version_set_id) => {
                     let package_solvable = package_id

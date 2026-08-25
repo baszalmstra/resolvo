@@ -49,7 +49,7 @@ use crate::{
 use super::{
     conditions::{Disjunction, DisjunctionId},
     decision::Decision,
-    decision_map::DecisionMap,
+    decision_map::{AmoGroupId, DecisionMap},
 };
 
 /// Index of a [`TrackedClause`] in [`DecideQueue::clauses`].
@@ -106,10 +106,17 @@ enum RequirementState {
     /// No candidate is assigned true, and `candidate` is the first undecided
     /// candidate in walk order. `count` is the number of undecided candidates
     /// in the version set the first undecided candidate was found in.
+    ///
+    /// A package-level decision changes the effective value of every sibling
+    /// candidate without routing the siblings through the occurrence lists,
+    /// so a frontier is additionally stamped with the decision map's
+    /// at-most-one revision at walk time and treated as dirty once the
+    /// revision moves on.
     Frontier {
         candidate: VariableId,
         version_set: VersionSetId,
         count: u32,
+        amo_revision: u64,
     },
 }
 
@@ -176,6 +183,11 @@ pub(crate) struct DecideQueue<D: DependencyProvider> {
     requirements_by_candidate: HashMap<VariableId, SmallVec<Requirement>>,
     /// Condition variable -> clauses whose condition disjunction mentions it.
     clauses_by_condition_variable: HashMap<VariableId, Vec<TrackedClauseId>>,
+    /// At-most-one group -> clauses whose condition disjunction mentions a
+    /// member of the group. A package-level decision can falsify condition
+    /// literals without a per-variable trail entry, so per-variable condition
+    /// occurrences alone would miss the wake-up.
+    clauses_by_condition_group: HashMap<AmoGroupId, Vec<TrackedClauseId>>,
 
     /// The walk cache, one entry per requirement.
     requirement_states: RequirementMap<RequirementEntry>,
@@ -212,6 +224,7 @@ impl<D: DependencyProvider> Default for DecideQueue<D> {
             clauses_by_name: HashMap::default(),
             requirements_by_candidate: HashMap::default(),
             clauses_by_condition_variable: HashMap::default(),
+            clauses_by_condition_group: HashMap::default(),
             requirement_states: RequirementMap::default(),
             clauses_by_requirement: RequirementMap::default(),
             mirror: Vec::new(),
@@ -261,7 +274,7 @@ impl<D: DependencyProvider> DecideQueue<D> {
         clause_id: ClauseId,
         names: impl IntoIterator<Item = D::NameId>,
         disjunctions: &Arena<DisjunctionId, Disjunction>,
-        parent_value: Option<bool>,
+        map: &DecisionMap,
     ) {
         let parent_pos = *self.parent_positions.entry(parent).or_insert_with(|| {
             self.clauses_by_parent.push(Vec::new());
@@ -292,6 +305,17 @@ impl<D: DependencyProvider> DecideQueue<D> {
                     .entry(literal.variable())
                     .or_default()
                     .push(id);
+                // A member's condition literal can be falsified by its
+                // package's decision without the variable itself appearing on
+                // the trail; group occurrences catch those wake-ups.
+                // Memberships are final by construction: condition variables
+                // are registered with their group before the clause is built.
+                if let Some(group) = map.amo_group_of(literal.variable()) {
+                    let clauses = self.clauses_by_condition_group.entry(group).or_default();
+                    if clauses.last() != Some(&id) {
+                        clauses.push(id);
+                    }
+                }
             }
         }
 
@@ -315,7 +339,7 @@ impl<D: DependencyProvider> DecideQueue<D> {
             hot,
         });
 
-        if parent_value == Some(true) {
+        if map.value(parent) == Some(true) {
             self.queue.insert(position, id);
             if hot {
                 self.hot_queue.insert(position, id);
@@ -398,6 +422,7 @@ impl<D: DependencyProvider> DecideQueue<D> {
             hot_queue,
             requirements_by_candidate,
             clauses_by_condition_variable,
+            clauses_by_condition_group,
             requirement_states,
             clauses_by_requirement,
             ..
@@ -454,6 +479,19 @@ impl<D: DependencyProvider> DecideQueue<D> {
                 enqueue_clause(queue, hot_queue, clauses, map, id);
             }
         }
+
+        // Package wake-up: a member's assignment change can complete a
+        // condition whose literals mention siblings that were never routed
+        // individually (they changed value through the package-level
+        // decision). Walk caches need no eager invalidation here: frontiers
+        // carry the at-most-one revision and revalidate lazily.
+        if let Some(group) = map.amo_group_of(variable) {
+            if let Some(woken) = clauses_by_condition_group.get(&group) {
+                for &id in woken {
+                    enqueue_clause(queue, hot_queue, clauses, map, id);
+                }
+            }
+        }
     }
 
     /// Evaluates a requirement through the per-requirement cache by walking
@@ -472,8 +510,21 @@ impl<D: DependencyProvider> DecideQueue<D> {
         let entry = requirement_states
             .get_mut(requirement)
             .expect("every registered clause created a cache entry");
-        if !matches!(entry.state, RequirementState::Dirty) {
-            return entry.state;
+        match entry.state {
+            RequirementState::Dirty => {}
+            // A satisfying candidate is always explicitly assigned, so the
+            // per-candidate occurrences dirty this entry when it breaks; a
+            // package-level decision cannot.
+            RequirementState::Satisfied { .. } => return entry.state,
+            // A frontier is stale as soon as any package-level decision was
+            // made or undone since the walk: siblings of the (un)chosen
+            // candidate changed their effective value without being routed
+            // through the occurrence lists.
+            RequirementState::Frontier { amo_revision, .. } => {
+                if amo_revision == map.amo_revision() {
+                    return entry.state;
+                }
+            }
         }
 
         #[cfg(feature = "diagnostics")]
@@ -493,6 +544,7 @@ impl<D: DependencyProvider> DecideQueue<D> {
             }
         }
 
+        entry.state = RequirementState::Dirty;
         let mut first: Option<(VariableId, VersionSetId, u32)> = None;
         'walk: for (version_set, candidates) in requirement
             .version_sets(provider)
@@ -527,6 +579,7 @@ impl<D: DependencyProvider> DecideQueue<D> {
                 candidate,
                 version_set,
                 count,
+                amo_revision: map.amo_revision(),
             };
         }
         entry.state
@@ -577,6 +630,7 @@ impl<D: DependencyProvider> DecideQueue<D> {
                 candidate,
                 version_set,
                 count,
+                ..
             } => Some((candidate, version_set, count)),
             RequirementState::Dirty => {
                 unreachable!("eval_requirement never leaves the entry dirty")

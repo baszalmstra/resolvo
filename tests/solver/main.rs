@@ -800,6 +800,40 @@ fn test_solve_with_soft_requirement_forbid_clause_conflict() {
     "###);
 }
 
+/// Candidates registered for a package that has already chosen another
+/// candidate are immediately false through the package-level at-most-one
+/// group, without trail entries. The requires clauses encoded for the soft
+/// requirements must observe those package-level values at insertion time.
+#[test]
+fn test_soft_requirement_candidates_registered_after_package_decision() {
+    let mut provider = BundleBoxProvider::from_packages(&[
+        ("b", 1, vec![]),
+        ("b", 2, vec![]),
+        ("b", 3, vec![]),
+        ("x", 1, vec!["b 0..10"]),
+        ("y", 1, vec!["b 2..4"]),
+    ]);
+
+    // The hard requirement only matches b=1, so b=2 and b=3 join the
+    // at-most-one group of "b" during the soft solves, after b=1 was chosen.
+    let requirements = provider.requirements(&["b 1..2"]);
+    let extra_solvables = [provider.solvable_id("x", 1), provider.solvable_id("y", 1)];
+
+    let mut solver = Solver::new(provider);
+    let problem = Problem::new()
+        .requirements(requirements)
+        .soft_requirements(extra_solvables);
+    let solved = solver.solve(problem).unwrap();
+
+    // x is satisfied by the pinned b=1; y requires a different b, which is
+    // false by the package-level decision, and must be dropped.
+    let result = transaction_to_string(solver.provider(), &solved);
+    assert_snapshot!(result, @r###"
+    b=1
+    x=1
+    "###);
+}
+
 #[test]
 fn test_solve_with_additional_with_constrains() {
     let mut provider = BundleBoxProvider::from_packages(&[
