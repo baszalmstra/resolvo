@@ -228,6 +228,12 @@ pub(crate) struct SolverState<D: DependencyProvider> {
     /// The package name of each at-most-one group, indexed by [`AmoGroupId`].
     amo_group_names: Vec<D::NameId>,
 
+    /// Variables that are registered as a member of some at-most-one group.
+    /// Only a dense dedup front for the encoder: requirements re-offer the
+    /// same candidates constantly, and testing a bit here is much cheaper
+    /// than probing the decision map's per-variable entries.
+    amo_registered: IndexedSet<VariableId>,
+
     /// Lazily materialized pairwise (¬sibling ∨ ¬chosen) clauses, used as the
     /// reason for implicitly false variables in conflict analysis and error
     /// reporting. Keyed by (sibling, chosen).
@@ -313,6 +319,7 @@ impl<D: DependencyProvider> Default for SolverState<D> {
             allow_multiple_names: Default::default(),
             at_most_one_groups: Default::default(),
             amo_group_names: Default::default(),
+            amo_registered: Default::default(),
             forbid_pair_clauses: Default::default(),
             pending_group_wakes: Default::default(),
             at_least_one_tracker: Default::default(),

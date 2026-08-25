@@ -1109,6 +1109,12 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         name_id: D::NameId,
         variable: VariableId,
     ) {
+        // Dense one-bit dedup: candidates are re-offered by every requirement
+        // that mentions them. A variable belongs to exactly one package, so
+        // deduplicating globally is safe.
+        if !self.state.amo_registered.insert(variable) {
+            return;
+        }
         match self
             .state
             .decision_tracker
