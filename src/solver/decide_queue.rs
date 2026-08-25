@@ -581,33 +581,16 @@ impl<D: DependencyProvider> DecideQueue<D> {
             .version_sets(provider)
             .zip(version_set_candidates)
         {
-            // All candidates of a version set belong to the same package,
-            // hence the same group; resolve it (and the package's choice)
-            // once per list instead of once per candidate.
-            let Some(&first_candidate) = candidates.first() else {
-                continue;
-            };
-            let group = map.amo_group_of(first_candidate);
-            if let (Some(walked), Some(group)) = (walk_groups.as_mut(), group) {
-                match *walked {
-                    None => *walked = Some(group),
-                    Some(existing) if existing != group => walk_groups = None,
-                    Some(_) => {}
-                }
-            }
-
-            if let Some(chosen) = group.and_then(|group| map.amo_group_chosen(group)) {
-                // The package is decided: the only possibly true candidate is
-                // the chosen one, every other member is false, so the walk is
-                // a raw id comparison.
-                if candidates.contains(&chosen) {
-                    entry.state = RequirementState::Satisfied { by: chosen };
-                    break 'walk;
-                }
-                continue;
-            }
-
             for &candidate in candidates {
+                if let Some(walked) = walk_groups.as_mut() {
+                    if let Some(group) = map.amo_group_of(candidate) {
+                        match *walked {
+                            None => *walked = Some(group),
+                            Some(existing) if existing != group => walk_groups = None,
+                            Some(_) => {}
+                        }
+                    }
+                }
                 match map.value(candidate) {
                     Some(true) => {
                         entry.state = RequirementState::Satisfied { by: candidate };

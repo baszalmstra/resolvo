@@ -1,6 +1,6 @@
 use std::{any::Any, collections::VecDeque};
 
-use super::{SolverState, clause::WatchedLiterals, conditions};
+use super::{PropagationError, SolverState, clause::WatchedLiterals, conditions};
 use crate::{
     Candidates, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider, Requirement,
     SolverCache, StringId, VariableId, VersionSetId,
@@ -1126,15 +1126,54 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             | AmoMemberAdded::AddedBecameChoice {
                 falsified_others: false,
             } => {}
-            AmoMemberAdded::AddedFalsified { .. }
-            | AmoMemberAdded::AddedBecameChoice {
+            AmoMemberAdded::AddedFalsified { chosen } => {
+                if self
+                    .state
+                    .decision_tracker
+                    .map()
+                    .amo_group_is_implicit(group)
+                {
+                    // The member turned implicitly false without a trail entry
+                    // to wake its watchers; schedule a catch-up sweep for the
+                    // next propagation round.
+                    if !self.state.pending_group_wakes.contains(&group) {
+                        self.state.pending_group_wakes.push(group);
+                    }
+                } else {
+                    // Explicit group: falsify the member on the trail, exactly
+                    // like the sibling sweep would have if the member had been
+                    // registered before the choice.
+                    let clause_id = self.state.forbid_pair_clause(variable, chosen);
+                    self.state
+                        .decision_tracker
+                        .try_add_decision(Decision::new(variable, false, clause_id), self.level)
+                        .expect("the member was checked to be undecided");
+                }
+            }
+            AmoMemberAdded::AddedBecameChoice {
                 falsified_others: true,
             } => {
-                // Members were falsified by the group's choice without a
-                // trail entry to wake their watchers; schedule a catch-up
-                // sweep for the next propagation round.
-                if !self.state.pending_group_wakes.contains(&group) {
-                    self.state.pending_group_wakes.push(group);
+                if self
+                    .state
+                    .decision_tracker
+                    .map()
+                    .amo_group_is_implicit(group)
+                {
+                    // The siblings turned implicitly false without trail
+                    // entries to wake their watchers; schedule a catch-up
+                    // sweep for the next propagation round.
+                    if !self.state.pending_group_wakes.contains(&group) {
+                        self.state.pending_group_wakes.push(group);
+                    }
+                } else if let Err(PropagationError::Conflict(_, _, clause_id)) = self
+                    .state
+                    .falsify_group_siblings(group, variable, self.level)
+                {
+                    // Two group members are already decided true, but the
+                    // constraint that would have prevented this didn't exist
+                    // yet. Report it as a conflict so the solver can
+                    // backtrack.
+                    self.conflicting_clauses.push(clause_id);
                 }
             }
             AmoMemberAdded::Conflict { chosen } => {
