@@ -84,9 +84,9 @@ impl AmoGroupId {
 const NO_GROUP: u32 = u32::MAX;
 
 /// Set in [`Entry::group`] when the group enforces at-most-one *implicitly*
-/// (package-level decisions). Clear while the group is enforced through
-/// explicit sibling propagation; see
-/// [`DecisionMap::IMPLICIT_GROUP_UNDO_THRESHOLD`].
+/// (package-level decisions). Clear while the group is small enough that
+/// explicit sibling propagation is cheaper; see
+/// [`DecisionMap::IMPLICIT_GROUP_THRESHOLD`].
 const IMPLICIT_GROUP: u32 = 1 << 31;
 
 struct AmoGroup {
@@ -111,14 +111,10 @@ struct AmoGroup {
     /// All member variables, in registration order.
     members: Vec<VariableId>,
 
-    /// Whether this group enforces at-most-one implicitly (true once its
-    /// choice has been undone [`DecisionMap::IMPLICIT_GROUP_UNDO_THRESHOLD`]
-    /// times) or through explicit sibling propagation until then.
+    /// Whether this group enforces at-most-one implicitly (true once the
+    /// member count crosses [`DecisionMap::IMPLICIT_GROUP_THRESHOLD`]) or
+    /// through explicit sibling propagation while it is small.
     implicit: bool,
-
-    /// How often this group's choice has been undone while in explicit mode;
-    /// drives the flip to implicit enforcement.
-    undo_count: u32,
 
     /// Bumped whenever this group's choice is set or cleared: the only events
     /// that change member values without touching the members themselves.
@@ -193,22 +189,11 @@ impl DecisionMap {
         entry.decision = DecisionAndLevel::undecided();
         let group = entry.group;
         if group != NO_GROUP {
-            let group_id = AmoGroupId(group & !IMPLICIT_GROUP);
-            let group = &mut self.groups[group_id.to_index()];
+            let group = &mut self.groups[(group & !IMPLICIT_GROUP) as usize];
             if group.chosen == Some(variable_id) {
                 group.chosen = None;
                 group.revision += 1;
                 self.amo_revision += 1;
-                if !group.implicit {
-                    group.undo_count += 1;
-                    // The same package is being re-decided repeatedly; switch
-                    // to the O(1)-per-selection representation. Safe here:
-                    // the choice was just cleared, so no member's effective
-                    // value changes at the moment the mode changes.
-                    if group.undo_count >= Self::IMPLICIT_GROUP_UNDO_THRESHOLD {
-                        self.flip_to_implicit(group_id);
-                    }
-                }
             }
         }
     }
@@ -263,23 +248,9 @@ impl DecisionMap {
         for entry in &mut self.map {
             entry.decision = DecisionAndLevel::undecided();
         }
-        let mut flip = Vec::new();
-        for (index, group) in self.groups.iter_mut().enumerate() {
-            // A restart undoes the group's choice just like a backtrack does;
-            // count it, or a solver that only ever restarts (the version-walk
-            // pathology surfaces conflicts at clause insertion, which
-            // restarts) would never flip a thrashing group.
-            if group.chosen.is_some() && !group.implicit {
-                group.undo_count += 1;
-                if group.undo_count >= Self::IMPLICIT_GROUP_UNDO_THRESHOLD {
-                    flip.push(AmoGroupId(index as u32));
-                }
-            }
+        for group in &mut self.groups {
             group.chosen = None;
             group.revision += 1;
-        }
-        for group in flip {
-            self.flip_to_implicit(group);
         }
         self.amo_revision += 1;
     }
@@ -351,22 +322,13 @@ impl DecisionMap {
         Some(chosen)
     }
 
-    /// The number of times a group's choice may be undone before the group
-    /// switches from explicit sibling propagation to implicit (package-level)
-    /// enforcement.
-    ///
-    /// Explicit propagation keeps evaluation of the (very common)
-    /// falsified-sibling literals to a single load and its trajectories match
-    /// the materialized encoding's, so it is the right default; its cost is
-    /// O(members) trail entries, occurrence routing and reason clauses *per
-    /// re-selection*. That only hurts when the same package is re-decided
-    /// over and over (the version-walk pathology), which is exactly what
-    /// this counter detects: after `IMPLICIT_GROUP_UNDO_THRESHOLD` undos the
-    /// group flips to the O(1)-per-selection representation, bounding the
-    /// total explicit overhead of any group at threshold × members — a
-    /// ski-rental style amortization rather than a guess based on group
-    /// size.
-    pub const IMPLICIT_GROUP_UNDO_THRESHOLD: u32 = 3;
+    /// The member count at which a group switches from explicit sibling
+    /// propagation to implicit (package-level) enforcement. Explicit
+    /// propagation keeps evaluation of the (very common) falsified-sibling
+    /// literals to a single load and is cheap while groups are small;
+    /// implicit enforcement caps the per-selection trail work of huge groups
+    /// at O(1) instead of O(members).
+    pub const IMPLICIT_GROUP_THRESHOLD: usize = 256;
 
     /// Allocates a new, empty at-most-one group.
     pub fn alloc_amo_group(&mut self) -> AmoGroupId {
@@ -379,22 +341,21 @@ impl DecisionMap {
             chosen: None,
             members: Vec::new(),
             implicit: false,
-            undo_count: 0,
             revision: 0,
         });
         id
     }
 
     /// Whether the group enforces at-most-one implicitly (see
-    /// [`Self::IMPLICIT_GROUP_UNDO_THRESHOLD`]).
+    /// [`Self::IMPLICIT_GROUP_THRESHOLD`]).
     #[inline]
     pub fn amo_group_is_implicit(&self, group: AmoGroupId) -> bool {
         self.groups[group.to_index()].implicit
     }
 
     /// Switches a group to implicit enforcement, updating every member's
-    /// fused entry. Called at most once per group when its choice has been
-    /// undone [`Self::IMPLICIT_GROUP_UNDO_THRESHOLD`] times.
+    /// fused entry. Called at most once per group when it crosses
+    /// [`Self::IMPLICIT_GROUP_THRESHOLD`].
     fn flip_to_implicit(&mut self, group: AmoGroupId) {
         let members = std::mem::take(&mut self.groups[group.to_index()].members);
         for &member in &members {
@@ -481,6 +442,16 @@ impl DecisionMap {
             group.0
         };
 
+        // Once the group grows past the threshold, flip it (and every member
+        // entry) to implicit enforcement. This happens at most once per
+        // group; from here on a package-level decision falsifies the members
+        // without per-member trail entries, so cached value scans must start
+        // validating against the group's revision.
+        if !implicit && self.groups[group.to_index()].members.len() > Self::IMPLICIT_GROUP_THRESHOLD
+        {
+            self.flip_to_implicit(group);
+        }
+
         // The explicit-mode `chosen` is only a hint; trust it exclusively
         // when the member it names is still assigned true.
         let chosen = self.groups[group.to_index()]
@@ -566,33 +537,29 @@ mod test {
     }
 
     #[test]
-    fn groups_flip_to_implicit_after_repeated_undos() {
+    fn groups_flip_to_implicit_past_the_threshold() {
         let mut map = DecisionMap::default();
         let group = map.alloc_amo_group();
-        for i in 1..=3 {
+        for i in 1..=DecisionMap::IMPLICIT_GROUP_THRESHOLD {
             map.add_amo_member(group, var(i));
         }
+        assert!(!map.amo_group_is_implicit(group));
+        let revision = map.amo_revision(Some(group));
 
-        // Choosing and undoing repeatedly (the version-walk pathology) flips
-        // the group to implicit enforcement.
-        for round in 0..DecisionMap::IMPLICIT_GROUP_UNDO_THRESHOLD {
-            assert!(
-                !map.amo_group_is_implicit(group),
-                "still explicit after {round} undos"
-            );
-            map.set(var(1), true, 1);
-            // Explicit mode: siblings are not falsified by the map itself.
-            assert_eq!(map.value(var(2)), None);
-            map.reset(var(1));
-        }
+        // One more member crosses the threshold: the group and every member
+        // entry switch to implicit enforcement, and cached value scans must
+        // revalidate.
+        map.add_amo_member(group, var(DecisionMap::IMPLICIT_GROUP_THRESHOLD + 1));
         assert!(map.amo_group_is_implicit(group));
+        assert_ne!(map.amo_revision(Some(group)), revision);
 
-        // From here on the choice falsifies the siblings implicitly.
-        map.set(var(2), true, 5);
-        assert_eq!(map.value(var(1)), Some(false));
-        assert_eq!(map.value(var(3)), Some(false));
-        assert_eq!(map.implicitly_false_by(var(1)), Some(var(2)));
-        assert_eq!(map.level(var(1)), 5);
+        map.set(var(1), true, 1);
+        assert_eq!(map.value(var(2)), Some(false));
+        assert_eq!(
+            map.value(var(DecisionMap::IMPLICIT_GROUP_THRESHOLD + 1)),
+            Some(false)
+        );
+        assert_eq!(map.implicitly_false_by(var(2)), Some(var(1)));
     }
 
     #[test]
