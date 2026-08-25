@@ -2,8 +2,8 @@ use std::{any::Any, collections::VecDeque};
 
 use super::{SolverState, clause::WatchedLiterals, conditions};
 use crate::{
-    Candidates, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider,
-    Requirement, SolverCache, StringId, VariableId, VersionSetId,
+    Candidates, ConditionId, ConditionalRequirement, Dependencies, DependencyProvider, Requirement,
+    SolverCache, StringId, VariableId, VersionSetId,
     internal::{id::ClauseId, solver_id::SolvableIdOrRoot},
     solver::{
         conditions::{DeferredConjunct, DeferredRequirement, Disjunction},
