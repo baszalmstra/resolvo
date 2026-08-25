@@ -612,10 +612,62 @@ impl WatchedLiterals {
     ) -> Option<Literal> {
         let other_watch_index = 1 - for_watch_index;
 
+        // The next unwatched variable (if available), is a variable that is:
+        // * Not already being watched
+        // * Not yet decided, or decided in such a way that the literal yields true
+        let other_watch = self.watched_literals[other_watch_index];
+        let eligible = |lit: Literal| lit != other_watch && lit.eval(decision_map).unwrap_or(true);
+
         match clause {
             Clause::InstallRoot => unreachable!(),
             Clause::Excluded(_, _) => unreachable!(),
             _ if clause.is_binary() => None,
+            &Clause::Requires(parent, condition, requirement) => {
+                let parent_literal = parent.negative();
+                if eligible(parent_literal) {
+                    return Some(parent_literal);
+                }
+                if let Some(condition) = condition {
+                    for &literal in &disjunction_to_candidates[condition].literals {
+                        if eligible(literal) {
+                            return Some(literal);
+                        }
+                    }
+                }
+                // Candidate lists are scanned with the package's choice
+                // hoisted out of the loop: every candidate is covered by the
+                // package's at-most-one group, so once the package is decided
+                // the only possibly non-false candidate is the chosen one and
+                // the scan degenerates to a raw id comparison — no per
+                // candidate evaluation.
+                for candidates in &requirement_to_sorted_candidates[requirement] {
+                    let Some(&first) = candidates.first() else {
+                        continue;
+                    };
+                    let chosen = decision_map
+                        .amo_group_of(first)
+                        .and_then(|group| decision_map.amo_group_chosen(group));
+                    match chosen {
+                        Some(chosen) => {
+                            if candidates.contains(&chosen) {
+                                let literal = chosen.positive();
+                                if literal != other_watch {
+                                    return Some(literal);
+                                }
+                            }
+                        }
+                        None => {
+                            for &candidate in candidates {
+                                let literal = candidate.positive();
+                                if eligible(literal) {
+                                    return Some(literal);
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
             clause => {
                 let next = clause.try_fold_literals(
                     learnt_clauses,
@@ -623,12 +675,7 @@ impl WatchedLiterals {
                     disjunction_to_candidates,
                     (),
                     |_, lit| {
-                        // The next unwatched variable (if available), is a variable that is:
-                        // * Not already being watched
-                        // * Not yet decided, or decided in such a way that the literal yields true
-                        if self.watched_literals[other_watch_index] != lit
-                            && lit.eval(decision_map).unwrap_or(true)
-                        {
+                        if eligible(lit) {
                             ControlFlow::Break(lit)
                         } else {
                             ControlFlow::Continue(())

@@ -1247,11 +1247,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
 
             self.propagate_watchers_of(watched_literal, level)?;
 
-            // A group member assigned true falsifies each sibling. An
-            // implicit group does so without a trail entry per sibling, so
-            // only the clauses watching the siblings' positive literals need
-            // waking; an explicit (small) group assigns each sibling false
-            // on the trail with a pairwise reason clause.
+            // A group member assigned true has already falsified each
+            // sibling in the decision map (without a trail entry per
+            // sibling); only the clauses watching the siblings' positive
+            // literals still need waking.
             if decision.value {
                 if let Some(group) = self
                     .state
@@ -1259,17 +1258,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                     .map()
                     .amo_group_of(decision.variable)
                 {
-                    if self
-                        .state
-                        .decision_tracker
-                        .map()
-                        .amo_group_is_implicit(group)
-                    {
-                        self.sweep_group_watchers(group, level)?;
-                    } else {
-                        self.state
-                            .falsify_group_siblings(group, decision.variable, level)?;
-                    }
+                    self.sweep_group_watchers(group, level)?;
                 }
             }
         }
@@ -1277,9 +1266,10 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         Ok(())
     }
 
-    /// Wakes the clauses watching the positive literal of every implicitly
-    /// false member of `group`. Explicitly assigned members are skipped: their
-    /// watchers are woken by the regular trail-driven propagation.
+    /// Wakes the clauses watching the positive literal of every member of
+    /// `group` that was falsified by the group's choice. Clause-assigned
+    /// members are skipped: their watchers are woken by the regular
+    /// trail-driven propagation of their own entries.
     fn sweep_group_watchers(
         &mut self,
         group: AmoGroupId,
@@ -1304,7 +1294,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                 .state
                 .decision_tracker
                 .map()
-                .implicitly_false_by(member)
+                .group_falsified_by(member)
                 .is_none()
             {
                 continue;
@@ -1565,7 +1555,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                                pair_reasons: &mut Vec<(VariableId, VariableId)>,
                                decision_tracker: &DecisionTracker,
                                variable: VariableId| {
-            if let Some(chosen) = decision_tracker.map().implicitly_false_by(variable) {
+            if let Some(chosen) = decision_tracker.map().group_falsified_by(variable) {
                 if !pair_reasons.contains(&(variable, chosen)) {
                     pair_reasons.push((variable, chosen));
                 }
@@ -1700,7 +1690,7 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
                         .state
                         .decision_tracker
                         .map()
-                        .implicitly_false_by(variable)
+                        .group_falsified_by(variable)
                     {
                         if !pair_reasons.contains(&(variable, chosen)) {
                             pair_reasons.push((variable, chosen));
@@ -1906,38 +1896,6 @@ impl<D: DependencyProvider> SolverState<D> {
         self.forbid_pair_clauses
             .insert((sibling, chosen), clause_id);
         clause_id
-    }
-
-    /// Called when `winner` (a member of an *explicit* at-most-one group) was
-    /// assigned true: forces every other member of the group to false on the
-    /// trail, with the pairwise clause as reason.
-    pub(crate) fn falsify_group_siblings(
-        &mut self,
-        group: AmoGroupId,
-        winner: VariableId,
-        level: u32,
-    ) -> Result<(), PropagationError> {
-        let member_count = self.decision_tracker.map().amo_group_member_count(group);
-        for index in 0..member_count {
-            let member = self.decision_tracker.map().amo_group_member(group, index);
-            if member == winner {
-                continue;
-            }
-            match self.decision_tracker.assigned_value(member) {
-                Some(false) => {}
-                Some(true) => {
-                    let clause_id = self.forbid_pair_clause(member, winner);
-                    return Err(PropagationError::Conflict(member, false, clause_id));
-                }
-                None => {
-                    let clause_id = self.forbid_pair_clause(member, winner);
-                    self.decision_tracker
-                        .try_add_decision(Decision::new(member, false, clause_id), level)
-                        .expect("the member was checked to be undecided");
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Returns the solvables that the solver has chosen to include in the
