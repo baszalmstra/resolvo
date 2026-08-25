@@ -188,6 +188,8 @@ impl<D: DependencyProvider, RT: AsyncRuntime> Solver<D, RT> {
         )
         .unwrap();
         writeln!(writer, "Conflicts:\t{}", counters.conflicts).unwrap();
+        writeln!(writer, "Sweep probes:\t{}", counters.sweep_probes).unwrap();
+        writeln!(writer, "Sweep walks:\t{}", counters.sweep_walks).unwrap();
 
         writeln!(writer, "\nClause visits by type:").unwrap();
         let vbt = &counters.visits_by_type;

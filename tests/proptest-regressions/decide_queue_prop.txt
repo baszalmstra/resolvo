@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 172fbe5dd47514b91ee072c5142b130412df55c04ab0ef5ed69b0985ed7cf950 # shrinks to problem = RandomProblem { packages: [[([], [])], [([], []), ([], [])]], roots: [(1, 1, 1), (1, 2, 1)] }
